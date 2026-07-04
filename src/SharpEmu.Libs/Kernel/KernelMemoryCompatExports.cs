@@ -5388,6 +5388,37 @@ public static class KernelMemoryCompatExports
         }
     }
 
+    internal static bool TryReadTrackedLibcHeap(
+        ulong address,
+        Span<byte> destination)
+    {
+        if (destination.IsEmpty)
+        {
+            return true;
+        }
+
+        var length = (ulong)destination.Length;
+        lock (_libcAllocGate)
+        {
+            foreach (var (allocationAddress, allocation) in _libcAllocations)
+            {
+                var allocationSize = (ulong)allocation.Size;
+                var offset = address >= allocationAddress
+                    ? address - allocationAddress
+                    : ulong.MaxValue;
+                if (offset > allocationSize ||
+                    length > allocationSize - offset)
+                {
+                    continue;
+                }
+
+                return TryReadHostMemory(address, destination);
+            }
+        }
+
+        return false;
+    }
+
     private static bool TryAllocateLibcHeap(ulong requestedSize, nuint alignment, bool zeroFill, out ulong address)
     {
         address = 0;

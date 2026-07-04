@@ -360,7 +360,7 @@ public static class VideoOutExports
         var bufferIndex = unchecked((int)ctx[CpuRegister.Rsi]);
         var flipMode = unchecked((int)ctx[CpuRegister.Rdx]);
         var flipArg = unchecked((long)ctx[CpuRegister.Rcx]);
-        return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg);
+        return SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: true);
     }
 
     [SysAbiExport(
@@ -440,7 +440,7 @@ public static class VideoOutExports
     }
 
     public static int SubmitFlipFromAgc(CpuContext ctx, int handle, int bufferIndex, int flipMode, long flipArg) =>
-        SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg);
+        SubmitFlip(ctx, handle, bufferIndex, flipMode, flipArg, submitGpuImage: false);
 
     internal static void SubmitHostRgbaFrame(ReadOnlySpan<byte> rgbaFrame, uint width, uint height)
     {
@@ -748,7 +748,13 @@ public static class VideoOutExports
         return groupIndex < 0 ? groupIndex : setIndex;
     }
 
-    private static int SubmitFlip(CpuContext ctx, int handle, int bufferIndex, int flipMode, long flipArg)
+    private static int SubmitFlip(
+        CpuContext ctx,
+        int handle,
+        int bufferIndex,
+        int flipMode,
+        long flipArg,
+        bool submitGpuImage)
     {
         if (!TryGetPort(handle, out var port))
         {
@@ -774,6 +780,17 @@ public static class VideoOutExports
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEvents = new List<FlipEventRegistration>(port.FlipEvents);
+        }
+
+        if (submitGpuImage &&
+            bufferIndex >= 0 &&
+            TryGetDisplayBufferInfo(handle, bufferIndex, out var displayBuffer))
+        {
+            _ = VulkanVideoPresenter.TrySubmitGuestImage(
+                displayBuffer.Address,
+                displayBuffer.Width,
+                displayBuffer.Height,
+                displayBuffer.PitchInPixel);
         }
 
         if (string.Equals(

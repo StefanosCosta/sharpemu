@@ -5,11 +5,17 @@ using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.Reflection;
 using System.Text.Json;
+using System.Diagnostics;
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
+using Avalonia.Interactivity;
 using Avalonia.Media;
+using Avalonia.Media.Imaging;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
+using SharpEmu.Libs.Pad;
 
 namespace SharpEmu.GUI;
 
@@ -35,6 +41,16 @@ public partial class MainWindow : Window
     private string? _emulatorExePath;
     private bool _isRunning;
     private int _autoScrollTicks;
+    private int _detailLoadGeneration;
+    private int _backdropGeneration;
+
+    // Controller navigation state.
+    private readonly DispatcherTimer _gamepadTimer;
+    private uint _previousPadButtons;
+    private long _navLeftNextAt;
+    private long _navRightNextAt;
+    private long _navUpNextAt;
+    private long _navDownNextAt;
 
     public MainWindow()
     {
@@ -59,15 +75,142 @@ public partial class MainWindow : Window
         GameList.DoubleTapped += (_, _) => LaunchSelected();
         SearchBox.TextChanged += (_, _) => RefreshVisibleGames();
         AddFolderButton.Click += async (_, _) => await AddFolderAsync();
+        EmptyAddFolderButton.Click += async (_, _) => await AddFolderAsync();
         RescanButton.Click += async (_, _) => await RescanLibraryAsync();
         OpenFileButton.Click += async (_, _) => await OpenFileAsync();
         LaunchButton.Click += (_, _) => LaunchSelected();
         StopButton.Click += (_, _) => _emulator?.Stop();
         ClearLogButton.Click += (_, _) => _consoleLines.Clear();
         CopyLogButton.Click += async (_, _) => await CopyConsoleAsync();
+        OptionsToggle.IsCheckedChanged += (_, _) => OptionsPanel.IsVisible = OptionsToggle.IsChecked == true;
+        ConsoleToggle.IsCheckedChanged += (_, _) => ConsolePanel.IsVisible = ConsoleToggle.IsChecked == true;
+
+        GameList.AddHandler(ContextRequestedEvent, OnGameContextRequested, RoutingStrategies.Tunnel);
+        CtxLaunch.Click += (_, _) => LaunchSelected();
+        CtxOpenFolder.Click += (_, _) => OpenSelectedGameFolder();
+        CtxCopyPath.Click += async (_, _) =>
+            await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.Path, "Path");
+        CtxCopyTitleId.Click += async (_, _) =>
+            await CopyToClipboardAsync((GameList.SelectedItem as GameEntry)?.TitleId, "Title ID");
+        CtxRemove.Click += (_, _) => RemoveSelectedFromLibrary();
 
         Opened += async (_, _) => await OnOpenedAsync();
         Closing += (_, _) => OnWindowClosing();
+
+        DualSenseReader.EnsureStarted();
+        _gamepadTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(50),
+        };
+        _gamepadTimer.Tick += (_, _) => PollGamepad();
+        _gamepadTimer.Start();
+    }
+
+    // ---- Controller navigation ----
+
+    private void PollGamepad()
+    {
+        if (!DualSenseReader.TryGetState(out var pad))
+        {
+            _previousPadButtons = 0;
+            return;
+        }
+
+        if (!IsActive)
+        {
+            // Ignore input while the launcher is in the background (e.g. the
+            // game window is focused and using the same controller).
+            _previousPadButtons = pad.Buttons;
+            return;
+        }
+
+        var now = Environment.TickCount64;
+        var left = (pad.Buttons & 0x0080) != 0 || pad.LeftX < 64;
+        var right = (pad.Buttons & 0x0020) != 0 || pad.LeftX > 192;
+        var up = (pad.Buttons & 0x0010) != 0 || pad.LeftY < 64;
+        var down = (pad.Buttons & 0x0040) != 0 || pad.LeftY > 192;
+
+        if (ShouldNavigate(left, ref _navLeftNextAt, now))
+        {
+            MoveSelection(-1);
+        }
+
+        if (ShouldNavigate(right, ref _navRightNextAt, now))
+        {
+            MoveSelection(1);
+        }
+
+        if (ShouldNavigate(up, ref _navUpNextAt, now))
+        {
+            MoveSelection(-TilesPerRow());
+        }
+
+        if (ShouldNavigate(down, ref _navDownNextAt, now))
+        {
+            MoveSelection(TilesPerRow());
+        }
+
+        var pressed = pad.Buttons & ~_previousPadButtons;
+        if ((pressed & 0x4000) != 0) // Cross
+        {
+            LaunchSelected();
+        }
+
+        if ((pressed & 0x2000) != 0) // Circle
+        {
+            _emulator?.Stop();
+        }
+
+        _previousPadButtons = pad.Buttons;
+    }
+
+    /// <summary>
+    /// Edge-triggered with hold-to-repeat: fires on press, then repeats
+    /// after 400ms at 130ms intervals while held.
+    /// </summary>
+    private static bool ShouldNavigate(bool held, ref long nextAt, long now)
+    {
+        if (!held)
+        {
+            nextAt = 0;
+            return false;
+        }
+
+        if (nextAt == 0)
+        {
+            nextAt = now + 400;
+            return true;
+        }
+
+        if (now >= nextAt)
+        {
+            nextAt = now + 130;
+            return true;
+        }
+
+        return false;
+    }
+
+    private void MoveSelection(int delta)
+    {
+        if (_visibleGames.Count == 0)
+        {
+            return;
+        }
+
+        var index = GameList.SelectedIndex < 0
+            ? 0
+            : Math.Clamp(GameList.SelectedIndex + delta, 0, _visibleGames.Count - 1);
+        GameList.SelectedIndex = index;
+        GameList.ScrollIntoView(index);
+    }
+
+    private int TilesPerRow()
+    {
+        // Tile footprint: 128 content + 20 item padding + 10 item margin.
+        const double TileOuterWidth = 158;
+        var width = GameList.Bounds.Width;
+        return width > TileOuterWidth ? (int)(width / TileOuterWidth) : 1;
     }
 
     private async Task OnOpenedAsync()
@@ -89,6 +232,7 @@ public partial class MainWindow : Window
         ReadControlsIntoSettings();
         _settings.Save();
         _consoleFlushTimer.Stop();
+        _gamepadTimer.Stop();
         _emulator?.Dispose();
     }
 
@@ -188,9 +332,21 @@ public partial class MainWindow : Window
             return;
         }
 
+        var changed = false;
         if (!_settings.GameFolders.Contains(path, StringComparer.OrdinalIgnoreCase))
         {
             _settings.GameFolders.Add(path);
+            changed = true;
+        }
+
+        // Adding (or re-adding) a folder is an explicit signal to restore any
+        // games beneath it that were removed from the library earlier.
+        var prefix = Path.TrimEndingDirectorySeparator(path) + Path.DirectorySeparatorChar;
+        changed |= _settings.ExcludedGames.RemoveAll(excluded =>
+            excluded.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) > 0;
+
+        if (changed)
+        {
             _settings.Save();
         }
 
@@ -200,19 +356,118 @@ public partial class MainWindow : Window
     private async Task RescanLibraryAsync()
     {
         var folders = _settings.GameFolders.ToArray();
+        var excluded = new HashSet<string>(_settings.ExcludedGames, StringComparer.OrdinalIgnoreCase);
         StatusBarRight.Text = "Scanning library…";
 
-        var games = await Task.Run(() => ScanFolders(folders));
+        var games = await Task.Run(() => ScanFolders(folders, excluded));
 
         _allGames.Clear();
         _allGames.AddRange(games);
         RefreshVisibleGames();
+        LoadGameDetailsInBackground(games);
         StatusBarRight.Text = folders.Length == 0
             ? "Add a game folder to populate the library."
             : $"Library scanned: {games.Count} game(s) in {folders.Length} folder(s).";
     }
 
-    private static List<GameEntry> ScanFolders(IReadOnlyList<string> folders)
+    /// <summary>
+    /// Enriches games off the UI thread — decodes cover art and totals each
+    /// game's install folder size — posting results back as they become
+    /// ready. A newer scan invalidates older loads.
+    /// </summary>
+    private void LoadGameDetailsInBackground(IReadOnlyList<GameEntry> games)
+    {
+        var generation = ++_detailLoadGeneration;
+        _ = Task.Run(() =>
+        {
+            // Covers first: they are cheap and the most visible, so the grid
+            // fills with art before the (potentially slow) size pass runs.
+            foreach (var game in games)
+            {
+                if (generation != _detailLoadGeneration)
+                {
+                    return;
+                }
+
+                if (game.CoverPath is null)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using var stream = File.OpenRead(game.CoverPath);
+                    var bitmap = Bitmap.DecodeToWidth(stream, 312);
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (generation == _detailLoadGeneration)
+                        {
+                            game.Cover = bitmap;
+                        }
+                    });
+                }
+                catch (Exception)
+                {
+                    // A missing or undecodable image keeps the placeholder.
+                }
+            }
+
+            foreach (var game in games)
+            {
+                if (generation != _detailLoadGeneration)
+                {
+                    return;
+                }
+
+                var size = ComputeInstallSize(game.Path);
+                if (size > 0)
+                {
+                    Dispatcher.UIThread.Post(() =>
+                    {
+                        if (generation == _detailLoadGeneration)
+                        {
+                            game.SizeBytes = size;
+                        }
+                    });
+                }
+            }
+        });
+    }
+
+    /// <summary>
+    /// Totals the size of the game's install folder (the directory holding
+    /// the eboot), which is far more accurate than the eboot alone.
+    /// </summary>
+    private static long ComputeInstallSize(string ebootPath)
+    {
+        var directory = Path.GetDirectoryName(ebootPath);
+        if (directory is null)
+        {
+            return 0;
+        }
+
+        long total = 0;
+        try
+        {
+            var enumeration = new EnumerationOptions
+            {
+                IgnoreInaccessible = true,
+                RecurseSubdirectories = true,
+            };
+            foreach (var file in new DirectoryInfo(directory).EnumerateFiles("*", enumeration))
+            {
+                total += file.Length;
+            }
+        }
+        catch (Exception)
+        {
+            // Fall back to whatever was accumulated so far.
+        }
+
+        return total;
+    }
+
+    private static List<GameEntry> ScanFolders(IReadOnlyList<string> folders, IReadOnlySet<string> excludedPaths)
     {
         var games = new List<GameEntry>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -235,7 +490,7 @@ public partial class MainWindow : Window
                 foreach (var file in Directory.EnumerateFiles(folder, "eboot.bin", enumeration))
                 {
                     var fullPath = Path.GetFullPath(file);
-                    if (!seen.Add(fullPath))
+                    if (!seen.Add(fullPath) || excludedPaths.Contains(fullPath))
                     {
                         continue;
                     }
@@ -250,7 +505,9 @@ public partial class MainWindow : Window
                     }
 
                     var (title, titleId) = TryReadParamJson(fullPath);
-                    games.Add(new GameEntry(title ?? GameNameFor(fullPath), titleId, fullPath, size));
+                    games.Add(new GameEntry(
+                        title ?? GameNameFor(fullPath), titleId, fullPath, size,
+                        FindCoverFor(fullPath), FindBackgroundFor(fullPath)));
                 }
             }
             catch (Exception)
@@ -332,6 +589,56 @@ public partial class MainWindow : Window
         }
     }
 
+    /// <summary>
+    /// Finds the cover art shipped with the game: sce_sys/icon0.png next to
+    /// the executable (falling back to pic0.png).
+    /// </summary>
+    private static string? FindCoverFor(string ebootPath)
+    {
+        var directory = Path.GetDirectoryName(ebootPath);
+        if (directory is null)
+        {
+            return null;
+        }
+
+        var sceSys = Path.Combine(directory, "sce_sys");
+        foreach (var candidate in new[] { "icon0.png", "pic0.png" })
+        {
+            var coverPath = Path.Combine(sceSys, candidate);
+            if (File.Exists(coverPath))
+            {
+                return coverPath;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Finds the key art shipped with the game (sce_sys/pic0.png, falling
+    /// back to pic1.png), used as the window backdrop when selected.
+    /// </summary>
+    private static string? FindBackgroundFor(string ebootPath)
+    {
+        var directory = Path.GetDirectoryName(ebootPath);
+        if (directory is null)
+        {
+            return null;
+        }
+
+        var sceSys = Path.Combine(directory, "sce_sys");
+        foreach (var candidate in new[] { "pic0.png", "pic1.png" })
+        {
+            var backgroundPath = Path.Combine(sceSys, candidate);
+            if (File.Exists(backgroundPath))
+            {
+                return backgroundPath;
+            }
+        }
+
+        return null;
+    }
+
     private static string GameNameFor(string ebootPath)
     {
         var directory = Path.GetDirectoryName(ebootPath);
@@ -339,26 +646,125 @@ public partial class MainWindow : Window
         return string.IsNullOrEmpty(name) ? Path.GetFileName(ebootPath) : name;
     }
 
+    // ---- Game context menu ----
+
+    /// <summary>
+    /// Selects the tile under the pointer before its context menu opens, and
+    /// suppresses the menu on empty grid space.
+    /// </summary>
+    private void OnGameContextRequested(object? sender, ContextRequestedEventArgs e)
+    {
+        var item = (e.Source as Visual)?.FindAncestorOfType<ListBoxItem>(includeSelf: true);
+        if (item?.DataContext is not GameEntry game)
+        {
+            e.Handled = true;
+            return;
+        }
+
+        GameList.SelectedItem = game;
+        CtxLaunch.IsEnabled = !_isRunning;
+        CtxCopyTitleId.IsEnabled = game.TitleId is not null;
+    }
+
+    private void OpenSelectedGameFolder()
+    {
+        if (GameList.SelectedItem is not GameEntry game)
+        {
+            return;
+        }
+
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "explorer.exe",
+                    Arguments = $"/select,\"{game.Path}\"",
+                    UseShellExecute = false,
+                });
+            }
+            else if (Path.GetDirectoryName(game.Path) is { } directory)
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = OperatingSystem.IsMacOS() ? "open" : "xdg-open",
+                    Arguments = $"\"{directory}\"",
+                    UseShellExecute = false,
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            StatusBarRight.Text = $"Could not open folder: {ex.Message}";
+        }
+    }
+
+    private async Task CopyToClipboardAsync(string? text, string what)
+    {
+        if (string.IsNullOrEmpty(text) || Clipboard is null)
+        {
+            return;
+        }
+
+        await Clipboard.SetTextAsync(text);
+        StatusBarRight.Text = $"{what} copied to clipboard.";
+    }
+
+    private void RemoveSelectedFromLibrary()
+    {
+        if (GameList.SelectedItem is not GameEntry game)
+        {
+            return;
+        }
+
+        if (!_settings.ExcludedGames.Contains(game.Path, StringComparer.OrdinalIgnoreCase))
+        {
+            _settings.ExcludedGames.Add(game.Path);
+            _settings.Save();
+        }
+
+        _allGames.RemoveAll(g => string.Equals(g.Path, game.Path, StringComparison.OrdinalIgnoreCase));
+        GameList.SelectedItem = null;
+        RefreshVisibleGames();
+        StatusBarRight.Text = $"Removed “{game.Name}” from the library. Re-add its folder to restore it.";
+    }
+
     private void RefreshVisibleGames()
     {
         var query = SearchBox.Text?.Trim() ?? string.Empty;
-        var selected = GameList.SelectedItem as GameEntry;
+        var selectedPath = (GameList.SelectedItem as GameEntry)?.Path;
 
         _visibleGames.Clear();
         foreach (var game in _allGames)
         {
             if (query.Length == 0 ||
                 game.Name.Contains(query, StringComparison.OrdinalIgnoreCase) ||
-                game.Path.Contains(query, StringComparison.OrdinalIgnoreCase))
+                game.Path.Contains(query, StringComparison.OrdinalIgnoreCase) ||
+                (game.TitleId?.Contains(query, StringComparison.OrdinalIgnoreCase) ?? false))
             {
                 _visibleGames.Add(game);
             }
         }
 
-        GameCountText.Text = _visibleGames.Count.ToString();
-        if (selected is not null && _visibleGames.Contains(selected))
+        GameCountText.Text = _visibleGames.Count == 1 ? "1 game" : $"{_visibleGames.Count} games";
+
+        if (selectedPath is not null &&
+            _visibleGames.FirstOrDefault(g => g.Path.Equals(selectedPath, StringComparison.OrdinalIgnoreCase))
+                is { } reselected)
         {
-            GameList.SelectedItem = selected;
+            GameList.SelectedItem = reselected;
+        }
+
+        EmptyState.IsVisible = _visibleGames.Count == 0;
+        if (_visibleGames.Count == 0)
+        {
+            var hasFilter = query.Length > 0;
+            EmptyStateTitle.Text = hasFilter ? "No games match your search" : "Your library is empty";
+            EmptyStateHint.Text = hasFilter
+                ? $"Nothing in the library matches “{query}”."
+                : "Add a folder containing your games to get started.";
+            EmptyAddFolderButton.IsVisible = !hasFilter;
         }
 
         UpdateSelectedGame();
@@ -370,14 +776,57 @@ public partial class MainWindow : Window
         {
             SelectedGameTitle.Text = game.Name;
             SelectedGamePath.Text = game.Path;
+            SelectedCoverPanel.DataContext = game;
+            _ = UpdateBackdropAsync(game);
         }
         else
         {
             SelectedGameTitle.Text = "No game selected";
             SelectedGamePath.Text = "Pick a game from the library, or open an eboot.bin directly.";
+            SelectedCoverPanel.DataContext = null;
+            _ = UpdateBackdropAsync(null);
         }
 
         UpdateRunButtons();
+    }
+
+    /// <summary>
+    /// Fades the window backdrop to the selected game's key art. The image
+    /// decodes off the UI thread and is cached on the entry; a newer
+    /// selection cancels the fade-in of an older one.
+    /// </summary>
+    private async Task UpdateBackdropAsync(GameEntry? game)
+    {
+        var generation = ++_backdropGeneration;
+        BackdropImage.Opacity = 0;
+
+        if (game?.BackgroundPath is null)
+        {
+            return;
+        }
+
+        if (game.Background is null)
+        {
+            try
+            {
+                var path = game.BackgroundPath;
+                game.Background = await Task.Run(() =>
+                {
+                    using var stream = File.OpenRead(path);
+                    return Bitmap.DecodeToWidth(stream, 1600);
+                });
+            }
+            catch (Exception)
+            {
+                return; // undecodable key art: keep the plain background
+            }
+        }
+
+        if (generation == _backdropGeneration)
+        {
+            BackdropImage.Source = game.Background;
+            BackdropImage.Opacity = 1.0;
+        }
     }
 
     // ---- Launching ----
@@ -448,6 +897,7 @@ public partial class MainWindow : Window
         arguments.Add(ebootPath);
 
         _consoleLines.Clear();
+        ConsoleToggle.IsChecked = true;
         AppendConsoleLine($"$ SharpEmu {string.Join(' ', arguments)}", DimLineBrush);
 
         var emulator = new EmulatorProcess();

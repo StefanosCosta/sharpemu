@@ -48,6 +48,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		// hashing are hoisted to stub-setup time.
 		public bool IsLeaf { get; }
 
+		public bool IsNoBlockLeaf { get; }
+
 		public bool SuppressStrlenTrace { get; }
 
 		public bool IsLoopGuardBoundary { get; }
@@ -59,6 +61,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			string nid,
 			ExportedFunction? export,
 			bool isLeaf,
+			bool isNoBlockLeaf,
 			bool suppressStrlenTrace,
 			bool isLoopGuardBoundary,
 			ulong nidHash)
@@ -67,6 +70,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Nid = nid;
 			Export = export;
 			IsLeaf = isLeaf;
+			IsNoBlockLeaf = isNoBlockLeaf;
 			SuppressStrlenTrace = suppressStrlenTrace;
 			IsLoopGuardBoundary = isLoopGuardBoundary;
 			NidHash = nidHash;
@@ -317,6 +321,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private bool _logGuestThreads;
 
 	private bool _logUsleep;
+
+	private bool _logFiber;
 
 	private bool _logBootstrap;
 
@@ -1067,6 +1073,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_ignoredGuestInt41Count = 0;
 		_logGuestThreads = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_THREADS"), "1", StringComparison.Ordinal);
 		_logUsleep = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_USLEEP"), "1", StringComparison.Ordinal);
+		_logFiber = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_FIBER"), "1", StringComparison.Ordinal);
 		_logBootstrap = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_BOOTSTRAP"), "1", StringComparison.Ordinal);
 		_logAllImports = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_ALL_IMPORTS"), "1", StringComparison.Ordinal);
 		_logImportFrames = string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IMPORT_FRAMES"), "1", StringComparison.Ordinal);
@@ -1164,6 +1171,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				text2,
 				resolvedExport,
 				IsLeafImport(text2),
+				IsNoBlockLeafImport(text2),
 				ShouldSuppressStrlenTrace(text2),
 				IsImportLoopGuardBoundary(text2),
 				StableHash64(text2));
@@ -3264,29 +3272,13 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			Pump(callerContext, reason);
 
-			var threads = SnapshotGuestThreads();
-			if (threads.Length == 0)
+			// Tally run states under the lock without allocating a snapshot every
+			// spin (this loop can iterate rapidly); the full snapshot is only
+			// materialized for the gated diagnostic dump below.
+			GetGuestThreadActivity(out var threadCount, out var hasReadyThread, out var hasRunningThread, out var hasBlockedThread);
+			if (threadCount == 0)
 			{
 				return;
-			}
-
-			var hasReadyThread = false;
-			var hasRunningThread = false;
-			var hasBlockedThread = false;
-			foreach (var thread in threads)
-			{
-				switch (thread.State)
-				{
-					case GuestThreadRunState.Ready:
-						hasReadyThread = true;
-						break;
-					case GuestThreadRunState.Running:
-						hasRunningThread = true;
-						break;
-					case GuestThreadRunState.Blocked:
-						hasBlockedThread = true;
-						break;
-				}
 			}
 
 			if (hasReadyThread)
@@ -3301,7 +3293,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 			if (_logGuestThreads && Stopwatch.GetTimestamp() >= nextSnapshotTimestamp)
 			{
-				foreach (var thread in threads)
+				foreach (var thread in SnapshotGuestThreads())
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][TRACE] guest_thread.idle_wait reason={reason} handle=0x{thread.ThreadHandle:X16} " +
@@ -3321,7 +3313,36 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	{
 		using (LockGate("SnapshotGuestThreads"))
 		{
-			return _guestThreads.Values.ToArray();
+			var snapshot = new GuestThreadState[_guestThreads.Count];
+			_guestThreads.Values.CopyTo(snapshot, 0);
+			return snapshot;
+		}
+	}
+
+	// Allocation-free run-state tally for the idle spin loop.
+	private void GetGuestThreadActivity(out int count, out bool hasReady, out bool hasRunning, out bool hasBlocked)
+	{
+		hasReady = false;
+		hasRunning = false;
+		hasBlocked = false;
+		using (LockGate("GetGuestThreadActivity"))
+		{
+			count = _guestThreads.Count;
+			foreach (var thread in _guestThreads.Values)
+			{
+				switch (thread.State)
+				{
+					case GuestThreadRunState.Ready:
+						hasReady = true;
+						break;
+					case GuestThreadRunState.Running:
+						hasRunning = true;
+						break;
+					case GuestThreadRunState.Blocked:
+						hasBlocked = true;
+						break;
+				}
+			}
 		}
 	}
 

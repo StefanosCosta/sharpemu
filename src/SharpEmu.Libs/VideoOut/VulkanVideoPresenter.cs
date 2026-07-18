@@ -337,15 +337,6 @@ internal static unsafe class VulkanVideoPresenter
     // thread's physical-device query) gives shader translation and descriptor
     // creation one stable aliasing contract on every conformant device.
     internal const ulong GuestStorageBufferOffsetAlignment = 256;
-    // Guest draw snapshots churn through a small set of 128 KiB-16 MiB size
-    // classes thousands of times per second. The process-wide shared pool
-    // trims and repartitions those large arrays aggressively under GC load,
-    // causing hundreds of MiB/s of replacement byte[] allocations. Keep a
-    // bounded, non-shared pool for AGC-to-presenter ownership transfers.
-    internal static BoundedByteArrayPool GuestDataPool { get; } = new(
-        maxArrayLength: 16 * 1024 * 1024,
-        maxCachedBytes: 256UL * 1024 * 1024,
-        maxArraysPerBucket: 8);
     // The pending queue and per-render drain budget bound how much guest GPU
     // work can be buffered ahead of the presenter. Draws are batched into
     // shared command buffers, so draining a large batch per render tick is
@@ -1719,17 +1710,6 @@ internal static unsafe class VulkanVideoPresenter
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<
         TextureContentIdentity, byte> _cachedTextureIdentities = new();
 
-    internal readonly record struct TextureContentIdentity(
-        ulong Address,
-        uint Width,
-        uint Height,
-        uint Format,
-        uint NumberType,
-        uint DstSelect,
-        uint TileMode,
-        uint Pitch,
-        GuestSampler Sampler);
-
     // Guest memory handle for render-thread self-healing: when a draw whose
     // texel copy was skipped misses the texture cache (eviction, cache
     // clear, or any other race), the presenter re-reads the texels itself
@@ -2932,6 +2912,7 @@ internal static unsafe class VulkanVideoPresenter
             public uint InstanceCount = 1;
             public PrimitiveTopology Topology = PrimitiveTopology.TriangleList;
             public GuestBlendState[] Blends = [GuestBlendState.Default];
+            public GuestBlendConstant BlendConstant;
             // Vulkan format of this draw's color target. Needed to suppress
             // blending on formats Metal cannot blend (integer / 32-bit float),
             // which otherwise makes vkCreateGraphicsPipelines fail and can
@@ -5375,7 +5356,7 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (buffer.Pooled && returned.Add(buffer.Data))
                 {
-                    GuestDataPool.Return(buffer.Data);
+                    GuestDataPool.Shared.Return(buffer.Data);
                 }
             }
 
@@ -5383,14 +5364,14 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (buffer.Pooled && returned.Add(buffer.Data))
                 {
-                    GuestDataPool.Return(buffer.Data);
+                    GuestDataPool.Shared.Return(buffer.Data);
                 }
             }
 
             if (draw.IndexBuffer is { Pooled: true } indexBuffer &&
                 returned.Add(indexBuffer.Data))
             {
-                GuestDataPool.Return(indexBuffer.Data);
+                GuestDataPool.Shared.Return(indexBuffer.Data);
             }
         }
 
@@ -5870,6 +5851,7 @@ internal static unsafe class VulkanVideoPresenter
                 InstanceCount = Math.Max(draw.InstanceCount, 1),
                 Topology = GetPrimitiveTopology(draw.PrimitiveType),
                 Blends = draw.RenderState.Blends.ToArray(),
+                BlendConstant = draw.RenderState.BlendConstant,
                 Scissor = draw.RenderState.Scissor,
                 Viewport = draw.RenderState.Viewport,
                 Raster = draw.RenderState.Raster,
@@ -6005,7 +5987,7 @@ internal static unsafe class VulkanVideoPresenter
                     resources.Index32Bit = indexBuffer.Is32Bit;
                     if (indexBuffer.Pooled)
                     {
-                        GuestDataPool.Return(indexBuffer.Data);
+                        GuestDataPool.Shared.Return(indexBuffer.Data);
                     }
                 }
 
@@ -6034,7 +6016,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     if (vertex.Pooled && returnedVertexData.Add(vertex.Data))
                     {
-                        GuestDataPool.Return(vertex.Data);
+                        GuestDataPool.Shared.Return(vertex.Data);
                     }
                 }
             }
@@ -6530,13 +6512,16 @@ internal static unsafe class VulkanVideoPresenter
                         AttachmentCount = (uint)resources.Blends.Length,
                         PAttachments = colorBlendAttachments,
                     };
-                    var dynamicStateValues = stackalloc DynamicState[2];
+                    var dynamicStateValues = stackalloc DynamicState[3];
                     dynamicStateValues[0] = DynamicState.Viewport;
                     dynamicStateValues[1] = DynamicState.Scissor;
+                    // CB_BLEND_RED..ALPHA vary per draw without a pipeline
+                    // identity change, so the constant stays dynamic.
+                    dynamicStateValues[2] = DynamicState.BlendConstants;
                     var dynamicState = new PipelineDynamicStateCreateInfo
                     {
                         SType = StructureType.PipelineDynamicStateCreateInfo,
-                        DynamicStateCount = 2,
+                        DynamicStateCount = 3,
                         PDynamicStates = dynamicStateValues,
                     };
                     var depth = resources.Depth;
@@ -8312,7 +8297,7 @@ internal static unsafe class VulkanVideoPresenter
             }
             if (guestBuffer.Pooled)
             {
-                GuestDataPool.Return(guestBuffer.Data);
+                GuestDataPool.Shared.Return(guestBuffer.Data);
             }
 
             return new GlobalBufferResource
@@ -8360,7 +8345,7 @@ internal static unsafe class VulkanVideoPresenter
         {
             var descriptorSize = checked((guestSize + byteBias + 3) & ~3UL);
             var descriptorLength = checked((int)descriptorSize);
-            var snapshot = GuestDataPool.Rent(descriptorLength);
+            var snapshot = GuestDataPool.Shared.Rent(descriptorLength);
             try
             {
                 var snapshotData = snapshot.AsSpan(0, descriptorLength);
@@ -8389,10 +8374,10 @@ internal static unsafe class VulkanVideoPresenter
             }
             finally
             {
-                GuestDataPool.Return(snapshot);
+                GuestDataPool.Shared.Return(snapshot);
                 if (guestBuffer.Pooled)
                 {
-                    GuestDataPool.Return(guestBuffer.Data);
+                    GuestDataPool.Shared.Return(guestBuffer.Data);
                 }
             }
         }
@@ -8407,7 +8392,7 @@ internal static unsafe class VulkanVideoPresenter
                 out var mapped);
             if (guestBuffer.Pooled)
             {
-                GuestDataPool.Return(guestBuffer.Data);
+                GuestDataPool.Shared.Return(guestBuffer.Data);
             }
 
             return new GlobalBufferResource
@@ -9921,7 +9906,7 @@ internal static unsafe class VulkanVideoPresenter
                     // into millions of writes for alternating output patterns.
                     const int pageSize = 4096;
                     const int unreadableMergeGap = 16;
-                    var livePageBuffer = GuestDataPool.Rent(pageSize);
+                    var livePageBuffer = GuestDataPool.Shared.Rent(pageSize);
                     var pageRuns = new List<(int Start, int Length)>(64);
                     try
                     {
@@ -10091,7 +10076,7 @@ internal static unsafe class VulkanVideoPresenter
                     }
                     finally
                     {
-                        GuestDataPool.Return(livePageBuffer);
+                        GuestDataPool.Shared.Return(livePageBuffer);
                     }
 
                     var probe = mappedBytes[..Math.Min(mappedBytes.Length, 256)];
@@ -14148,6 +14133,15 @@ internal static unsafe class VulkanVideoPresenter
                 drawViewport.Y += ViewportDebugEpsilon;
             }
             _vk.CmdSetViewport(_commandBuffer, 0, 1, &drawViewport);
+            // CB_BLEND_RED..ALPHA feed the CONSTANT_COLOR/CONSTANT_ALPHA factors.
+            var blendConstants = stackalloc float[4]
+            {
+                resources.BlendConstant.Red,
+                resources.BlendConstant.Green,
+                resources.BlendConstant.Blue,
+                resources.BlendConstant.Alpha,
+            };
+            _vk.CmdSetBlendConstants(_commandBuffer, blendConstants);
             if (resources.VertexBuffers.Length != 0)
             {
                 var buffers = stackalloc VkBuffer[resources.VertexBuffers.Length];
@@ -15023,7 +15017,6 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyInstance(_instance, null);
                 _instance = default;
             }
-            GuestDataPool.Trim();
         }
 
         private void RecreateSwapchainResources(string operation, Result result)

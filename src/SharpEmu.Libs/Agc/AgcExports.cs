@@ -651,6 +651,9 @@ public static partial class AgcExports
         LibraryName = "libSceAgc")]
     public static int GetIsTrinityMode(CpuContext ctx)
     {
+        // Trinity is the PS5 Pro hardware revision; SharpEmu only targets base PS5
+        // hardware, matching sceKernelIsNeoMode's equivalent "not the Pro variant"
+        // answer for the PS4/PS4 Pro generation.
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

@@ -108,6 +108,55 @@ public sealed class KernelPathCaseSensitivityTests : IDisposable
         Assert.False(File.Exists(resolved));
     }
 
+    [Fact]
+    public void ResolveApp0RelativePath_FallsBackToFlatFileWhenNestedPathIsMissing()
+    {
+        // Some PS5 dumps repack the game as a flat directory, dropping the
+        // subdirectory structure the guest still expects (e.g. IL2CPP requesting
+        // "Media/Metadata/global-metadata.dat" when the file actually sits
+        // directly at the app0 root).
+        var app0Root = Path.Combine(_tempRoot, "app0-flat");
+        Directory.CreateDirectory(app0Root);
+        File.WriteAllBytes(Path.Combine(app0Root, "global-metadata.dat"), [1, 2, 3]);
+        var relative = Path.Combine("Media", "Metadata", "global-metadata.dat");
+
+        var resolved = KernelMemoryCompatExports.ResolveApp0RelativePath(app0Root, relative);
+
+        Assert.Equal(Path.Combine(app0Root, "global-metadata.dat"), resolved);
+    }
+
+    [Fact]
+    public void ResolveApp0RelativePath_PrefersTheNestedFileWhenItActuallyExists()
+    {
+        var app0Root = Path.Combine(_tempRoot, "app0-nested");
+        var nestedDir = Path.Combine(app0Root, "Media", "Metadata");
+        Directory.CreateDirectory(nestedDir);
+        File.WriteAllBytes(Path.Combine(nestedDir, "global-metadata.dat"), [1]);
+        // A same-named flat file must never shadow a real nested layout.
+        File.WriteAllBytes(Path.Combine(app0Root, "global-metadata.dat"), [1, 2]);
+        var relative = Path.Combine("Media", "Metadata", "global-metadata.dat");
+
+        var resolved = KernelMemoryCompatExports.ResolveApp0RelativePath(app0Root, relative);
+
+        Assert.Equal(Path.Combine(nestedDir, "global-metadata.dat"), resolved);
+    }
+
+    [Fact]
+    public void ResolveApp0RelativePath_ReturnsTheNestedPathWhenNeitherExists()
+    {
+        // Genuinely missing files must still resolve to the originally-requested
+        // nested path, so callers (e.g. open()) report NOT_FOUND against the path
+        // the guest actually asked for, and create/write flows still build the
+        // expected directory structure rather than silently landing at the root.
+        var app0Root = Path.Combine(_tempRoot, "app0-missing");
+        Directory.CreateDirectory(app0Root);
+        var relative = Path.Combine("Media", "Metadata", "does-not-exist.dat");
+
+        var resolved = KernelMemoryCompatExports.ResolveApp0RelativePath(app0Root, relative);
+
+        Assert.Equal(Path.Combine(app0Root, relative), resolved);
+    }
+
     private bool HostFsIsCaseSensitive()
     {
         var name = $"probe_{Guid.NewGuid():N}";

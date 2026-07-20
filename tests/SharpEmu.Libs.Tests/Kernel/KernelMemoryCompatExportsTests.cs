@@ -43,6 +43,46 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
+    public void PosixOpenCore_MissingFileReturnsMinusOne()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/__sharpemu_test_missing__/il2cpp.usym");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0; // O_RDONLY
+
+        var result = KernelMemoryCompatExports.PosixOpenCore(context);
+
+        // A missing file must come back as the POSIX open(2) failure sentinel
+        // (-1 in RAX). Guest libc's File::Open only compares the low 32 bits
+        // of the return against -1 (`cmp eax, -1`); the raw Orbis kernel
+        // result (e.g. ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002) never equals
+        // that, so a missing file used to be silently read back as success
+        // with a bogus "file descriptor" - this is what that regressed into
+        // deep in IL2CPP metadata symbol loading for a missing il2cpp.usym.
+        Assert.Equal(-1, result);
+        Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void PosixFstatCore_InvalidDescriptorReturnsMinusOne()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong statAddress = memoryBase + 0x400;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 999_999; // never-opened fd
+        context[CpuRegister.Rsi] = statAddress;
+
+        var result = KernelMemoryCompatExports.PosixFstatCore(context);
+
+        Assert.Equal(-1, result);
+        Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
     public void Sprintf_ReadsVariadicDoubleFromXmmRegister()
     {
         const ulong memoryBase = 0x1_0000_0000;
@@ -404,5 +444,65 @@ public sealed class KernelMemoryCompatExportsTests
         var deleteResult = KernelMemoryCompatExports.OperatorDeleteArraySized(context);
 
         Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, deleteResult);
+    }
+
+    [Fact]
+    public void ReallocAlign_NullPointerAllocatesFreshAlignedBlock()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 0;
+        context[CpuRegister.Rsi] = 64;
+        context[CpuRegister.Rdx] = 0x40;
+
+        var result = KernelMemoryCompatExports.ReallocAlign(context);
+        var address = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, address);
+        Assert.Equal(0UL, address % 0x40);
+
+        var pointer = unchecked((nint)address);
+        Marshal.WriteByte(pointer, 63, 0xAB);
+        Assert.Equal(0xAB, Marshal.ReadByte(pointer, 63));
+
+        context[CpuRegister.Rdi] = address;
+        KernelMemoryCompatExports.Free(context);
+    }
+
+    [Fact]
+    public void ReallocAlign_GrowsExistingAllocationPreservingContentsAndAlignment()
+    {
+        // Mirrors the guest call shape that used to crash: a dynamic array's
+        // growth path calls reallocalign(old_ptr, bigger_size, alignment) and
+        // then unconditionally writes through the returned pointer. Before this
+        // export existed, the unresolved-import fallback left RAX at 0 and that
+        // write faulted (metal_slug, Access Violation at guest RIP 0x800812114).
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 32;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.Malloc(context));
+        var originalAddress = context[CpuRegister.Rax];
+        var originalPointer = unchecked((nint)originalAddress);
+        Marshal.WriteByte(originalPointer, 0, 0x42);
+        Marshal.WriteByte(originalPointer, 31, 0x99);
+
+        context[CpuRegister.Rdi] = originalAddress;
+        context[CpuRegister.Rsi] = 128;
+        context[CpuRegister.Rdx] = 0x40;
+
+        var result = KernelMemoryCompatExports.ReallocAlign(context);
+        var resizedAddress = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, resizedAddress);
+        Assert.Equal(0UL, resizedAddress % 0x40);
+
+        var resizedPointer = unchecked((nint)resizedAddress);
+        Assert.Equal(0x42, Marshal.ReadByte(resizedPointer, 0));
+        Assert.Equal(0x99, Marshal.ReadByte(resizedPointer, 31));
+
+        context[CpuRegister.Rdi] = resizedAddress;
+        KernelMemoryCompatExports.Free(context);
     }
 }

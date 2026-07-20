@@ -2663,6 +2663,31 @@ public static partial class AgcExports
         return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
     }
 
+    // Called right after sceKernelWaitEqueue delivers a graphics-filter event: takes a
+    // pointer to that SceKernelEvent and extracts the AGC context/queue id from it. The
+    // kevent's udata field carries back exactly the userData the game itself supplied to
+    // sceAgcDriverAddEqEvent (see KernelEventQueueCompatExports.RegisterEvent) when it
+    // registered, so this is a plain field read, not a lookup against any driver-owned
+    // state - the caller then masks the low bits of the result to index its own per-queue
+    // array, confirming this is meant to be a small integer, not a fresh SharpEmu-minted
+    // handle.
+    [SysAbiExport(
+        Nid = "Zw7uUVPulbw",
+        ExportName = "sceAgcDriverGetEqContextId",
+        Target = Generation.Gen5,
+        LibraryName = "libSceAgcDriver")]
+    public static int DriverGetEqContextId(CpuContext ctx)
+    {
+        var eventAddress = ctx[CpuRegister.Rdi];
+        if (eventAddress == 0 || !TryReadUInt64(ctx, eventAddress + 0x18, out var userData))
+        {
+            return ReturnPointer(ctx, 0);
+        }
+
+        TraceAgc($"agc.driver_get_eq_context_id event=0x{eventAddress:X16} udata=0x{userData:X16}");
+        return ReturnPointer(ctx, userData);
+    }
+
     [SysAbiExport(
         Nid = "UglJIZjGssM",
         ExportName = "sceAgcDriverSubmitDcb",

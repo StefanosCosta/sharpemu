@@ -66,7 +66,9 @@ public static partial class KernelMemoryCompatExports
     private const uint HostPageExecuteWriteCopy = 0x80;
     private const uint HostPageGuard = 0x100;
     private const int Enomem = 12;
+    private const int Eacces = 13;
     private const int Efault = 14;
+    private const int Ebadf = 9;
     private const int Einval = 22;
     private const int Erange = 34;
     private const int Struncate = 80;
@@ -1221,6 +1223,33 @@ public static partial class KernelMemoryCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // reallocalign(ptr, size, alignment): like realloc, but the caller supplies a fresh
+    // alignment requirement instead of inheriting the original allocation's alignment.
+    [SysAbiExport(
+        Nid = "OGybVuPAhAY",
+        ExportName = "reallocalign",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int ReallocAlign(CpuContext ctx)
+    {
+        var existingAddress = ctx[CpuRegister.Rdi];
+        var requestedSize = ctx[CpuRegister.Rsi];
+        var alignmentValue = ctx[CpuRegister.Rdx];
+
+        ctx[CpuRegister.Rax] =
+            TryReallocateAlignedLibcHeap(existingAddress, requestedSize, alignmentValue, out var resizedAddress)
+                ? resizedAddress
+                : 0;
+        TraceLibcAllocation(
+            ctx,
+            "reallocalign",
+            size: requestedSize,
+            alignment: alignmentValue,
+            existingAddress: existingAddress,
+            resultAddress: ctx[CpuRegister.Rax]);
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     // C++'s operator new/delete family are, by default, thin wrappers over this same libc
     // heap (this is also how real libstdc++/libc++ implement them), so they're kept HLE and
     // routed through the exact same TryAllocateLibcHeap/FreeLibcHeap helpers as malloc/free
@@ -1621,6 +1650,34 @@ public static partial class KernelMemoryCompatExports
         }
     }
 
+    // open(2) follows the libc/POSIX ABI: failures return -1 and expose the
+    // reason through errno, same as PosixStat below - KernelOpenUnderscore's
+    // raw Orbis kernel codes (e.g. ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002)
+    // otherwise flow straight into RAX. Guest File::Open compares only the
+    // low 32 bits of the return against -1 (`cmp eax, -1`); 0x80020002 never
+    // equals 0xFFFFFFFF, so a missing file was silently read back as success
+    // with a bogus fd - traced end-to-end to a null-pointer crash deep in
+    // IL2CPP metadata symbol loading (a missing, optional il2cpp.usym file).
+    internal static int PosixOpenCore(CpuContext ctx)
+    {
+        var result = KernelOpenUnderscore(ctx);
+        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return 0;
+        }
+
+        var errno = result switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_PERMISSION_DENIED => Eacces,
+            _ => 2, // ENOENT
+        };
+        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
+        ctx[CpuRegister.Rax] = ulong.MaxValue;
+        return -1;
+    }
+
     [SysAbiExport(
         Nid = "NNtFaKJbPt0",
         ExportName = "_close",
@@ -1908,6 +1965,29 @@ public static partial class KernelMemoryCompatExports
 
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    // fstat(2) is POSIX ABI, same reasoning as PosixOpenCore above: translate
+    // KernelFstat's raw Orbis kernel codes into -1/errno instead of letting
+    // them flow into RAX unchanged, where guest code's `cmp eax, -1` would
+    // never trip on them.
+    internal static int PosixFstatCore(CpuContext ctx)
+    {
+        var result = KernelFstat(ctx);
+        if (result == (int)OrbisGen2Result.ORBIS_GEN2_OK)
+        {
+            return 0;
+        }
+
+        var errno = result switch
+        {
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT => Einval,
+            (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT => Efault,
+            _ => Ebadf, // fstat operates on a descriptor, not a path - ENOENT doesn't apply
+        };
+        KernelRuntimeCompatExports.TrySetErrno(ctx, errno);
+        ctx[CpuRegister.Rax] = ulong.MaxValue;
+        return -1;
     }
 
     [SysAbiExport(
@@ -4867,7 +4947,7 @@ public static partial class KernelMemoryCompatExports
                 guestPath.StartsWith("$\\", StringComparison.Ordinal))
             {
                 var relative = NormalizeMountRelativePath(guestPath[2..]);
-                return Path.Combine(app0Root, relative);
+                return ResolveApp0RelativePath(app0Root, relative);
             }
 
             if (string.Equals(guestPath, "/app0", StringComparison.OrdinalIgnoreCase) ||
@@ -4879,13 +4959,13 @@ public static partial class KernelMemoryCompatExports
             if (guestPath.StartsWith("/app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["/app0/".Length..]);
-                return Path.Combine(app0Root, relative);
+                return ResolveApp0RelativePath(app0Root, relative);
             }
 
             if (guestPath.StartsWith("app0/", StringComparison.OrdinalIgnoreCase))
             {
                 var relative = NormalizeMountRelativePath(guestPath["app0/".Length..]);
-                return Path.Combine(app0Root, relative);
+                return ResolveApp0RelativePath(app0Root, relative);
             }
 
             if (!Path.IsPathFullyQualified(guestPath) &&
@@ -4893,11 +4973,41 @@ public static partial class KernelMemoryCompatExports
                 !guestPath.StartsWith("\\", StringComparison.Ordinal))
             {
                 var relative = NormalizeMountRelativePath(guestPath);
-                return Path.Combine(app0Root, relative);
+                return ResolveApp0RelativePath(app0Root, relative);
             }
         }
 
         return guestPath;
+    }
+
+    // Some PS5 dumps repack the game as a flat directory, dropping the subdirectory
+    // structure the guest still expects (the same root cause already fixed once for
+    // .prx/.sprx modules in SharpEmuRuntime.LoadAdjacentSceModules, which scans the eboot
+    // directory itself as a fallback). This mirrors that for arbitrary file opens: IL2CPP's
+    // own bootstrap requests e.g. "Media/Metadata/global-metadata.dat" and silently aborts
+    // init when that 404s, even though the file exists flat at the game root. Only fall
+    // back for files (not directories, which the module scan already handles its own way),
+    // and only when the guest-requested nested path doesn't exist, so a real nested layout
+    // is never shadowed by an unrelated same-named flat file.
+    internal static string ResolveApp0RelativePath(string app0Root, string relative)
+    {
+        var primary = Path.Combine(app0Root, relative);
+        if (File.Exists(primary) || Directory.Exists(primary))
+        {
+            return primary;
+        }
+
+        var fileName = Path.GetFileName(relative);
+        if (!string.IsNullOrEmpty(fileName) && !string.Equals(fileName, relative, StringComparison.Ordinal))
+        {
+            var flat = Path.Combine(app0Root, fileName);
+            if (File.Exists(flat))
+            {
+                return flat;
+            }
+        }
+
+        return primary;
     }
 
     private static bool TryResolveRegisteredGuestMount(string guestPath, out string hostPath)
@@ -5534,7 +5644,7 @@ public static partial class KernelMemoryCompatExports
         return true;
     }
 
-    private static bool TryReadUInt32Compat(CpuContext ctx, ulong address, out uint value)
+    internal static bool TryReadUInt32Compat(CpuContext ctx, ulong address, out uint value)
     {
         Span<byte> bytes = stackalloc byte[sizeof(uint)];
         if (!TryReadCompat(ctx, address, bytes))
@@ -6539,6 +6649,55 @@ public static partial class KernelMemoryCompatExports
         }
 
         var bytesToCopy = Math.Min(allocation.Size, (nuint)requestedSize);
+        Buffer.MemoryCopy(
+            source: (void*)existingAddress,
+            destination: (void*)resizedAddress,
+            destinationSizeInBytes: checked((long)Math.Max(bytesToCopy, 1u)),
+            sourceBytesToCopy: checked((long)bytesToCopy));
+        FreeLibcHeap(existingAddress);
+        return true;
+    }
+
+    private static unsafe bool TryReallocateAlignedLibcHeap(ulong existingAddress, ulong requestedSize, ulong alignmentValue, out ulong resizedAddress)
+    {
+        resizedAddress = 0;
+        if (existingAddress == 0)
+        {
+            return TryAllocateAlignedLibcHeap(alignmentValue, requestedSize, requireSizeMultiple: false, out resizedAddress);
+        }
+
+        if (requestedSize == 0)
+        {
+            FreeLibcHeap(existingAddress);
+            return true;
+        }
+
+        if (!TryValidateAlignedAllocation(
+                alignmentValue,
+                requestedSize,
+                requireSizeMultiple: false,
+                requirePointerSizedAlignment: false,
+                out var alignment,
+                out var size))
+        {
+            return false;
+        }
+
+        LibcHeapAllocation allocation;
+        lock (_libcAllocGate)
+        {
+            if (!_libcAllocations.TryGetValue(existingAddress, out allocation))
+            {
+                return false;
+            }
+        }
+
+        if (!TryAllocateLibcHeapCore(size, alignment, zeroFill: false, out resizedAddress))
+        {
+            return false;
+        }
+
+        var bytesToCopy = Math.Min(allocation.Size, size);
         Buffer.MemoryCopy(
             source: (void*)existingAddress,
             destination: (void*)resizedAddress,

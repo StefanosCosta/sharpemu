@@ -402,6 +402,7 @@ public sealed partial class DirectExecutionBackend
 						rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,
 						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
+					DumpGuestMemScanDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
 					SharpEmu.HLE.GuestImageWriteTracker.FlushPendingDiagnostics();
 					break;
@@ -761,6 +762,141 @@ public sealed partial class DirectExecutionBackend
 			if (!hitCounts.TryGetValue(target, out var count) || count == 0)
 			{
 				Console.Error.WriteLine($"[LOADER][INFO]   Ref scan 0x{target:X16}: none");
+			}
+		}
+	}
+
+	// Temporary ASCII byte-pattern scanner (SHARPEMU_LOG_MEMSCAN_TEXT) for locating a string
+	// literal's guest address so SHARPEMU_LOG_REFSCAN_ADDRS can then find who reads it. Unlike
+	// DumpGuestReferenceDiagnostics, this must walk readable-but-not-executable regions too,
+	// since string literals normally live in rodata, not code.
+	private unsafe void DumpGuestMemScanDiagnostics()
+	{
+		var rawTargets = Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEMSCAN_TEXT");
+		if (string.IsNullOrWhiteSpace(rawTargets) || _cpuContext == null)
+		{
+			return;
+		}
+
+		var tokens = rawTargets.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+		var targets = new List<byte[]>(tokens.Length);
+		foreach (var token in tokens)
+		{
+			var bytes = System.Text.Encoding.ASCII.GetBytes(token);
+			if (bytes.Length > 0)
+			{
+				targets.Add(bytes);
+			}
+		}
+
+		if (targets.Count == 0)
+		{
+			return;
+		}
+
+		const ulong scanBase = 0x0000000800000000UL;
+		const ulong scanEnd = 0x0000000810000000UL;
+		const int maxHitsPerTarget = 24;
+
+		Console.Error.WriteLine($"[LOADER][INFO]   Mem scan targets: {string.Join(", ", tokens)}");
+		var scanStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+		var hitCounts = new int[targets.Count];
+
+		ulong address = scanBase;
+		while (address < scanEnd)
+		{
+			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				break;
+			}
+
+			ulong regionBase = mbi.BaseAddress;
+			ulong regionEnd = regionBase + mbi.RegionSize;
+			if (regionEnd <= address)
+			{
+				break;
+			}
+
+			if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect))
+			{
+				ScanRegionForByteTargets(regionBase, regionEnd, targets, hitCounts, maxHitsPerTarget);
+			}
+
+			var allTargetsSatisfied = true;
+			for (var i = 0; i < targets.Count; i++)
+			{
+				if (hitCounts[i] < maxHitsPerTarget)
+				{
+					allTargetsSatisfied = false;
+					break;
+				}
+			}
+
+			if (allTargetsSatisfied)
+			{
+				break;
+			}
+
+			address = regionEnd;
+		}
+
+		Console.Error.WriteLine($"[LOADER][INFO]   Mem scan done t={scanStopwatch.Elapsed.TotalSeconds:F2}s");
+		for (var i = 0; i < targets.Count; i++)
+		{
+			if (hitCounts[i] == 0)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO]   Mem scan \"{tokens[i]}\": none");
+			}
+		}
+	}
+
+	private void ScanRegionForByteTargets(
+		ulong regionBase,
+		ulong regionEnd,
+		IReadOnlyList<byte[]> targets,
+		int[] hitCounts,
+		int maxHitsPerTarget)
+	{
+		if (_cpuContext == null || regionEnd <= regionBase)
+		{
+			return;
+		}
+
+		var regionLength = regionEnd - regionBase;
+		if (regionLength > int.MaxValue)
+		{
+			regionLength = int.MaxValue;
+		}
+
+		var buffer = new byte[(int)regionLength];
+		if (!_cpuContext.Memory.TryRead(regionBase, buffer))
+		{
+			return;
+		}
+
+		for (var t = 0; t < targets.Count; t++)
+		{
+			if (hitCounts[t] >= maxHitsPerTarget)
+			{
+				continue;
+			}
+
+			var needle = targets[t];
+			var searchOffset = 0;
+			while (hitCounts[t] < maxHitsPerTarget && searchOffset < buffer.Length)
+			{
+				var relativeIndex = buffer.AsSpan(searchOffset).IndexOf(needle);
+				if (relativeIndex < 0)
+				{
+					break;
+				}
+
+				var hitAddress = regionBase + (ulong)(searchOffset + relativeIndex);
+				hitCounts[t]++;
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Mem scan hit \"{System.Text.Encoding.ASCII.GetString(needle)}\" at 0x{hitAddress:X16}");
+				searchOffset += relativeIndex + 1;
 			}
 		}
 	}

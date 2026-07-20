@@ -1743,6 +1743,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool CanUseLleLibcAllocatorFamily()
 	{
+		
 		// Deliberately always false: HLE's aligned-allocation exports (memalign/aligned_alloc/
 		// posix_memalign) carve memory from SharpEmu's own guest heap, which is backed by
 		// freshly-committed, demand-paged host memory that reads as zero on first touch. Guest

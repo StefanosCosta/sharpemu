@@ -1743,18 +1743,52 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool CanUseLleLibcAllocatorFamily()
 	{
-		
-		// Deliberately always false: HLE's aligned-allocation exports (memalign/aligned_alloc/
-		// posix_memalign) carve memory from SharpEmu's own guest heap, which is backed by
-		// freshly-committed, demand-paged host memory that reads as zero on first touch. Guest
-		// code that lazily initializes a field only "if it reads as zero" (a real pattern found
-		// in metal_slug's IL2CPP-style per-thread allocator bucket bookkeeping) works by accident
-		// under that HLE heap, but a real host memalign() can return recycled, non-zeroed heap
-		// memory instead - dereferencing the unpopulated field then crashes. Since glibc's malloc/
-		// free/calloc/realloc/memalign/aligned_alloc/posix_memalign all share one underlying heap,
-		// mixing LLE for some of these with HLE for others would let guest code free an
-		// HLE-allocated (non-native) pointer through a real host free(), corrupting the host heap.
-		// So this family must stay all-HLE together rather than partially LLE'd.
+		// HLE's aligned-allocation exports (memalign/aligned_alloc/posix_memalign) carve memory
+		// from SharpEmu's own guest heap, which is backed by freshly-committed, demand-paged host
+		// memory that reads as zero on first touch. Guest code that lazily initializes a field
+		// only "if it reads as zero" (a real pattern found in IL2CPP-style per-thread allocator
+		// bucket bookkeeping, observed in Metal Slug Tactics) works by accident under that HLE
+		// heap, but a real host memalign() can return recycled, non-zeroed heap memory instead -
+		// dereferencing the unpopulated field then crashes. IL2CPP presence is auto-detected in
+		// SharpEmuRuntime.LoadAdjacentSceModules (an Il2cpp*-named module on disk is a reliable,
+		// title-agnostic signal for this exact bug class), so this only forces the family to HLE
+		// for titles that actually need it rather than globally. SHARPEMU_FORCE_HLE_LIBC_ALLOCATOR
+		// is a manual escape hatch for a title hitting the same pattern without IL2CPP present.
+		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DETECTED_IL2CPP"), "1", StringComparison.Ordinal) ||
+			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_FORCE_HLE_LIBC_ALLOCATOR"), "1", StringComparison.Ordinal))
+		{
+			return false;
+		}
+
+		// Since glibc's malloc/free/calloc/realloc/memalign/aligned_alloc/posix_memalign all
+		// share one underlying heap, mixing LLE for some of these with HLE for others would let
+		// guest code free an HLE-allocated (non-native) pointer through a real host free(),
+		// corrupting the host heap - so the whole family must move together, hence checking all
+		// seven rather than each independently.
+		return HasUsableLleLibcExport("gQX+4GDQjpM", "malloc") &&
+			HasUsableLleLibcExport("tIhsqj0qsFE", "free") &&
+			HasUsableLleLibcExport("2X5agFjKxMc", "calloc") &&
+			HasUsableLleLibcExport("Y7aJ1uydPMo", "realloc") &&
+			HasUsableLleLibcExport("Ujf3KzMvRmI", "memalign") &&
+			HasUsableLleLibcExport("2Btkg8k24Zg", "aligned_alloc") &&
+			HasUsableLleLibcExport("cVSk9y8URbc", "posix_memalign");
+	}
+
+	private bool HasUsableLleLibcExport(string nid, string exportName)
+	{
+		if (TryResolveRuntimeSymbolAddress(nid, out var address) && IsDirectImportTargetUsable(address))
+		{
+			return true;
+		}
+
+		foreach (var candidate in EnumerateRuntimeSymbolCandidates(exportName))
+		{
+			if (TryResolveRuntimeSymbolAddress(candidate, out address) && IsDirectImportTargetUsable(address))
+			{
+				return true;
+			}
+		}
+
 		return false;
 	}
 

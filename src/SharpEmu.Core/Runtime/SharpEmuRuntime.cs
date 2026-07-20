@@ -674,6 +674,18 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
             .Select(group => group.First())
             .ToArray();
 
+        // Unity's PS5 IL2CPP build pipeline always ships its AOT-compiled runtime as a module
+        // literally named Il2cppUserAssemblies.prx, so its mere presence on disk is a reliable,
+        // title-agnostic signal - detected here (before any module's imports get bound) so
+        // DirectExecutionBackend.CanUseLleLibcAllocatorFamily can automatically prefer the HLE
+        // allocator family for IL2CPP titles without needing a per-title config.
+        if (allModulePaths.Any(entry => Path.GetFileNameWithoutExtension(entry.Path)
+                .Contains("Il2cpp", StringComparison.OrdinalIgnoreCase)))
+        {
+            Environment.SetEnvironmentVariable("SHARPEMU_DETECTED_IL2CPP", "1");
+            Console.Error.WriteLine("[RUNTIME] Detected IL2CPP title (Il2cpp*-named module present).");
+        }
+
         var modulePaths = allModulePaths
             .Where(entry => ShouldPreloadModule(entry.Path))
             .ToArray();

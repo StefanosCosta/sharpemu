@@ -126,6 +126,25 @@ public interface IGuestThreadScheduler
     /// observed. Defaults to false for schedulers that never queue exceptions.
     /// </summary>
     bool HasPendingGuestException(ulong threadHandle) => false;
+
+    /// <summary>
+    /// Reports whether the CURRENT calling thread — cooperative or the external/
+    /// primordial thread whose handle an HLE cannot cheaply obtain — has a queued
+    /// guest exception. Host-parked HLE waits consult this before and while they
+    /// sleep. Defaults to false.
+    /// </summary>
+    bool HasPendingGuestExceptionForCurrentThread() => false;
+
+    /// <summary>
+    /// Runs any queued guest exception for the CURRENT calling thread synchronously,
+    /// in place, on this host thread — capturing the interrupted continuation from
+    /// the active import call frame — and returns after the handler returns. Returns
+    /// true if a handler was delivered. Host-parked HLE waits use this so an
+    /// asynchronously-delivered signal (e.g. an IL2CPP stop-the-world SIGUSR1) is
+    /// observed and acknowledged without spuriously returning from the wait. Defaults
+    /// to false.
+    /// </summary>
+    bool TryDeliverPendingGuestExceptionInPlace(CpuContext currentContext) => false;
 }
 
 public readonly record struct GuestImportCallFrame(
@@ -465,6 +484,17 @@ public static class GuestThreadExecution
             RestoreFullFpuState: false);
         return true;
     }
+
+    /// <summary>
+    /// Public wrapper over the block-continuation capture, for HLE waits that must
+    /// deliver a queued guest exception in place: it snapshots the interrupted guest
+    /// state from the live import call frame (return RIP / resume RSP / return slot)
+    /// plus the caller's register context, identical to what the import-boundary
+    /// delivery uses. Fails if there is no active import call frame.
+    /// </summary>
+    public static bool TryCaptureCurrentImportBoundaryContinuation(
+        CpuContext context, out GuestCpuContinuation continuation)
+        => TryCaptureCurrentBlockContinuation(context, out continuation);
 
     public static void RequestCurrentEntryExit(string reason, int status)
     {

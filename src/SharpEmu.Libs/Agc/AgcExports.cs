@@ -3114,6 +3114,28 @@ public static partial class AgcExports
 
             var op = (header >> 8) & 0xFFu;
             var register = (header >> 2) & 0x3Fu;
+
+            // DIAG (probe): census of EVERY distinct PM4 opcode in the graphics
+            // stream — subnautica never sets CB_COLOR via SET_CONTEXT_REG, so the RT
+            // must bind via a packet SharpEmu doesn't decode (e.g. LOAD_CONTEXT_REG
+            // 0x61 / LOAD_CONTEXT_REG_INDEX 0x9F). Dump the set once so we can see it.
+            if (_traceAgcShader && ReferenceEquals(state, gpuState.Graphics))
+            {
+                lock (_diagOpcodeGate)
+                {
+                    _diagAllOpcodes.Add(op);
+                    if (!_diagOpcodeSetDumped && ++_diagOpcodeTicks == 40000)
+                    {
+                        _diagOpcodeSetDumped = true;
+                        var ops = _diagAllOpcodes.ToList();
+                        ops.Sort();
+                        Console.Error.WriteLine(
+                            "[LOADER][TRACE] agc.opcode_set graphics distinct=" +
+                            $"{ops.Count} ops=[{string.Join(',', ops.Select(o => $"0x{o:X2}"))}]");
+                    }
+                }
+            }
+
             if (_traceFramePackets && ReferenceEquals(state, gpuState.Graphics))
             {
                 var packetKey = (op, op == ItNop ? register : uint.MaxValue);
@@ -3448,6 +3470,32 @@ public static partial class AgcExports
                         $"size={pendingDisplayTarget.Width}x{pendingDisplayTarget.Height}");
                     state.PendingTargetlessDraw = null;
                     state.TranslatedDraw = null;
+                }
+
+                if (_traceAgcShader &&
+                    System.Threading.Interlocked.Increment(ref _diagFlipContentDumps) <= 8 &&
+                    VideoOutExports.TryGetDisplayBufferInfo(handle, displayBufferIndex, out var diagBuf))
+                {
+                    // DIAG: is the computed frame actually IN the scanout buffer?
+                    // If so, the fix is to present its linear content directly.
+                    ulong nonZero = 0, total = 0;
+                    for (uint i = 0; i < 8192; i++)
+                    {
+                        if (TryReadUInt32(ctx, diagBuf.Address + ((ulong)i * 4), out var dw))
+                        {
+                            total++;
+                            if (dw != 0)
+                            {
+                                nonZero++;
+                            }
+                        }
+                    }
+
+                    _ = TryReadUInt32(ctx, diagBuf.Address, out var d0);
+                    _ = TryReadUInt32(ctx, diagBuf.Address + 0x100000, out var dMid);
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.flip_content addr=0x{diagBuf.Address:X16} " +
+                        $"nonzero={nonZero}/{total} d0=0x{d0:X8} d1MB=0x{dMid:X8}");
                 }
 
                 if (VideoOutExports.TryGetDisplayBufferInfo(
@@ -4027,6 +4075,16 @@ public static partial class AgcExports
 
     private static void ResetSubmittedParserState(SubmittedDcbState state)
     {
+        if (_traceAgcShader)
+        {
+            // DIAG (black-screen investigation): does a RESET discard a populated
+            // CB_COLOR-bearing register bank right before the draws (H2)?
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.parser_reset " +
+                $"cxCount={state.CxRegisters.Count} shCount={state.ShRegisters.Count} " +
+                $"cb0Base={state.CxRegisters.ContainsKey(CbColor0Base)}");
+        }
+
         // Queue ownership, pending submissions and suspension bookkeeping are
         // deliberately retained. Work emitted before this packet already owns
         // immutable snapshots; clearing these fields affects only commands
@@ -5356,6 +5414,18 @@ public static partial class AgcExports
                 directDestination[startRegister + index] = value;
             }
 
+            // DIAG (probe 1): does CB_COLOR (0x318) ever arrive via the DIRECT
+            // SetContextReg packet path (as opposed to the indirect blob)?
+            if (_traceAgcShader && op == ItSetContextReg &&
+                startRegister <= CbColor0Base &&
+                CbColor0Base < startRegister + (packetLength - 2) &&
+                _diagCxColorBaseHits++ < 8)
+            {
+                Console.Error.WriteLine(
+                    "[LOADER][TRACE] agc.cx_color_base_SEEN path=direct " +
+                    $"start=0x{startRegister:X4} count={packetLength - 2}");
+            }
+
             return;
         }
 
@@ -5374,12 +5444,25 @@ public static partial class AgcExports
             RShRegsIndirect => state.ShRegisters,
             _ => state.UcRegisters,
         };
+        // DIAG (black-screen investigation): summarize what an indirect blob apply
+        // actually contains, to see if CB_COLOR (0x318) ever arrives via this path.
+        var diagZeroOffsets = 0u;
+        var diagSawColorBase = false;
+        var diagApplied = 0u;
         for (uint index = 0; index < registerCount; index++)
         {
             var entryAddress = registersAddress + ((ulong)index * 8);
             if (!TryReadUInt32(ctx, entryAddress, out var registerOffset) ||
                 !TryReadUInt32(ctx, entryAddress + sizeof(uint), out var value))
             {
+                if (_traceAgcShader)
+                {
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] agc.indirect_apply_readfail " +
+                        $"space={(register == RCxRegsIndirect ? "cx" : register == RShRegsIndirect ? "sh" : "uc")} " +
+                        $"regs=0x{registersAddress:X16} count={registerCount} index={index} applied={diagApplied}");
+                }
+
                 return;
             }
 
@@ -5388,8 +5471,154 @@ public static partial class AgcExports
             // Dropping it leaves stale depth/render-control state active in
             // later passes.
             destination[registerOffset] = value;
+            diagApplied++;
+            if (registerOffset == 0)
+            {
+                diagZeroOffsets++;
+            }
+
+            if (register == RCxRegsIndirect && registerOffset == CbColor0Base)
+            {
+                diagSawColorBase = true;
+            }
+
+            // DIAG (probe 1): accumulate EVERY distinct cx offset written by ANY
+            // indirect blob (including the count 190/191/192 per-draw ones that the
+            // sampler below skips), and shout the first time CB_COLOR / any CB_COLORn
+            // base (0x318 + n*0xF) ever lands via this path.
+            if (_traceAgcShader && register == RCxRegsIndirect)
+            {
+                lock (_diagCxOffsetGate)
+                {
+                    _diagAllCxOffsets.Add(registerOffset);
+                    var isColorBase = registerOffset >= CbColor0Base &&
+                        registerOffset <= CbColor0Base + 7 * 0xF &&
+                        (registerOffset - CbColor0Base) % 0xF == 0;
+                    if (isColorBase && _diagCxColorBaseHits++ < 8)
+                    {
+                        Console.Error.WriteLine(
+                            "[LOADER][TRACE] agc.cx_color_base_SEEN " +
+                            $"off=0x{registerOffset:X4} val=0x{value:X8} " +
+                            $"blobCount={registerCount} regs=0x{registersAddress:X16}");
+                    }
+                }
+            }
+        }
+
+        if (_traceAgcShader && register == RCxRegsIndirect)
+        {
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.indirect_apply_cx " +
+                $"regs=0x{registersAddress:X16} count={registerCount} applied={diagApplied} " +
+                $"zeroOffsets={diagZeroOffsets} sawColorBase={diagSawColorBase}");
+
+            // DIAG (probe 1): once we've applied a good sample, print the full set of
+            // distinct cx offsets any indirect blob ever touched, so we can see
+            // whether CB_COLOR (0x318) is present anywhere at all.
+            lock (_diagCxOffsetGate)
+            {
+                if (!_diagCxOffsetSetDumped && ++_diagCxApplyTicks == 6000)
+                {
+                    _diagCxOffsetSetDumped = true;
+                    var sorted = _diagAllCxOffsets.ToList();
+                    sorted.Sort();
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.cx_offset_set distinct={sorted.Count} " +
+                        $"hasColor318={_diagAllCxOffsets.Contains(CbColor0Base)} " +
+                        $"offsets=[{string.Join(',', sorted.Select(o => $"0x{o:X}"))}]");
+                }
+            }
+
+            // DIAG: sample a couple of the common per-draw blobs (count 190/191/192)
+            // — the ones the odd-blob sampler below excludes — to see if CB_COLOR
+            // lives in THOSE.
+            if (register == RCxRegsIndirect &&
+                registerCount is (190 or 191 or 192) &&
+                System.Threading.Interlocked.Increment(ref _diagCxDrawBlobDumps) <= 2)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.cx_drawblob regs=0x{registersAddress:X16} count={registerCount}");
+                for (uint index = 0; index < registerCount; index++)
+                {
+                    var entryAddress = registersAddress + ((ulong)index * 8);
+                    if (!TryReadUInt32(ctx, entryAddress, out var off) ||
+                        !TryReadUInt32(ctx, entryAddress + 4, out var val))
+                    {
+                        break;
+                    }
+
+                    if (off != 0 || val != 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.cx_drawblob_pair idx={index} off=0x{off:X4} val=0x{val:X8}");
+                    }
+                }
+
+                // LATE dump (during actual rendering) of the offset-base template
+                // 0x8019CD290 the odd-builder adds index*scale to. If still all-zero
+                // here, the register-offset base table is uninitialised -> every
+                // indirect offset collapses toward 0 -> RT never binds.
+                var lateTmpl = new byte[0x120];
+                if (ctx.Memory.TryRead(0x8019CD1F0UL, lateTmpl))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.reg_template_late base=0x8019CD1F0: {Convert.ToHexString(lateTmpl)}");
+                }
+            }
+
+            // DIAG: dump the full (offset,value) + raw-dword contents of the first
+            // few "odd" cx blobs (count not the common per-draw 190/192) at APPLY
+            // time — these are the patch-built render-target blobs.
+            if (register == RCxRegsIndirect &&
+                registerCount is not (190 or 191 or 192) &&
+                System.Threading.Interlocked.Increment(ref _diagCxBlobDumps) <= 2)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.cx_oddblob regs=0x{registersAddress:X16} count={registerCount}");
+                for (uint index = 0; index < registerCount; index++)
+                {
+                    var entryAddress = registersAddress + ((ulong)index * 8);
+                    if (!TryReadUInt32(ctx, entryAddress, out var off) ||
+                        !TryReadUInt32(ctx, entryAddress + 4, out var val))
+                    {
+                        break;
+                    }
+
+                    if (off != 0 || val != 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.cx_oddblob_pair idx={index} off=0x{off:X4} val=0x{val:X8}");
+                    }
+                }
+
+                for (uint index = 0; index < (registerCount * 2u); index++)
+                {
+                    if (!TryReadUInt32(ctx, registersAddress + ((ulong)index * 4), out var dw))
+                    {
+                        break;
+                    }
+
+                    if (dw != 0)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.cx_oddblob_raw dw={index} value=0x{dw:X8}");
+                    }
+                }
+            }
         }
     }
+
+    private static int _diagCxBlobDumps;
+    private static int _diagCxDrawBlobDumps;
+    private static readonly object _diagOpcodeGate = new();
+    private static readonly System.Collections.Generic.HashSet<uint> _diagAllOpcodes = new();
+    private static int _diagOpcodeTicks;
+    private static bool _diagOpcodeSetDumped;
+    private static readonly object _diagCxOffsetGate = new();
+    private static readonly System.Collections.Generic.HashSet<uint> _diagAllCxOffsets = new();
+    private static int _diagCxColorBaseHits;
+    private static int _diagCxApplyTicks;
+    private static bool _diagCxOffsetSetDumped;
 
     private static bool TryReadSubmittedDrawCount(
         CpuContext ctx,
@@ -5460,6 +5689,21 @@ public static partial class AgcExports
         var hasPsInputAddr = state.CxRegisters.TryGetValue(SpiPsInputAddr, out var psInputAddr);
         state.UcRegisters.TryGetValue(VgtPrimitiveType, out var primitiveType);
         var renderTargets = GetRenderTargets(state.CxRegisters);
+        if (_traceAgcShader)
+        {
+            // DIAG (black-screen investigation): per-draw census of the register
+            // state GetRenderTargets consumes, to see which CB_COLOR/PS registers
+            // are missing at draw time (unsampled, unlike TraceSubmittedPacket).
+            var cx = state.CxRegisters;
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.draw_census " +
+                $"cxCount={cx.Count} shCount={state.ShRegisters.Count} rts={renderTargets.Count} " +
+                $"cb0Base={cx.ContainsKey(CbColor0Base)} cb0Ext={cx.ContainsKey(CbColor0BaseExt)} " +
+                $"cb0Info={cx.ContainsKey(CbColor0Info)} cb0Attr2={cx.ContainsKey(CbColor0Attrib2)} " +
+                $"cb0Attr3={cx.ContainsKey(CbColor0Attrib3)} tgtMask={cx.ContainsKey(CbTargetMask)} " +
+                $"psInEna={hasPsInputEna} psInAddr={hasPsInputAddr} " +
+                $"ps={hasPixelShader} es={hasExportShader}");
+        }
         var drawSequence = ++gpuState.WorkSequence;
         if (state.PendingTargetlessDraw is { } stalePendingDraw)
         {
@@ -10564,9 +10808,90 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.patch_{registerSpace}_addr cmd=0x{commandAddress:X16} regs=0x{registersAddress:X16}");
+        if (_traceAgcShader && registerSpace == "cx" &&
+            System.Threading.Interlocked.Increment(ref _diagPatchAddrDumps) <= 4)
+        {
+            var callerRet = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var r) ? r : 0;
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.patch_addr_args " +
+                $"rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16} " +
+                $"caller_ret=0x{callerRet:X16}");
+            // Dump the caller function's code (guest is running, no stall) so the
+            // CxRegister-array build can be disassembled offline.
+            if (callerRet is > 0x800000000 and < 0x808000000)
+            {
+                var dumpBase = callerRet - 0x120;
+                var bytes = new byte[0x180];
+                if (ctx.Memory.TryRead(dumpBase, bytes))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.caller_code base=0x{dumpBase:X16}: {Convert.ToHexString(bytes)}");
+                }
+
+                // Walk one frame up: at SetAddress time rbp == the builder's frame
+                // base, so [rbp+8] is the return address into the builder's CALLER
+                // (the code that fills the source (offset,value) array). Dump it to
+                // reverse where the register OFFSETS come from.
+                if (ctx.TryReadUInt64(ctx[CpuRegister.Rbp] + 8, out var builderCaller) &&
+                    builderCaller is > 0x800000000 and < 0x808000000)
+                {
+                    var upBase = builderCaller - 0x160;
+                    var upBytes = new byte[0x200];
+                    if (ctx.Memory.TryRead(upBase, upBytes))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.builder_caller ret=0x{builderCaller:X16} base=0x{upBase:X16}: {Convert.ToHexString(upBytes)}");
+                    }
+
+                    // DIAG (per-draw blob RE): scan the guest image for the register
+                    // OFFSET template that the per-draw blob builder copies from. The
+                    // region-B offsets include a contiguous run 0x191,0x192,...,0x1B0
+                    // (SPI_PS_INPUT_CNTL_0..31) — 32 consecutive u32s incrementing by 1
+                    // is a strong, unique signature. Report every address where that run
+                    // appears as static data so the builder can be found by xref.
+                    if (System.Threading.Interlocked.Exchange(ref _diagTemplateScanned, 1) == 0)
+                    {
+                        var chunk = new byte[0x1000 + 16];
+                        for (ulong scan = 0x800000000UL; scan < 0x802000000UL; scan += 0x1000UL)
+                        {
+                            if (!ctx.Memory.TryRead(scan, chunk))
+                            {
+                                continue;
+                            }
+
+                            for (var b = 0; b + 12 <= 0x1000; b += 4)
+                            {
+                                var v0 = BitConverter.ToUInt32(chunk, b);
+                                if (v0 != 0x191)
+                                {
+                                    continue;
+                                }
+
+                                var v1 = BitConverter.ToUInt32(chunk, b + 4);
+                                var v2 = BitConverter.ToUInt32(chunk, b + 8);
+                                if (v1 == 0x192 && v2 == 0x193)
+                                {
+                                    Console.Error.WriteLine(
+                                        "[LOADER][TRACE] agc.offset_table_found " +
+                                        $"addr=0x{scan + (ulong)b:X16}");
+                                }
+                            }
+                        }
+
+                        Console.Error.WriteLine("[LOADER][TRACE] agc.offset_table_scan_done");
+                    }
+                }
+            }
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    private static int _diagPatchAddrDumps;
+    private static int _diagFlipContentDumps;
+    private static int _diagTemplateScanned;
 
     private static int PatchWriteDataControlByte(CpuContext ctx, int byteIndex)
     {
@@ -10628,6 +10953,34 @@ public static partial class AgcExports
     {
         var commandAddress = ctx[CpuRegister.Rdi];
         var registerCount = (uint)ctx[CpuRegister.Rsi];
+        if (_traceAgcShader && registerSpace == "cx" &&
+            System.Threading.Interlocked.Increment(ref _diagPatchArgDumps) <= 8)
+        {
+            // DIAG: full arg dump + peek at any pointer arg, to find the source
+            // (offset,value) register data the patch is supposed to append.
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.patch_add_args " +
+                $"rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16} " +
+                $"r8=0x{ctx[CpuRegister.R8]:X16} r9=0x{ctx[CpuRegister.R9]:X16}");
+            foreach (var (name, ptr) in new[]
+                     {
+                         ("rdx", ctx[CpuRegister.Rdx]), ("rcx", ctx[CpuRegister.Rcx]),
+                         ("r8", ctx[CpuRegister.R8]), ("r9", ctx[CpuRegister.R9]),
+                     })
+            {
+                if (ptr > 0x10000 && TryReadUInt32(ctx, ptr, out var p0) &&
+                    TryReadUInt32(ctx, ptr + 4, out var p1) &&
+                    TryReadUInt32(ctx, ptr + 8, out var p2) &&
+                    TryReadUInt32(ctx, ptr + 12, out var p3))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.patch_add_argmem {name}=0x{ptr:X16} " +
+                        $"[0]=0x{p0:X8} [1]=0x{p1:X8} [2]=0x{p2:X8} [3]=0x{p3:X8}");
+                }
+            }
+        }
+
         if (commandAddress == 0)
         {
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT);
@@ -10640,9 +10993,55 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.patch_{registerSpace}_add cmd=0x{commandAddress:X16} add={registerCount} total={currentCount + registerCount}");
+
+        // DIAG (black-screen investigation): for the first few cx patch packets,
+        // inspect the packet header + the blob it points at, and scan for CB_COLOR
+        // (0x318). This checks the exact render-target blob the patch mechanism
+        // builds, which the per-apply census may not have sampled.
+        if (_traceAgcShader && registerSpace == "cx" &&
+            System.Threading.Interlocked.Increment(ref _diagCxPatchDumps) <= 4)
+        {
+            var finalCount = currentCount + registerCount;
+            var okHdr = TryReadUInt32(ctx, commandAddress, out var hdr);
+            var okAddr = TryReadUInt64(ctx, commandAddress + 8, out var blobAddr);
+            var sawColor = false;
+            var dumped = 0;
+            if (okAddr && blobAddr != 0)
+            {
+                // Dump raw dwords to reveal the true blob layout (pairs vs packed).
+                for (uint i = 0; i < (finalCount * 2) + 8; i++)
+                {
+                    if (!TryReadUInt32(ctx, blobAddr + ((ulong)i * 4), out var dw))
+                    {
+                        break;
+                    }
+
+                    if (dw == CbColor0Base)
+                    {
+                        sawColor = true;
+                    }
+
+                    if (dumped < 48)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.patch_cx_raw dw={i} value=0x{dw:X8}");
+                        dumped++;
+                    }
+                }
+            }
+
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.patch_cx_probe " +
+                $"cmd=0x{commandAddress:X16} hdrOk={okHdr} hdr=0x{hdr:X8} " +
+                $"blobAddr=0x{blobAddr:X16} finalCount={finalCount} sawColorBase={sawColor}");
+        }
+
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    private static int _diagCxPatchDumps;
+    private static int _diagPatchArgDumps;
 
     private static int DcbSetRegistersIndirect(CpuContext ctx, uint packetRegister, string registerSpace)
     {

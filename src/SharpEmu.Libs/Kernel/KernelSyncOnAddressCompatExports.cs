@@ -142,7 +142,11 @@ public static class KernelSyncOnAddressCompatExports
         var deadlineMs = timeoutAddress != 0
             ? Environment.TickCount64 + Math.Max(1L, timeoutUsec / 1000L)
             : long.MaxValue;
-        lock (gate)
+        var scheduler = GuestThreadExecution.Scheduler;
+        // Explicit Monitor.Enter/Exit (not lock{}) so the gate can be released while a
+        // queued async signal handler runs in place on this host thread.
+        Monitor.Enter(gate);
+        try
         {
             // Rechecked every iteration under the same lock SyncOnAddressWake pulses under,
             // instead of trusting Monitor.Wait's pulsed/timed-out return value alone - closes
@@ -156,8 +160,32 @@ public static class KernelSyncOnAddressCompatExports
                     return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
                 }
 
-                Monitor.Wait(gate, remaining <= 0 ? Timeout.Infinite : (int)Math.Min(remaining, int.MaxValue));
+                // Deliver a queued async guest exception (IL2CPP stop-the-world SIGUSR1)
+                // in place without returning from the futex wait; release the gate first
+                // (the handler parks on the GC's ResumeSemaphore for the whole cycle).
+                if (scheduler?.HasPendingGuestExceptionForCurrentThread() == true)
+                {
+                    Monitor.Exit(gate);
+                    try
+                    {
+                        scheduler.TryDeliverPendingGuestExceptionInPlace(ctx);
+                    }
+                    finally
+                    {
+                        Monitor.Enter(gate);
+                    }
+
+                    continue;
+                }
+
+                // Bounded (<=100ms) so the pending-exception poll above runs even for an
+                // otherwise-infinite wait, which SyncOnAddressWake would not pulse.
+                Monitor.Wait(gate, (int)Math.Min(remaining <= 0 ? long.MaxValue : remaining, 100));
             }
+        }
+        finally
+        {
+            Monitor.Exit(gate);
         }
 
         if (_traceSyncAddr) TraceSyncAddr($"wait-host-wake addr=0x{address:X16}");

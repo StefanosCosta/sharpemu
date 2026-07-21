@@ -4291,6 +4291,51 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		}
 	}
 
+	private ulong CurrentSignalDeliveryThreadHandle()
+	{
+		var handle = GuestThreadExecution.CurrentGuestThreadHandle;
+		return handle != 0 ? handle : _currentExternalGuestThreadHandle;
+	}
+
+	public bool HasPendingGuestExceptionForCurrentThread()
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		var handle = CurrentSignalDeliveryThreadHandle();
+		return handle != 0 && HasPendingGuestException(handle);
+	}
+
+	public bool TryDeliverPendingGuestExceptionInPlace(CpuContext currentContext)
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		var handle = CurrentSignalDeliveryThreadHandle();
+		if (handle == 0 || !HasPendingGuestException(handle))
+		{
+			return false;
+		}
+
+		// A host-parked HLE wait (WaitSema / SyncOnAddress on the primordial or any
+		// external thread) discovered a queued signal. Deliver it synchronously on
+		// this same host thread so the guest handler runs and acknowledges, then the
+		// caller re-enters its wait. The interrupted continuation is captured from the
+		// live import call frame + register context, matching the import-boundary path.
+		if (!GuestThreadExecution.TryCaptureCurrentImportBoundaryContinuation(
+				currentContext, out var continuation))
+		{
+			return false;
+		}
+
+		DeliverPendingGuestExceptionAtSafePoint(currentContext, continuation);
+		return true;
+	}
+
 	private static ulong FindGuestExceptionThreadRecord(
 		CpuContext context,
 		ulong callback,

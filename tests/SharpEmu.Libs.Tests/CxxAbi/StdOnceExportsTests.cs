@@ -3,10 +3,14 @@
 
 using SharpEmu.HLE;
 using SharpEmu.Libs.CxxAbi;
+using SharpEmu.Libs.Tests.Kernel;
 using Xunit;
 
 namespace SharpEmu.Libs.Tests.CxxAbi;
 
+// Shares the scheduler-state collection so it never runs in parallel with other
+// classes that mutate the process-wide GuestThreadExecution.Scheduler static.
+[Collection(GuestThreadSchedulerStateCollection.Name)]
 public sealed class StdOnceExportsTests
 {
     [Fact]

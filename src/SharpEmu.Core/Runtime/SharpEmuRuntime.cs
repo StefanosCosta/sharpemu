@@ -88,7 +88,14 @@ public sealed class SharpEmuRuntime : ISharpEmuRuntime
         moduleManager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4 | Generation.Gen5));
         moduleManager.Freeze();
 
-        var virtualMemory = new PhysicalVirtualMemory();
+        var virtualMemory = new PhysicalVirtualMemory
+        {
+            // Serve libc-malloc'd buffers (host addresses outside the region
+            // table) through the single ctx.Memory path, so every guest-buffer
+            // syscall (read/write/pread/recv/...) is malloc-safe without opting
+            // into a parallel fallback helper.
+            ExternalHostMemory = SharpEmu.Libs.Kernel.KernelMemoryCompatExports.ExternalHostMemoryAccessor.Instance,
+        };
 
         var fileSystem = new PhysicalFileSystem();
 

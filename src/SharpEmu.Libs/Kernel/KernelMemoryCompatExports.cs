@@ -95,7 +95,9 @@ public static partial class KernelMemoryCompatExports
     private const int KernelStatStBirthtimOffset = 104;
 
     private static readonly object _fdGate = new();
-    private static readonly Dictionary<int, FileStream> _openFiles = new();
+    // Stream (not FileStream) so synthetic device fds (e.g. /dev/urandom) can
+    // share the same read/write/close/lseek code paths as real files.
+    private static readonly Dictionary<int, Stream> _openFiles = new();
     private static readonly Dictionary<int, OpenDirectory> _openDirectories = new();
     private static readonly object _libcAllocGate = new();
     private static readonly object _memoryGate = new();
@@ -132,6 +134,87 @@ public static partial class KernelMemoryCompatExports
         {
             return (int)Interlocked.Increment(ref _nextFileDescriptor);
         }
+    }
+
+    // /dev/urandom (and the /dev/random, /dev/srandom aliases some libc/IL2CPP
+    // builds probe) has no host-filesystem backing, so an unhandled open() on
+    // these paths would fall through to ResolveGuestPath's real-filesystem
+    // path and come back ENOENT - some titles interpret that failure as a
+    // valid fd and spin forever reading it. Serve them as virtual devices
+    // instead, before any real-filesystem lookup is attempted.
+    private static bool TryOpenRandomDevice(string guestPath, out int fd)
+    {
+        if (guestPath is not ("/dev/urandom" or "/dev/random" or "/dev/srandom"))
+        {
+            fd = 0;
+            return false;
+        }
+
+        fd = AllocateGuestFileDescriptor();
+        lock (_fdGate)
+        {
+            _openFiles[fd] = new RandomDeviceStream();
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Minimal /dev/urandom-style character device: reads return
+    /// cryptographically random bytes, writes are accepted and discarded
+    /// (matching the real device mixing entropy in without exposing a
+    /// meaningful return value), and it has no seekable position or length,
+    /// same as the real device.
+    /// </summary>
+    private sealed class RandomDeviceStream : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+
+        // IOException (not NotSupportedException) so this fails the same way
+        // callers already expect a real device file to fail - every _openFiles
+        // call site in this codebase catches IOException around seek/length/
+        // position-style operations, matching a real /dev/urandom character
+        // device rejecting them.
+        public override long Length => throw new IOException("/dev/urandom has no length.");
+
+        public override long Position
+        {
+            get => throw new IOException("/dev/urandom has no seek position.");
+            set => throw new IOException("/dev/urandom has no seek position.");
+        }
+
+        public override int Read(byte[] buffer, int offset, int count)
+        {
+            if (count == 0)
+            {
+                return 0;
+            }
+
+            System.Security.Cryptography.RandomNumberGenerator.Fill(buffer.AsSpan(offset, count));
+            return count;
+        }
+
+        public override int Read(Span<byte> buffer)
+        {
+            System.Security.Cryptography.RandomNumberGenerator.Fill(buffer);
+            return buffer.Length;
+        }
+
+        public override void Write(byte[] buffer, int offset, int count)
+        {
+        }
+
+        public override void Flush()
+        {
+        }
+
+        public override long Seek(long offset, SeekOrigin origin) =>
+            throw new IOException("/dev/urandom is not seekable.");
+
+        public override void SetLength(long value) =>
+            throw new IOException("/dev/urandom does not support SetLength.");
     }
 
     private static ulong _nextPhysicalAddress;
@@ -1559,6 +1642,13 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        if (TryOpenRandomDevice(guestPath, out var randomFd))
+        {
+            LogOpenTrace($"_open random-device path='{guestPath}' fd={randomFd}");
+            ctx[CpuRegister.Rax] = unchecked((ulong)randomFd);
+            return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+        }
+
         var hostPath = ResolveGuestPath(guestPath);
         var access = ResolveOpenAccess(flags);
         var mode = ResolveOpenMode(flags, access);
@@ -2169,7 +2259,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        FileStream? stream;
+        Stream? stream;
         lock (_fdGate)
         {
             if (_openFiles.Remove(fd, out stream))
@@ -2212,7 +2302,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        FileStream? stream;
+        Stream? stream;
         lock (_fdGate)
         {
             _openFiles.TryGetValue(fd, out stream);
@@ -2252,7 +2342,7 @@ public static partial class KernelMemoryCompatExports
 
         LogIoTrace(
             "read",
-            stream.Name,
+            stream is FileStream fileStream ? fileStream.Name : $"fd:{fd}",
             $"fd={fd} req={requested} read={read} pos={positionBefore}->{positionAfter} preview='{PreviewIoBytes(buffer, read, 64)}' hex={PreviewIoHex(buffer, read, 32)} guest_tail={PreviewGuestHex(ctx, bufferAddress + (ulong)Math.Max(read, 0), 32)}");
 
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
@@ -2352,7 +2442,7 @@ public static partial class KernelMemoryCompatExports
     {
         position = -1;
 
-        FileStream? stream;
+        Stream? stream;
         lock (_fdGate)
         {
             _openFiles.TryGetValue(fd, out stream);
@@ -2363,6 +2453,8 @@ public static partial class KernelMemoryCompatExports
             LogIoTrace("lseek", $"fd:{fd}", $"offset={offset} whence={whence} result=badfd");
             return OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
         }
+
+        var streamName = stream is FileStream fileStream ? fileStream.Name : $"fd:{fd}";
 
         SeekOrigin origin;
         switch (whence)
@@ -2377,7 +2469,7 @@ public static partial class KernelMemoryCompatExports
                 origin = SeekOrigin.End;
                 break;
             default:
-                LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=invalid_whence");
+                LogIoTrace("lseek", streamName, $"fd={fd} offset={offset} whence={whence} result=invalid_whence");
                 return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
@@ -2387,16 +2479,16 @@ public static partial class KernelMemoryCompatExports
         }
         catch (IOException ex)
         {
-            LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=io_error ex={ex.Message}");
+            LogIoTrace("lseek", streamName, $"fd={fd} offset={offset} whence={whence} result=io_error ex={ex.Message}");
             return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
         catch (ArgumentException ex)
         {
-            LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} result=invalid ex={ex.Message}");
+            LogIoTrace("lseek", streamName, $"fd={fd} offset={offset} whence={whence} result=invalid ex={ex.Message}");
             return OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        LogIoTrace("lseek", stream.Name, $"fd={fd} offset={offset} whence={whence} pos={position}");
+        LogIoTrace("lseek", streamName, $"fd={fd} offset={offset} whence={whence} pos={position}");
         return OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
@@ -2441,7 +2533,7 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
 
-        FileStream? stream;
+        Stream? stream;
         lock (_fdGate)
         {
             _openFiles.TryGetValue(fd, out stream);
@@ -6994,9 +7086,9 @@ public static partial class KernelMemoryCompatExports
                 hostPath = directory.Path;
                 isDirectory = true;
             }
-            else if (_openFiles.TryGetValue(fd, out var stream))
+            else if (_openFiles.TryGetValue(fd, out var stream) && stream is FileStream fileStream)
             {
-                hostPath = stream.Name;
+                hostPath = fileStream.Name;
             }
         }
 

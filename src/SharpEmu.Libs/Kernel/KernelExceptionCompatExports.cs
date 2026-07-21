@@ -5,7 +5,7 @@ using SharpEmu.HLE;
 
 namespace SharpEmu.Libs.Kernel;
 
-public static class KernelExceptionCompatExports
+public static partial class KernelExceptionCompatExports
 {
     private static readonly HashSet<int> AllowedSignals = new() { 1, 4, 8, 10, 11, 30 };
     private static readonly Dictionary<int, ulong> _installedHandlers = new();
@@ -112,6 +112,10 @@ public static class KernelExceptionCompatExports
                 $"error={error ?? "scheduler unavailable"}");
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
         }
+
+        // If the target is host-parked in an interruptible wait, wake it so it
+        // returns to an import boundary and runs the just-queued handler.
+        KernelPthreadCompatExports.InterruptHostParkedThreadForSignal(targetThread);
 
         if (string.Equals(
                 Environment.GetEnvironmentVariable("SHARPEMU_LOG_GUEST_EXCEPTIONS"),

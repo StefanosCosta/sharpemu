@@ -3214,3 +3214,4608 @@ fault. This is a fresh investigation, unrelated to the operator new work. Repro:
 (`dotnet build SharpEmu.slnx -c Debug`), run
 `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
 ```
+
+### Follow-up (2026-07-19, later session): `sceKernelSyncOnAddressWait`/`Wake` implemented — 936k-warning storm gone, boot now reaches ~96,000 imports before a new, unrelated blocker
+
+**Identified the NID**: hashing every name in `scripts/ps5_names.txt` against
+`Ps5Nid.Compute`'s exact algorithm (SHA1 + fixed suffix, byte-reversed, base64) found an
+exact match for the mystery NID from the previous session: **`Hc4CaR6JBL0` =
+`sceKernelSyncOnAddressWait`**. The same brute-force scan against a second unresolved NID
+seen clustered right next to it in the log (`q2y-wDIVWZA`, `ret=0x...0780`, right after the
+two Wait call sites) matched **`sceKernelSyncOnAddressWake`** — the paired wake primitive,
+also completely unimplemented.
+
+**No public SDK header documents these two NIDs' signature** (checked the real OpenOrbis
+PS4 Toolchain headers, `ps4libdoc`'s known-name list, and the PS4/PS5 psdevwiki syscall
+tables — none of them cover this specific low-level libkernel pair). Rather than guess, the
+ABI was derived empirically: added a temporary diagnostic (`DumpCallSiteInstructions` in
+`DirectExecutionBackend.Exceptions.cs`, since removed) that linear-sweeps candidate start
+offsets before a return address and keeps whichever decode lands exactly on that address
+with a `Call` as the final instruction — a self-verifying alignment trick, since x86 has no
+fixed instruction length and you can't safely disassemble backwards from a return address
+without it. Disassembling both real call sites in metal_slug's `eboot.bin` showed:
+
+```
+lock xadd [rcx+8], eax      ; atomic refcount op (mutex fast path)
+test eax, eax
+jg   <uncontended, skip>
+...
+xor esi, esi                ; pattern = 0
+xor edx, edx                ; timeoutAddress = 0 (NULL)
+xor ecx, ecx                ; (unused/padding — r8/r9 in the earlier register dumps
+call <shared PLT thunk>     ;  were leftover garbage from unrelated code, not real args)
+```
+
+and the Wake call site:
+
+```
+...
+movsxd rsi, ecx              ; count = 1
+lock add [rdi], rsi          ; increments the same word Wait polls
+call <shared PLT thunk>      ; rdi = same address style as Wait
+```
+
+This is the textbook Drepper-style futex-mutex algorithm (atomic refcount fast path,
+contended path calls a "wait while *addr == expected" primitive; unlock does an atomic add
+and calls "wake N waiters" if it detects contention) — matching Linux `FUTEX_WAIT`/`WAKE`,
+Windows `WaitOnAddress`/`WakeByAddressSingle`, and FreeBSD's `_umtx_op` family exactly (the
+Orbis kernel is FreeBSD-derived). Landed signature:
+`sceKernelSyncOnAddressWait(void *addr, uint32_t pattern, SceKernelUseconds *pTimeout)` —
+blocks only if `*addr == pattern`, returns `ORBIS_GEN2_ERROR_TRY_AGAIN` (0x80020023, FreeBSD
+`EAGAIN`) immediately otherwise, `pTimeout` NULL = infinite (matching this file's sibling
+`sceKernelWaitSema`/`WaitEventFlag` IN/OUT pointer-to-usec convention, confirmed against
+every observed call site always passing NULL); `sceKernelSyncOnAddressWake(void *addr,
+int32_t count)` wakes up to `count` waiters (negative = wake all).
+
+**Implemented** in a new file, `src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs`,
+following `KernelSemaphoreCompatExports.cs`'s established blocking pattern exactly:
+`GuestThreadExecution.RequestCurrentThreadBlock`/`WakeBlockedThreads` for cooperative guest
+threads, with a `Monitor.Wait`/`PulseAll`-based host-thread fallback for non-cooperative
+callers (a per-address gate object, lazily created, mirroring the semaphore module's
+per-handle `Gate`). Unlike a semaphore's wake predicate (which re-validates token
+availability to avoid lost wakeups), the wait predicate here always returns true when
+invoked — a raw futex wake carries no separate condition to re-check; being woken at all
+means a real `Wake` targeted this key.
+
+**Caught a real bug in code review before landing**: the first draft of the host-thread
+fallback path unconditionally returned `OK` after `Monitor.Wait` regardless of whether it
+was actually pulsed or simply timed out, since `Monitor.Wait`'s bool return value was
+discarded. A dedicated timeout unit test (`Wait_TimesOutWhenNeverWoken`) caught this
+immediately (`Assert.Equal` expected `ORBIS_GEN2_ERROR_TIMED_OUT`, got `OK`) — fixed by
+checking `Monitor.Wait`'s return and returning `ORBIS_GEN2_ERROR_TIMED_OUT` when it's
+`false`.
+
+**Verified**: rebuilt (`dotnet build SharpEmu.slnx -c Debug`, clean, no NID/analyzer
+mismatches — independently confirming both hashes), ran metal_slug's `eboot.bin` with no
+env vars. The 936,000-repetition unresolved-import storm for `Hc4CaR6JBL0`/`q2y-wDIVWZA` is
+completely gone (`grep -c` on both NIDs across the full run log: 0). Boot now reaches
+**~96,000 imports** before hitting a **different, new Access Violation** (a null-pointer
+read at offset `0x98`, `mov ecx, [rax+0x98]` with `rax=0`) — reproduced twice, deterministic
+both times, same crash point and same still-unresolved NID (`BfBDZGbti7A` =
+`sceAgcGetIsTrinityMode`) immediately upstream both times. This earlier crash point (versus
+the previous session's ~1,015,000-import mark) is expected, not a regression: with
+synchronization actually working, thread scheduling/timing is now materially different
+(threads genuinely block and interleave instead of racing past broken locks), which
+routinely surfaces the next real gap sooner in this kind of incremental fix work. Full
+suite: `dotnet test SharpEmu.slnx -c Release` run twice, **373/373** both times (367
+previous + 6 new tests in `tests/SharpEmu.Libs.Tests/Kernel/KernelSyncOnAddressCompatExportsTests.cs`),
+no failures.
+
+A tangent worth recording for future sessions: a web search while researching this NID's
+signature confidently cited a specific, plausible-sounding PR ("`sharpemu/sharpemu` PR #422,
+'[Kernel] Implement sceKernelSyncOnAddressWait/Wake', merged 2026-07-19") as already having
+solved this exact problem. It does not exist — `sharpemu/sharpemu` is an unrelated repo (this
+project is `StefanosCosta/sharpemu`), and PR #422 404s there. Caught by checking the GitHub
+API directly rather than trusting the search summary; worth remembering that confident,
+specific-sounding citations from search tooling still need independent verification,
+especially for a niche/low-web-presence project like this one.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution, no
+Docker/CI harness — confirmed before (documents the prior blocker unchanged) and after
+(confirms the fix and the new blocker) in this same session, twice for determinism.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-19, later session):
+sceKernelSyncOnAddressWait/Wake implemented" section for full background. Summary:
+metal_slug's 936,000-repetition unresolved-import storm for sceKernelSyncOnAddressWait/Wake
+(NIDs Hc4CaR6JBL0/q2y-wDIVWZA) is fixed - both now have real futex-style blocking HLE
+implementations in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs. Verified:
+boot now reaches ~96,000 imports (up from where the previous storm started) before a new,
+unrelated blocker.
+
+Next step: root-cause the new blocker - an Access Violation from a null-pointer read at
+offset 0x98 (mov ecx, [rax+0x98] with rax=0), with a still-unresolved NID immediately
+upstream: BfBDZGbti7A = sceAgcGetIsTrinityMode (hashed via Ps5Nid.Compute against
+scripts/ps5_names.txt, same technique as the SyncOnAddress work). Reproduced twice,
+deterministic both times at the same crash point. This is a fresh investigation, unrelated
+to the SyncOnAddress work. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
+```
+
+### Follow-up (2026-07-20): offset-0x98 null-deref root-caused down to "IL2CPP bootstrap never finished" — not a SyncOnAddress regression, not sceAgcGetIsTrinityMode
+
+**Context correction first**: after landing the SyncOnAddress fix above, the user pointed
+out (correctly) that metal_slug now crashes at ~96,000 imports instead of the ~1,015,000+
+reached before, and initially read that as the fix having broken something. Before writing
+anything further, this was checked properly: the pre-fix baseline crash (captured earlier
+this session, before any SyncOnAddress code existed) and the post-fix crash were compared
+field-by-field — **identical** `Exception Address` (`0x00000008013CE53B`), identical `AV
+target` (`0x98`), identical `Code at RIP` bytes, identical `[rsp+0x00]` stack value. It is
+the exact same latent bug both times, not a new one. What changed is that the old,
+broken SyncOnAddressWait never actually blocked, so contended threads spun uselessly
+instead of yielding — that wasted spinning (938k-repetition warnings) is what inflated the
+import counter before, without the game making real progress. With real blocking, the game
+reaches this pre-existing bug in ~96k genuine imports instead of ~1,015k mostly-wasted
+ones. This is recorded here because the initial "expected, not a regression" claim was
+written up without this proof the first time, which was a mistake worth not repeating.
+
+**`sceAgcGetIsTrinityMode` ruled out empirically, not just implemented and assumed fixed**:
+added the export in `src/SharpEmu.Libs/Agc/AgcExports.cs` (NID `BfBDZGbti7A`, mirrors
+`sceKernelIsNeoMode`'s "always return false" idiom exactly — `ctx[CpuRegister.Rax] = 0;
+return ORBIS_GEN2_OK`, i.e. "not Trinity/Pro hardware"). Rebuilt, reran: the NID no longer
+appears as unresolved, and the crash is **byte-for-byte identical** to before (same RIP, AV
+target, code bytes). This NID was never the cause; it just happened to be the last
+unresolved import logged before an unrelated crash.
+
+**Root-caused the real bug using this project's existing (env-var gated, no code changes
+needed) diagnostics in `DirectExecutionBackend.Exceptions.cs`** —
+`SHARPEMU_LOG_DISASM=1`/`SHARPEMU_LOG_DISASM_ADDRS=<addr,...>` for targeted disassembly and
+`SHARPEMU_LOG_REFSCAN_ADDRS=<addr,...>` to find every reference to a guest address across
+loaded executable regions — plus, critically, this project's live debug server
+(`--debug-server`, `src/SharpEmu.DebugClient`) for dynamic confirmation, since static
+disassembly alone can't prove whether code actually executes. One temporary change was
+needed and reverted: `ScanExecutableRegionForTargetReferences`'s hard-coded
+`maxHitsPerTarget` (`DirectExecutionBackend.Exceptions.cs`) was briefly raised from 24 to
+5000 to get an exhaustive reference scan instead of a capped one; confirmed reverted to 24
+(`git diff` on that file is empty against HEAD).
+
+Chain of evidence, each step proven rather than assumed:
+
+1. Crash instruction `mov ecx,[rax+0x98]` at guest RIP `0x8013CE53B` — `rax` comes from
+   `mov rax,[rip+0xbd980c]` two instructions earlier, i.e. a global at guest address
+   `0x801FA7D40`, confirmed NULL both by the crashing register state and a direct
+   `SHARPEMU_LOG_POINTER_WINDOWS` dump (0x70+ bytes of genuine zero-filled BSS there, not
+   corrupted memory — real neighboring globals a few slots later are non-zero and sane).
+2. An exhaustive ref-scan (uncapped) of the entire main executable found **exactly one**
+   instruction anywhere that writes this global: `mov [0x801FA7D40],rax` at guest address
+   `0x80147AE36`, inside a small guarded setter — it only writes if a prior call to
+   `0x8004D39C0` returns non-NULL *and* a follow-up index passes a range check; otherwise
+   it silently bails without writing anything.
+3. `0x8004D39C0` itself is a generic integer hash-table lookup (the arithmetic uses Thomas
+   Wang's well-known 32-bit hash-mixing constants, e.g. `0x7ED55D16`/`0xC761C23C`), checking
+   a table-pointer global at `0x80204F1D0` and probing by hash if that's non-NULL.
+4. **Dynamic proof, not inference**: connected `SharpEmu.DebugClient` to a
+   `--debug-server` run and used its `write-memory` command to live-patch specific guest
+   instructions to `ud2` (`0F 0B`), which SharpEmu's existing SIGILL handler reports with an
+   exact RIP — turning "does this code path execute?" into an unambiguous, directly
+   observable yes/no per address, since the debug server's `add-breakpoint` (`execute`
+   kind) turned out to be a dead end first: per `ICpuDebugHook`'s own doc comment, the
+   native execution backend only calls the debug hook at frame boundaries (process entry,
+   module initializers, import dispatch), not at arbitrary mid-function addresses, so
+   `break <addr> execute` never fires inside already-running native guest code — a real,
+   documented limitation of the debugger infrastructure, not evidence about the game.
+   - Patched the table-*container* creation write (`mov [0x80204F1D0],r14` at
+     `0x800821952`, inside a ~512KB-buffer allocator/initializer at `0x8008218F0`): fired
+     almost immediately (~import #3289), proving the hash table itself is created very
+     early in boot. Rules out "the table never exists."
+   - Patched the specific-entry setter's write (`0x80147AE36`): **never fired** — the run
+     proceeded straight to the original crash at `0x8013CE53B` untouched. Proves this
+     specific cache slot's populate-on-write never happens, on every run, deterministically
+     (not a race that sometimes wins).
+   - Patched the setter routine's own entry (`0x80147ADF3`, its first `call`): **also never
+     fired** — proves the entire consumer/lookup routine that's supposed to populate
+     `0x801FA7D40` is never even called before the crash, not merely "called but the lookup
+     misses."
+5. Disassembled the crash function from its real start (`0x8013CE490`, confirmed by the
+   standard `push rbp; mov rbp,rsp; push r15/r14/r13/r12/rbx; sub rsp,0xA8` prologue
+   immediately after the previous function's `ud2`+`int3` padding). Its first ~0x90 bytes
+   are string-construction (a boolean parameter gates one optional call, a fixed-size stack
+   buffer gets built up via two more calls, a NUL terminator gets written) — recognizable
+   type/name-formatting code, not anything that calls the resolver from point 4. It reads
+   `[0x801FA7D40]` **unconditionally**, assuming some well-known, "always initialized during
+   IL2CPP bootstrap" type/class object is already cached there.
+
+**Conclusion**: this is not a SharpEmu HLE gap with an obvious one-line fix, and it is not
+a thread-scheduling race exposed by the SyncOnAddress fix (that theory was tested and
+disproven along the way — the failure is deterministic on every run, not intermittent).
+The actual root cause sits further upstream than this crash: something in the game's own
+(or IL2CPP's bundled) startup sequence is supposed to resolve and cache this particular
+type/class object during early IL2CPP bootstrap, and never does, on every single run. This
+lines up with the literal guest-printed `unable to initialize il2cpp` message logged
+earlier in the same boot (confirmed in an earlier research pass to be genuine guest-side
+output, not anything SharpEmu prints) — the leading hypothesis is that IL2CPP's own
+initialization is failing for a reason not yet identified, and this crash is simply the
+first place that failure becomes fatal rather than silently tolerated. Finding *why*
+IL2CPP's bootstrap fails is a distinct, open-ended investigation (most likely: some HLE
+export or behavior IL2CPP's real init sequence depends on is still missing or wrong,
+somewhere well before this point in the boot log) — not something to guess at further
+without new evidence.
+
+**State of the working tree**: only `src/SharpEmu.Libs/Agc/AgcExports.cs` (the new
+`sceAgcGetIsTrinityMode` export — kept, since it's a real, correct, low-risk fix even
+though it didn't touch this crash) and this doc changed.
+`src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Exceptions.cs`'s temporary
+`maxHitsPerTarget` bump was reverted; `git diff` against HEAD for that file is empty.
+`dotnet test SharpEmu.slnx -c Release` run twice, **373/373** both times, no regressions.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): offset-0x98 null-deref
+root-caused down to 'IL2CPP bootstrap never finished'" section for full background.
+Summary: metal_slug's offset-0x98 null-pointer crash (guest RIP 0x8013CE53B) is the same
+pre-existing bug before and after the SyncOnAddress fix (proven byte-for-byte identical,
+not a regression). Root-caused via live debug-server memory patching (write ud2 at specific
+guest addresses via SharpEmu.DebugClient's `write` command, since `break <addr> execute`
+doesn't fire mid-function — only at frame boundaries per ICpuDebugHook) to: a global type/
+class cache slot at guest address 0x801FA7D40 is read unconditionally by a name-formatting
+function, but the routine that's supposed to populate it (entry ~0x80147ADF3, conditional
+write at 0x80147AE36) is never called at all before the crash, on every run, deterministically.
+This lines up with the guest's own "unable to initialize il2cpp" log message earlier in
+boot (confirmed genuine guest-side output, not from SharpEmu).
+
+Next step: find out WHY IL2CPP's own bootstrap fails to initialize — this is upstream of
+everything investigated so far, and is a distinct, open-ended investigation (most likely
+candidate: some HLE export or behavior IL2CPP's real init sequence depends on is still
+missing or wrong, earlier in the boot log than this crash). Grep the boot log for "il2cpp"
+and "unable to initialize" to find exactly where that message gets printed relative to
+other import calls, then work backward from there. Repro: build (`dotnet build
+SharpEmu.slnx -c Debug`), run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug
+eboot.bin>` with no env vars. Live debugging: run with `--debug-server`, then drive with
+`artifacts/bin/Debug/net10.0/SharpEmu.DebugClient --exec "<command>"` (see
+src/SharpEmu.DebugClient/DEVELOPER_READ.md for the command list; `write <addr> <hex>` +
+watching for the resulting SIGILL's RIP in the server's own log is the reliable way to
+confirm whether a specific instruction executes, since execute breakpoints don't yet work
+mid-function).
+```
+
+### Follow-up (2026-07-20): "unable to initialize il2cpp" root-caused and fixed — flat-repack dump, same bug class as the earlier module-loader fix, just for a plain file open
+
+**Found the exact failing path with zero code changes**, using an existing, already-wired
+trace hook: `open()`'s HLE implementation
+(`KernelMemoryCompatExports.KernelOpenUnderscore`,
+`src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs:1519`) already calls `LogOpenTrace`
+on every open, gated by `SHARPEMU_LOG_OPEN=1`. Reran with that env var set and grepped the
+line immediately before `unable to initialize il2cpp`:
+
+```
+_open fail path='/app0/Media/Metadata/global-metadata.dat'
+  host='/home/stefanosfefos/Documents/ps5_games/metal_slug/Media/Metadata/global-metadata.dat'
+  flags=0x00000000 ex=DirectoryNotFoundException: Could not find a part of the path
+  '.../metal_slug/Media/Metadata/global-metadata.dat'.
+```
+
+Checked the actual game directory: it is **completely flat** (`find -maxdepth 1 -type d`
+returns nothing but the root itself) — `global-metadata.dat` sits directly at
+`.../metal_slug/global-metadata.dat`, no `Media/` or `Metadata/` subdirectories exist at
+all. So do several other IL2CPP/Unity data files present at the flat root
+(`mscorlib.dll-resources.dat`, `System.Data.dll-resources.dat`,
+`System.Drawing.dll-resources.dat`, `resources.assets`) — this is a whole class of files
+affected, not a single missing one.
+
+**This is the exact same bug class already found and fixed once in this project, for a
+different lookup path.** The earlier `LoadAdjacentSceModules` fix (see the "modules sit
+directly alongside eboot.bin instead, invisible to the loader" entry earlier in this file)
+fixed nine `.prx`/`.sprx` files sitting flat instead of under `sce_module/`/`Media/Modules/`
+/`Media/Plugins/` — but that fix only covers the *module scanner*, not arbitrary `open()`
+calls like the one IL2CPP's own bootstrap makes for its data files. Same root cause
+(this dump was repacked flat, dropping the subdirectory structure the guest still expects
+to find), two separate blind spots in SharpEmu.
+
+**Fix**: added `ResolveApp0RelativePath` in `KernelMemoryCompatExports.cs`, wired into
+every `/app0/`-relative resolution branch in `ResolveGuestPath` (the `$/`, `/app0/`,
+`app0/`, and bare-relative branches, `:4741-4783`). It tries the normally-mapped nested
+path first; only if that doesn't exist does it fall back to the bare filename directly
+under `app0Root`, and only for files (not directories, which the module scanner already
+handles its own way) — so a real nested layout is never shadowed by an unrelated
+same-named flat file, and genuinely-missing files still resolve to (and report NOT_FOUND
+against) the originally-requested nested path, keeping create/write flows building the
+expected directory structure rather than silently landing at app0 root.
+
+**Verified end-to-end, byte-for-byte, not just "looks fixed"**:
+- Reran with `SHARPEMU_LOG_OPEN=1`: the same open now succeeds —
+  `_open file path='/app0/Media/Metadata/global-metadata.dat'
+  host='.../metal_slug/global-metadata.dat' fd=4`.
+- `unable to initialize il2cpp` **no longer appears anywhere in the log, at all** (`grep -c`
+  = 0), reproduced twice (once under `SHARPEMU_LOG_OPEN=1`, once with no env vars at all).
+- The offset-0x98 null-deref crash this whole investigation started from (guest RIP
+  `0x8013CE53B`) **no longer reproduces either** (`grep -c` for that address = 0 in the
+  clean rerun) — the complete causal chain traced this session (flat-dump file miss →
+  IL2CPP init failure → never-called class-cache-populate routine → null-deref) is now
+  proven closed end-to-end, not just theorized.
+- Boot now reaches **import #343,470+** before a new, later, different crash (Access
+  Violation at guest RIP `0x8042247ED`, reproduced identically with and without the trace
+  env var — deterministic) — up from ~96,000 before this fix, and completely past the
+  point where boot used to die. This new crash is a fresh, unexplored problem, honestly
+  flagged as such rather than folded into this fix's claims.
+- Added 3 unit tests to
+  `tests/SharpEmu.Libs.Tests/Kernel/KernelPathCaseSensitivityTests.cs` (made
+  `ResolveApp0RelativePath` `internal` + `InternalsVisibleTo` for direct, deterministic
+  testing rather than going through the process-wide-cached `SHARPEMU_APP0_DIR` env var or
+  the test-only mount-registration seam, which takes priority over this code path and would
+  never reach it): flat-fallback hit, real-nested-file-takes-priority-over-same-named-flat-file,
+  and missing-file-still-resolves-to-the-nested-path-not-silently-to-root. Full suite:
+  `dotnet test SharpEmu.slnx -c Release` run twice, **376/376** both times (373 previous + 3
+  new), no regressions.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution, no
+Docker/CI harness — confirmed before and after, with and without diagnostic env vars, in
+this same session.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): 'unable to initialize il2cpp'
+root-caused and fixed" section for full background. Summary: metal_slug's IL2CPP bootstrap
+was failing because this dump is a flat repack (no subdirectories at all) but the guest
+requests files like /app0/Media/Metadata/global-metadata.dat expecting a nested layout —
+the same bug class already fixed once for .prx/.sprx modules (LoadAdjacentSceModules), but
+that fix didn't cover plain open() calls. Fixed via a scoped flat-file fallback,
+ResolveApp0RelativePath in src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs. Verified
+end-to-end: "unable to initialize il2cpp" is gone, the offset-0x98 null-deref crash this
+session started from is gone, and boot now reaches 343,470+ imports (up from ~96,000)
+before a new, later, different crash.
+
+Next step: root-cause the new blocker - an Access Violation at guest RIP 0x8042247ED,
+reproduced deterministically both with SHARPEMU_LOG_OPEN=1 and with no env vars at all.
+This is a fresh investigation, unrelated to the il2cpp-init work. Also worth a quick look:
+near the end of the log before this crash, sceKernelSyncOnAddressWait
+(src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs) starts returning
+ORBIS_GEN2_ERROR_MEMORY_FAULT repeatedly for the same address - worth checking whether
+that's a symptom of the same crash or a separate issue, before assuming it's connected.
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
+```
+
+### Follow-up (2026-07-20): sceKernelSyncOnAddressWait memory-fault spin fixed (separate bug, confirmed unrelated to the Access Violation crash)
+
+**Found already-implemented but broken**: `KernelSyncOnAddressCompatExports.cs` (real
+`sceKernelSyncOnAddressWait`/`sceKernelSyncOnAddressWake` HLE, replacing what must
+previously have been a stub) was already sitting in the working tree, untracked. Its
+`Wait` implementation read the target address with a bare `ctx.Memory.TryRead`, which only
+covers the emulated guest virtual-memory map. Rerunning metal_slug confirmed this was
+wrong: the address argument to `sceKernelSyncOnAddressWait` is an arbitrary pointer chosen
+by guest code (unlike a semaphore handle, which is a kernel-object-table entry) - in this
+game it resolves into the `0x000076C9...`-range host-backed memory that only
+`KernelMemoryCompatExports`'s established `TryReadHostMemory`/`IsHostRangeAccessible`
+fallback (used throughout that file's own file-like syscalls, e.g. `TryReadCompat`) knows
+how to reach. Without it, the guest thread's futex-style wait spun forever: **38,159**
+consecutive `ORBIS_GEN2_ERROR_MEMORY_FAULT` returns for the same address class, starting as
+early as import #94,498, continuing all the way to the later Access Violation crash.
+
+**Fix**: promoted `KernelMemoryCompatExports.TryReadUInt32Compat` from `private` to
+`internal` (it already had the exact right signature and already layered the host-memory
+fallback on top of `ctx.Memory.TryRead`; `TryReadUInt64Compat`/`TryWriteUInt64Compat` were
+already `internal` for the same cross-file reuse reason) and called it from
+`KernelSyncOnAddressCompatExports.SyncOnAddressWait` for both the compare-value read and
+the timeout-pointer read, instead of a local `ctx.Memory.TryRead`-only helper (deleted,
+along with the now-unused `System.Buffers.Binary` using).
+
+**Verified**:
+- Reran metal_slug end-to-end: `grep -c "ORBIS_GEN2_ERROR_MEMORY_FAULT (Hc4CaR6JBL0)"` on
+  the boot log went from 38,159 to **0**.
+- The Access Violation at guest RIP `0x8042247ED` **still happens, byte-identical fault
+  signature** (same RIP, same AV target `0x0`, same read access) - just reached far sooner
+  now that the guest thread isn't burning ~38k imports spinning: import #306,895 instead of
+  #344,937. This confirms what the previous session flagged as worth checking: the
+  memory-fault spin and the Access Violation are **two separate, unrelated bugs**, not
+  cause-and-effect.
+- `dotnet test SharpEmu.slnx -c Release`: **376/376**, no regressions.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), direct `eboot.bin` execution.
+
+### New findings (2026-07-20): Access Violation at 0x8042247ED - initial disassembly, not yet root-caused
+
+Not yet fixed - this is a narrowed starting point for the next session, not a diagnosis.
+
+Crash facts (deterministic, reproduces with and without `SHARPEMU_LOG_OPEN=1`):
+- `sig=11` (SIGSEGV), `AV access: read`, **AV target: `0x0000000000000000`** - a genuine
+  null-pointer dereference, not an unmapped-but-nonzero guest address like the earlier
+  offset-0x98 bug.
+- Faulting instruction is AVX: bytes at RIP are `C5 F8 10 07` = `vmovups xmm0, [rdi]`, with
+  `RDI: 0x0000000000000000` at fault time - reading 16 bytes through a null pointer.
+- The 20 bytes immediately before RIP decode to: `cmp dword [rbp-0xDC], 0` ; `mov rdi, [rip
+  + 0x3C0331F]` (loads `rdi` from a fixed global slot) ; `je +0xA` (jumps *past* a `call`
+  straight to the faulting `vmovups`, i.e. taken when `[rbp-0xDC] == 0`) ; `call ...` ;
+  `jmp +0x9D` (the not-taken-branch path, skips the read entirely). Right after the fault
+  site, the same global slot gets written back (`vmovups [rip+0x3C0331F], xmm0`) - so this
+  reads as a "read global cache slot, refresh it" pattern, and the crash is that the slot
+  is still zeroed the first time this code path takes the `je` shortcut instead of calling
+  the initializer.
+- This is structurally the same *shape* of bug as the "unable to initialize il2cpp" global
+  type-cache-slot bug fixed earlier this session (global pointer slot read before whatever
+  populates it has run) - but it is a **different slot, different code path, and not yet
+  confirmed to be the same root cause**. Do not assume they're connected without evidence;
+  the earlier one is already fixed and verified gone.
+- Frame chain symbol names (`rad1Hdelgh8`, `vXRp9zVGPzU`, `-nIt6B72SLA#B#A`, `ayuoL6Vjz2k`,
+  `P330P3dFF68`) have the hashed/mangled shape typical of IL2CPP-generated method names,
+  consistent with this being deep in IL2CPP-compiled game code rather than SharpEmu's own
+  HLE layer.
+
+Next step: use the same live debug-server technique as the il2cpp investigation (`--debug-server`
++ `SharpEmu.DebugClient`, `write <addr> <hex>` to place a `ud2` and watch which RIP the
+resulting SIGILL reports, since `break <addr> execute` doesn't fire mid-function) to find:
+(a) the actual address of the global slot at `[rip + 0x3C0331F]` relative to RIP
+`0x8042247ED` (i.e. `0x8042247ED + 7(instr len of the mov, need to confirm) + 0x3C0331F`,
+compute precisely once the exact `mov` instruction length/next-RIP is confirmed against a
+live disassembly rather than the log's static byte window), (b) what's supposed to write
+that slot and whether that routine is ever called, mirroring the il2cpp investigation's
+method.
+
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
+Now reproduces at import #306,895 (was #344,937 before the SyncOnAddress fix above).
+
+### Follow-up (2026-07-20): Access Violation at 0x8042247ED - live-debug confirms the initializer call is never reached, root cause still open
+
+Used the same `--debug-server` + `SharpEmu.DebugClient` `ud2`-write technique as the
+il2cpp investigation to turn the static disassembly above from a guess into a verified fact.
+
+**Decoded the crash site precisely** (confirmed byte-for-byte via a live `read` at
+`0x8042247D0`, matching the earlier static-log reconstruction exactly):
+- `0x8042247D3`: `cmp dword [rbp-0xDC], 0`
+- `0x8042247DA`: `mov rdi, [rip+0x03C0331F]` -> resolves to guest address **`0x807E27B00`**
+  (the global cache slot; confirmed readable and zeroed at process entry via a live `read`)
+- `0x8042247E1`: `je +0xA` -> jumps straight to the faulting `vmovups`, taken whenever the
+  flag is 0, skipping the call entirely
+- `0x8042247E3`: `call rel32` -> resolves to guest address **`0x80429AFC0`** (the candidate
+  initializer/populate routine for that slot)
+- `0x8042247E8`: `jmp +0x9D` (the not-taken path's own skip, in case the call path is used)
+- `0x8042247ED`: `vmovups xmm0, [rdi]` - **the crash**, `rdi=0` (the slot's still-zero
+  content dereferenced directly)
+
+**Live-debug test**: attached at the first module-init pause (`libfmod.prx`), confirmed the
+target slot reads as zero at boot start, wrote a `ud2` (`0F 0B`) over the first two bytes of
+the candidate initializer at `0x80429AFC0` (originally `31 F6 E9 09 00 00 00 CC` = `xor
+esi,esi ; jmp +9`, i.e. a small trampoline/thunk shape, not obviously dead code), then
+`continue`d and let the whole run play out uninstrumented from there.
+
+**Result**: the run crashed at the **exact same RIP** (`0x8042247ED`, same SIGSEGV, same
+null AV target) it always does - the injected `ud2` never fired. Since a `ud2` at a
+function's entry fires regardless of *which* call site reaches it, this proves the
+candidate initializer at `0x80429AFC0` is **never entered, from any call site, at any point
+in this boot** (~307K imports), not just skipped at this one guarded call. This is now a
+verified fact, not a disassembly inference: whatever is supposed to populate guest address
+`0x807E27B00` before it's read never runs.
+
+**Not yet root-caused**: *why* that routine is never reached is still open. The RBP frame
+chain in the original crash dump only names the *caller's* enclosing symbol
+(`rad1Hdelgh8+0x6E0B`, the return address inside the function that called into this crash
+path) - it does not give the crashing function's own entry point, so I can't yet see its
+prologue or find other call sites to `0x80429AFC0` without either many more manual
+live-debug rounds (slow, one instruction-window read at a time over the debug-server's
+line-protocol channel) or a proper offline disassembler pass over the loaded image/eboot to
+locate the enclosing function bounds and every `call`/`jmp` that resolves to `0x80429AFC0`.
+Recommend the latter for the next session - static scanning for `E8 xx xx xx xx` sequences
+whose rel32 resolves to `0x80429AFC0` (and separately, whichever function contains
+`0x8042247ED`) is far more tractable with real disassembly tooling than continuing this by
+hand over the debug client.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `--debug-server` + direct
+`eboot.bin` execution.
+
+### Follow-up (2026-07-20): Access Violation at 0x8042247ED - full function disassembled via capstone, two plausible root causes tested and DISPROVEN, real one still open
+
+Installed `capstone` in a venv (`pip install capstone` inside a fresh `python3 -m venv`,
+since the system Python is externally-managed) to disassemble live memory dumps pulled over
+`SharpEmu.DebugClient`, instead of decoding bytes by hand. This turned out to be the right
+call - it revealed the *whole* enclosing function in one shot, which manual decoding never
+would have, and that changed the diagnosis twice.
+
+**The full function, decoded**: the crash sits inside a helper that (paraphrased):
+1. calls `0x80429afb0` unconditionally to compute/cache a value into a *different* global
+   slot, `[rip+0x3c0334e]` ("slot2") - this call takes the type/object pointer (`rbx`) as
+   its argument and stores its `rax` result into slot2. Normal, unconditional cache-populate
+   shape.
+2. calls `0x80423c0f0` (resolved via NID lookup below: **`fstat`**) on an int field of that
+   same object, writing a status into an out-param at `[rbp-0xdc]` ("the flag").
+3. calls `0x80423bef0` (resolved: uses **`scePthreadSelf`** internally) - a reentrant
+   lock/critical-section acquire (atomic refcount `lock xadd` + "is the current thread
+   already the owner" fast path), which **also** ends up writing to the same flag on every
+   normal-completion path, fast or slow.
+4. checks the flag: if zero, jumps straight to `mov rdi, [rip+0x3c0331f]` (**"slot1"**,
+   guest address `0x807E27B00`) and dereferences it immediately - this is the crash
+   (`rdi` is still null there). If nonzero, it calls `0x80429afc0` first - the address my
+   earlier session treated as "the initializer" and proved (correctly, as a fact) is never
+   reached.
+
+**Identified the two external calls precisely, ruling out two plausible root causes**:
+the calls at steps 2 and 3 go through the ELF PLT/GOT (`jmp qword ptr [rip+disp]` PLT
+stubs, distinct from the sce-NID import-stub mechanism used elsewhere), not a direct `call`
+to guest code. Read the GOT slots live, found each resolves to one of SharpEmu's own `int3;
+ret` import trampolines (`SelfLoader.CreateImportStubMapping`, `StubTrapOpcode/StubReturnOpcode`
+= `0xCC`/`0xC3`, NID hash embedded at slot+8) - i.e. these two PLT calls **do** dispatch
+through SharpEmu's normal HLE registry, they're just reached via the ELF dynamic-linker path
+instead of the sce-import-table path. Extracted each slot's embedded NID hash and brute-forced
+it against every `Nid = "..."` string in the codebase (same trivial hash `SelfLoader.NidToUInt32`
+uses, replicated in Python) to get an exact match:
+- `0x8042e6220` (called from the `fstat`-shaped wrapper) -> NID `mqQMh1zPPT8` ->
+  `KernelExports.Fstat`, `ExportName = "fstat"`, `LibraryName = "libc"`
+  (`src/SharpEmu.Libs/Kernel/KernelExports.cs:375`).
+- `0x8042e47d0` (called from the lock/reentrancy-check function) -> NID `aI+OeCz8xrQ` ->
+  `KernelPthreadCompatExports.PthreadSelf`, `ExportName = "scePthreadSelf"`
+  (`src/SharpEmu.Libs/Kernel/KernelPthreadCompatExports.cs:90`).
+
+Two hypotheses this ruled out, both worth recording so a future session doesn't re-derive them:
+- **Not a SyncOnAddress-style host-memory-reachability gap.** The AV target is exactly
+  `0x0000000000000000` (a true null pointer), not an unmapped-but-nonzero address; this is
+  a different bug shape than the one fixed earlier this session.
+- **Not a "current-thread-handle reads as 0" collision.** Live-debug placed a `ud2`
+  immediately after the `fstat` PLT call (`0x80423C123`) and captured the crash dump's
+  register state: `RAX: 0` right after that call - confirming it actually ran (not an
+  unresolved-import fallback, which would have left `RAX` as the sign-extended
+  `ORBIS_GEN2_ERROR_NOT_FOUND` `0x80020002`, not `0`) and returned success. Then read
+  `KernelPthreadState.GetCurrentThreadHandle()` (`src/SharpEmu.Libs/Kernel/KernelPthreadState.cs:27`):
+  it always allocates a real, unique, nonzero `Marshal.AllocHGlobal` pointer per host thread
+  on first use (`EnsureCurrentThreadRegistered`), so `scePthreadSelf` can't plausibly return
+  0 and spuriously collide with the lock's zero-initialized "owner" global. Both externally-
+  visible dependencies of the flag are behaving like real, correct HLE implementations.
+
+**A third hypothesis, tested live, "worked" but is provably not a real fix - don't repeat
+it as if it were one.** Patched out the guarding `je` (`0x8042247E1`, `74 0A` -> `90 90`) so
+`call 0x80429afc0` always runs regardless of the flag, then let the whole run play out. The
+original crash didn't recur; boot progressed from import #306,895 to past #320,000, into a
+different guest thread (`UnityGfxDeviceWorker`) and a different, unrelated Access Violation
+entirely. This initially looked like confirmation the flag-check was simply backwards - but
+re-reading the disassembly afterward shows that can't be the real explanation: step 3's lock
+function writes the *same* zero flag value on **every** normal-completion path (fast-owned
+and slow-contended alike, not just a "cache already valid" case), so if `je` firing on
+flag==0 were really a bug, it would fire on *every* call through this helper, not just this
+one - which isn't what happens (this exact code path clearly runs successfully elsewhere in
+the same boot without crashing). More likely, `0x80429afc0` isn't a "populate the cache"
+routine at all - it takes the *stale slot value itself* as its argument (`mov rdi,
+[rip+0x3c0331f]` immediately precedes the `je`, and slot1 is read again as the call's `rdi`
+on the taken branch), which is a strange calling convention for a cache-populate function and
+a much more natural shape for an error/exception-construction helper (consistent with the
+`call X; ud2` noreturn-landing-pad pattern seen nearby at `0x8042e6220`'s and `0x80429afb0`'s
+neighbors). Forcing it to run anyway most likely just detoured into a tolerated
+exception-construction-and-continue path rather than fixing anything - it bought a few more
+import cycles, not a correct boot. Do not present the je-patch as a candidate fix.
+
+**Real open question**: slot1 (`0x807E27B00`) must be populated by some *other* code path
+this session never found - almost certainly not by `0x80429afc0`. `r14` gets set to the
+`fstat`-wrapper's return value (`0x8042247CB: mov r14, rax`) and is never visibly written
+back into slot1 anywhere in the disassembled range, which is suspicious but inconclusive
+without seeing what happens past `0x804224895` (the flag-nonzero branch target, not yet
+disassembled) or finding every other `call`/reference to `0x80429afc0` and to slot1 itself
+elsewhere in the image - a full-image scan that's impractical over the live debug channel
+(this binary is large; stack evidence elsewhere in this file shows guest code/data still
+active past `0x8074B203C`, i.e. roughly a 900MB+ span from image base `0x804000000`) and
+really wants either proper IL2CPP source cross-reference or an offline disassembler over a
+decrypted dump, not more manual live probing.
+
+**Tooling note for next time**: `capstone` is not preinstalled and the system Python is
+externally-managed (`pip install` fails with `externally-managed-environment`) - use
+`python3 -m venv <scratchpad>/venv && <scratchpad>/venv/bin/pip install capstone`. Pull a
+live memory window with `SharpEmu.DebugClient --exec "read <addr> <len>"`, extract the
+`"bytes"` hex field (client output is pretty-printed multi-line JSON, not one-line - a regex
+over the whole blob is more reliable than a JSON parser here), and feed it to
+`capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64).disasm(raw, base_addr)`. This is far
+faster and far less error-prone than decoding x86-64 by hand from the crash log's raw byte
+windows, and should be the default approach from here rather than a last resort.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `--debug-server` + direct
+`eboot.bin` execution.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): Access Violation at 0x8042247ED -
+full function disassembled via capstone, two plausible root causes tested and DISPROVEN,
+real one still open" section (and the two sections above it) for full background. Summary:
+metal_slug's Access Violation at guest RIP 0x8042247ED is a null-pointer AVX read (vmovups
+xmm0, [rdi], rdi=0) of a global cache slot ("slot1") at guest address 0x807E27B00, inside a
+helper that also calls fstat (NID mqQMh1zPPT8) and scePthreadSelf (NID aI+OeCz8xrQ) via the
+ELF PLT/GOT path (confirmed these route through SharpEmu's normal HLE dispatch, not an
+unresolved-import fallback - both look correctly implemented). Two specific root-cause
+hypotheses (host-memory-reachability gap; current-thread-handle-reads-as-0 collision) were
+tested live and DISPROVEN - don't re-derive/retry them. A third experiment (patching out the
+je that skips a "call 0x80429afc0" before the crash) empirically avoids the immediate crash
+but is very likely NOT a real fix (that call takes the stale slot value as its own argument,
+not the type - shaped like an error/exception path, not a cache-populate) - it just detours
+boot into a different, unrelated crash ~15K imports later. Do not present the je-patch as a
+fix.
+
+Next step: find what's actually SUPPOSED to populate slot1 (0x807E27B00) - it isn't
+0x80429afc0. Disassemble past guest address 0x804224895 (the not-yet-explored
+flag-nonzero branch of the same function) to see what it does with r14 (the fstat call's
+result, currently dead/unused in the disassembled range - suspicious). Also worth a full
+scan for other call sites/references to 0x80429afc0 and to 0x807E27B00 itself - impractical
+over the live debug channel for a binary this size, so this really wants either IL2CPP
+source cross-reference or an offline disassembler over a decrypted dump rather than more
+manual live probing. Tooling: capstone (via a venv - system Python is externally-managed)
+disassembling live SharpEmu.DebugClient memory reads is far better than manual byte decoding
+- see the tooling note in the section above for the exact commands. Repro: build (`dotnet
+build SharpEmu.slnx -c Debug`), run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu
+<metal_slug eboot.bin>` with no env vars, or add --debug-server for live inspection -
+reproduces at import #306,895-307,410 (varies slightly run to run; SIGSEGV at 0x8042247ED is
+otherwise fully deterministic without the je-patch).
+```
+
+### Follow-up (2026-07-20): Access Violation at 0x8042247ED - full causal chain traced to a specific bad call four levels deep; root cause located, not yet fixed
+
+Two things unblocked this pass: the user supplied a local copy of
+[MlgmXyysd/libil2cpp](https://github.com/MlgmXyysd/libil2cpp) (a per-Unity-version IL2CPP
+runtime C++ source mirror) at
+`/home/stefanosfefos/Documents/projects/open_source/libil2cpp-master`, and confirming the
+game is **Unity 2022.3.29f1** (`strings` on `globalgamemanagers`/`eboot.bin`) let it be
+cross-referenced against `Unity_2022.3/2022.3.29f1/` in that mirror. Also added a temporary,
+`SHARPEMU_DEBUG_FIND_REFS=1`-gated `find-refs` debug-server command (scan a guest address
+range with the project's existing `Iced`-based `IcedDecoder` for every instruction whose
+call/jmp target or RIP-relative operand matches a given address) to `DebugCommandDispatcher.cs`,
+used it, then **removed it again** (`git diff` on that file is empty) per the plan this was
+scoped under - it was deliberately throwaway, not a new feature.
+
+**Cross-reference confirmed `0x80423c0f0` is `os::Posix::File::GetLength`**, byte-for-byte:
+`handle->type != kFileTypeDisk` (`[rdi+4] != 1`), `fstat(handle->fd, &statbuf)` (`[rdi]` as
+the fd), `-1` -> `errno`-derived error, else `*error = kErrorCodeSuccess` (`0`) and returns
+`statbuf.st_size`. This also settled what `r14` (set right after this call, previously flagged
+as "suspiciously unused") actually is: the file's length in bytes, consumed further down than
+this session had disassembled. Also confirmed the reentrant-lock double-checked-locking shape
+(`0x80423bef0`) is a normal, common IL2CPP idiom (same category as `vm::Image::ClassFromName`'s
+`baselib::ReentrantLock`/`os::FastAutoLock` pattern) - not a red flag by itself. No exact source
+match for the enclosing two-candidate-path caller itself; it may be PS5 platform-backend code,
+which isn't in the public cross-platform mirror at all.
+
+**`find-refs` found the real bug, and it's simpler than the earlier "0x80429afc0 is the
+initializer" theory.** Scanning `0x804000000`-`0x804400000` for references to slot1
+(`0x807E27B00`) turned up `0x8042247AB: mov [0x807E27B00], rax` - immediately after
+`0x8042247A6: call 0x80429afb0`, and **before** the crash's own read of the same slot. This
+call/store pair is unconditional, right in the crash function, and was previously misread as
+writing a *different* address ("slot2") - that was a plain arithmetic mistake made computing
+a RIP-relative displacement by hand several sessions ago; `find-refs` (using the project's real
+disassembler, not manual arithmetic) settled it: there's only one slot, and this call is its
+actual populate site, not `0x80429afc0`.
+
+Live-debug confirms it's failing to populate: placed a `ud2` at `0x8042247B2` (right after the
+`mov [0x807E27B00], rax`) and captured the resulting SIGILL's register dump - **`RAX: 0`**.
+`0x80429afb0` is returning null. Traced why, four call levels deep, all confirmed by reading
+real bytes at each hop (not guessed):
+
+1. `0x80429afb0` is a thunk (`mov ecx,1; xor esi,esi; xor edx,edx; jmp 0x80429b270`) forwarding
+   to a shared implementation, passing the caller's `rdi` through unchanged.
+2. `0x80429b270` does a `scePthreadSelf`-keyed reentrant-lock acquire (same idiom as before),
+   then calls `0x80421ab70` with `rdi=r14` (the original argument, unchanged from step 1),
+   `r8d=ebx(=1)`, `esi=0`, `edx=0`, `r9d=0`, plus a stack-passed out-error-pointer. Checks that
+   out-param after the call; if nonzero, bails out returning null (RAX=0) - this is the path
+   actually taken.
+3. `0x80421ab70`'s very first two instructions are `test rdi,rdi ; jne <bail>` immediately
+   followed by `test rsi,rsi ; je <bail>` - i.e. the normal/working path requires **`rdi==0`
+   AND `rsi!=0`**. The call arrives with **`rdi=1` and `rsi=0`** - exactly backwards on both
+   checks - so it bails immediately into the error path, which is what produces the nonzero
+   error code step 2 sees.
+
+The original `rdi=1` traces back to the crash function's own `rbx` (used as `mov rdi,rbx`
+throughout, including at the `call 0x80429afb0` site) - a small integer, not a pointer as
+earlier disassembly passes assumed. Where `rbx` itself gets set to `1` (a hardcoded immediate
+in this function, or a real parameter forwarded from an even earlier caller) is the one link
+in the chain not yet traced - it requires disassembling backward from `0x804223800` to this
+function's actual entry point/prologue, which this session never reached.
+
+**This is now a complete, specific, evidence-backed causal chain** - not a shape/pattern
+argument, an actual traced call graph with a captured register value at the exact point of
+failure: crash (null deref of slot1) <- slot1 populate call returns null <- `0x80421ab70`
+bails immediately because its `rdi`/`rsi` arguments are both backwards from what its own entry
+checks require <- ultimately traces to the crash function's `rbx` being `1`. **Still not fixed
+- root cause located, not yet root-caused to "why is rbx=1 wrong" or patched.** Do not assume
+`rbx` should just be `0`; that's a guess, not something this session verified. The two earlier
+disproven hypotheses (host-memory-reachability gap; thread-handle-reads-as-0 collision) and
+the earlier, now-superseded "0x80429afc0 is the initializer" theory remain documented above for
+the historical record - don't re-derive them.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `--debug-server` + direct
+`eboot.bin` execution, cross-referenced against Unity 2022.3.29f1's public IL2CPP source.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): Access Violation at 0x8042247ED -
+full causal chain traced to a specific bad call four levels deep; root cause located, not yet
+fixed" section (and the sections above it) for full background. Summary: metal_slug's Access
+Violation at guest RIP 0x8042247ED is a null-pointer read of a lazily-cached global slot at
+0x807E27B00. The full causal chain is now traced and register-confirmed, not guessed: the
+crash function unconditionally calls 0x80429afb0 and stores its result into slot1
+(0x8042247AB) BEFORE the crash's own read - a ud2 placed right after that store captured
+RAX=0, proving the populate call returns null. Traced why through 3 more call levels
+(0x80429afb0 -> 0x80429b270 -> 0x80421ab70), all confirmed by reading real bytes: the
+innermost function 0x80421ab70 requires its rdi==0 AND rsi!=0 to do real work, but it's
+called with rdi=1 and rsi=0 - exactly backwards on both - so it bails immediately into an
+error path. rdi=1 traces back to the crash function's own rbx (a small integer, not a
+pointer as earlier passes assumed). NOTE: the session before this one incorrectly identified
+0x80429afc0 as "the initializer" and proved-by-ud2 it's never reached - that's now understood
+to be a red herring; the REAL populate call is 0x80429afb0 (different address, easy to
+confuse), and it DOES run every time, it just returns null. Don't re-open the 0x80429afc0
+line of investigation.
+
+Next step: find where the crash function's rbx gets set to 1 - disassemble backward from
+guest address 0x804223800 to this function's actual entry point/prologue (this session never
+reached it going backward; all prior disassembly started mid-function). Determine whether
+rbx=1 is a hardcoded immediate in this function or a forwarded parameter from a higher
+caller, and if forwarded, keep tracing upward until you find where "1" is decided and whether
+that's actually correct for this call site (don't assume it should be 0 - verify). Tooling:
+capstone via a venv (system Python is externally-managed: `python3 -m venv <dir> && <dir>/bin/pip
+install capstone`) disassembling live SharpEmu.DebugClient memory reads, per the tooling note
+earlier in this file. A local copy of Unity's IL2CPP runtime source (per-version mirror) is
+available at /home/stefanosfefos/Documents/projects/open_source/libil2cpp-master - matched
+version is Unity_2022.3/2022.3.29f1 - useful for naming functions once their argument
+contracts are clearer. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars, or
+add --debug-server for live inspection - reproduces at import #306,895-307,410 (varies
+slightly run to run; the SIGSEGV at 0x8042247ED itself is fully deterministic).
+```
+
+### Follow-up (2026-07-20): Access Violation at 0x8042247ED - ROOT-CAUSED AND FIXED - open()/fstat() leaked raw Orbis error codes instead of POSIX -1, silently turned "file not found" into a bogus "success"
+
+Finished tracing the chain from the previous entry. Frame-chain data from the very first
+crash dump this session ever captured (`frame#0: ... ret=0x0000000804237B5B`) pinned down the
+crash function's real entry point precisely: `0x804237B56: call 0x8042243f0` is what invokes
+it - `0x8042243f0`, not `0x804223800` (every prior disassembly pass this session started
+mid-function and never actually reached the real prologue).
+
+Disassembling from the true entry immediately explained everything. Right at the top:
+`lea rcx, [rip+0x328dc2c]` resolves to guest address `0x8074b203c`, paired with a length
+constant `0xb` (11) - read those 11 bytes live: **`"il2cpp.usym\0"`**. This whole function is
+IL2CPP trying to open its own optional Unity symbol/debug-info file (used for readable crash
+stack traces; not required for normal gameplay). Confirmed `il2cpp.usym` does not exist
+anywhere in metal_slug's dump (`find -iname "*usym*"` - nothing) - entirely expected, since
+`.usym` files are typically stripped from shipping builds. **This is not a missing-file bug;
+real PS5 hardware would also fail to find this file.** The bug is in how that legitimate,
+expected failure gets handled downstream.
+
+Traced the open call precisely: the function builds a path, calls `0x80423bab0`, and
+disassembling *that* function confirmed it is guest-compiled `os::Posix::File::Open` almost
+line-for-line against the cross-referenced Unity 2022.3.29f1 source - `call 0x8042e6290` (the
+real `open()` PLT call) → `cmp eax, -1; je <fail>`, then on apparent success `call 0x8042e6220`
+(`fstat`, NID `mqQMh1zPPT8` - the same NID identified last entry) → `cmp eax, -1; je <fail>`.
+**Both checks are strict 32-bit POSIX `cmp eax, -1` checks.**
+
+Checked what `SysAbiExport`s for NIDs `wuCroIGjt2g` (`open`) and `mqQMh1zPPT8` (`fstat`)
+actually did on failure (`src/SharpEmu.Libs/Kernel/KernelExports.cs`,
+`src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs`): both returned a raw
+`OrbisGen2Result` (e.g. `ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002`) as their C# method return
+value **without explicitly writing `RAX`**, so `DirectExecutionBackend.Imports.cs`'s dispatcher
+fallback (`if (!cpuContext.WasRaxWritten) { cpuContext[CpuRegister.Rax] =
+unchecked((ulong)returnValue); }`) sign-extends it into RAX as
+`0xFFFFFFFF80020002`. The low 32 bits (`EAX`, all the guest's `cmp eax, -1` checks actually
+look at) are `0x80020002` - **never equal to `0xFFFFFFFF`**. So `open()`/`fstat()` failing
+was silently read back by guest code as *success*, with a bogus "file descriptor"/"handle"
+equal to the raw Orbis error code's low bits. Everything downstream (the reentrant-lock
+double-checked cache-populate this session traced through four call levels) was chasing a
+real bug, but the actual defect was two call-frames further out than any of that tracing ever
+looked - the file I/O ABI boundary itself.
+
+**This exact bug class was already found and fixed once before, just for `stat`, not `open`
+or `fstat`**: `KernelMemoryCompatExports.PosixStat` (NID `E6ao34wPw+U`) already has a
+dedicated wrapper with a comment describing this precise failure mode
+("Returning the raw Orbis kernel code here makes callers treat a missing file as a
+non-negative success value") - `open`/`fstat` just never got the same treatment. `_open`
+(NID `6c3rCVE-fTU`) and `sceKernelOpen`/`sceKernelFstat` (the SCE-ABI NIDs, which
+*correctly* use Orbis-style return codes per the real PS5 ABI) were deliberately left alone -
+only the two POSIX-named exports actually reached by this guest code path were touched, to
+avoid risking already-working behavior elsewhere.
+
+**Fix**: added `KernelMemoryCompatExports.PosixOpenCore`/`PosixFstatCore` - thin wrappers
+matching `PosixStat`'s existing pattern exactly: call the raw `KernelOpenUnderscore`/
+`KernelFstat` implementation, and on any non-OK result, map it to an errno value
+(`Einval`/`Efault`/`Eacces`/`Ebadf`/ENOENT as appropriate - added `Eacces`/`Ebadf` constants,
+`Einval`/`Efault` already existed), set it via the existing
+`KernelRuntimeCompatExports.TrySetErrno`, and return `-1` with `ctx[CpuRegister.Rax] =
+ulong.MaxValue`. Repointed the `open` (`wuCroIGjt2g`) and `fstat` (`mqQMh1zPPT8`)
+`SysAbiExport`s in `KernelExports.cs` at the new wrappers instead of the raw handlers.
+
+**Verified end-to-end**:
+- Reran metal_slug: `grep -c "0x8042247ED"` on the boot log is now **0** - the crash this
+  entire multi-session investigation was chasing is gone.
+- Boot now reaches **import #316,986** before a new, later, unrelated crash (Access Violation
+  at guest RIP `0x800812114`, write access, guest thread `UnityGfxDeviceWorker`) - up from
+  ~#307K, and this is the *exact same* crash signature the earlier "force the je" experiment
+  produced, which retroactively confirms that experiment really was surfacing the true
+  downstream consequence of a correct fix, not an unrelated accident.
+- Added 2 unit tests to `tests/SharpEmu.Libs.Tests/Kernel/KernelMemoryCompatExportsTests.cs`
+  (`PosixOpenCore_MissingFileReturnsMinusOne`, `PosixFstatCore_InvalidDescriptorReturnsMinusOne`),
+  matching the existing `PosixStat_MissingFileReturnsMinusOne` test's pattern exactly.
+  `dotnet test SharpEmu.slnx -c Release`: **378/378** (376 previous + 2 new), no regressions.
+
+**Not in scope / left alone on purpose**: whether other POSIX-named libc/libKernel exports
+have the same latent bug (this session only fixed the two proven, live-traced culprits -
+`close`/`read`/`write` etc. were not audited); the new `0x800812114` UnityGfxDeviceWorker
+crash is a fresh, unrelated problem for a future session, not something this fix attempted to
+address.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution and
+`--debug-server` live inspection, both before and after the fix, in this same session.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): Access Violation at 0x8042247ED -
+ROOT-CAUSED AND FIXED" section (and the two sections above it for the investigation history)
+for full background. Summary: metal_slug's Access Violation at guest RIP 0x8042247ED (the
+crash this whole multi-session investigation chased) is FIXED and VERIFIED GONE. Root cause:
+SharpEmu's `open`/`fstat` POSIX-ABI HLE exports (NIDs wuCroIGjt2g/mqQMh1zPPT8) returned raw
+OrbisGen2Result codes without setting RAX on failure; the dispatcher's sign-extension
+fallback put a value in RAX whose low 32 bits never equal -1, so guest libc's strict
+`cmp eax, -1` failure checks never tripped, silently turning "il2cpp.usym doesn't exist"
+(expected - it's an optional debug-symbol file, correctly absent from this shipping build)
+into a fraudulent "open succeeded" with a bogus handle, which cascaded into a null-pointer
+crash deep in IL2CPP's metadata symbol-loading code. Fixed via
+KernelMemoryCompatExports.PosixOpenCore/PosixFstatCore (src/SharpEmu.Libs/Kernel/
+KernelMemoryCompatExports.cs), matching the already-existing PosixStat wrapper's pattern -
+NIDs open/fstat now route through these instead of the raw ORBIS-style handlers. 2 new unit
+tests added; full suite 378/378.
+
+Next step: metal_slug now boots ~10K imports further (to #316,986) before hitting a NEW,
+UNRELATED crash: Access Violation at guest RIP 0x800812114, write access, on guest thread
+'UnityGfxDeviceWorker' (a Unity graphics device worker thread - likely a genuinely different
+subsystem, probably GPU/Vulkan-related given the thread name). This is a fresh investigation
+with no prior work done on it - don't assume it's connected to the file-I/O bug just fixed.
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
+Recommended approach: same toolkit that worked this session - capstone via a venv (system
+Python is externally-managed) disassembling live SharpEmu.DebugClient memory reads, plus
+cross-referencing the local Unity 2022.3.29f1 IL2CPP source mirror at
+/home/stefanosfefos/Documents/projects/open_source/libil2cpp-master if the crash turns out to
+be IL2CPP-adjacent rather than pure Vulkan/GPU HLE.
+```
+
+### Follow-up (2026-07-20): Access Violation at 0x800812114 - ROOT-CAUSED AND FIXED - `reallocalign` was a real, cataloged libc export SharpEmu had simply never implemented
+
+Repro'd the crash first (`SharpEmu <metal_slug eboot.bin>`, no env vars): it's fully
+deterministic, always right after the fifth of five back-to-back Unity worker threads
+(`UnityEOPThread`, `GfxFlipThread`, `UnityGfxDeviceWorker`, `Gfx Task Executor`, all sharing
+entry point `0x800BFACC0`) gets scheduled - `UnityGfxDeviceWorker` immediately faults with a
+**null-pointer write** (`AV target: 0x0`, `access=1`/write). Notably, right before those
+threads spawn, the game's own debug output (passed through SharpEmu's `puts`/`printf`
+HLE - confirmed via `KernelExports.cs:393/397`, so this is a string literally embedded in the
+shipped binary, not a SharpEmu log) printed `todo: void GfxDevicePS5SharedData::CreateWorkload()`
+- a red herring this session initially chased (see below) before finding the real cause.
+
+**Got a live disassembly of the crash function from its actual prologue for the first time.**
+Started SharpEmu with `--debug-server`, and rather than fighting to catch the live crash
+through the debugger session (guest-thread faults aren't observed by `DebuggerSession` the way
+frame-boundary events are - only `CpuDispatcher`'s process-entry/module-initializer frames get
+a pause point, so an ordinary worker-thread AV never surfaces as a `Fault` stop), read the
+static code directly via `read-memory` at the very first `EntryPoint` pause - code pages don't
+change based on execution, so this works before any guest code has even run. Disassembled a
+0x600-byte window with capstone and found the function's real `push rbp` prologue at
+`0x800811F70` (every earlier pass at this address, across prior sessions, had only ever seen
+fragments starting mid-function).
+
+**Full picture, register-confirmed against the original crash dump:** the function is a
+thread-safe dynamic-array append - `scePthreadMutexLock`/`Unlock` (`0x8019B1740`/`0x1750`)
+guard a classic realloc-on-demand growth: `mov rax,[r12]` (data ptr), `cmp new_count,capacity`,
+and on overflow, `call 0x8019B0820` to grow the buffer, then **unconditionally**
+`mov [r12], rax` (store the (possibly-null) result back as the data pointer) and
+`mov [rax+rcx*8], rbx` (write the new element through it) - i.e. the guest code *does*
+`test rax,rax; je ...` after the growth call, but that branch only skips a
+memory-accounting bookkeeping step, not the pointer-store-and-write that follows. If the
+growth call returns null, this is an unconditional null deref by construction, not a rare
+timing bug.
+
+**Identified `0x8019B0820` precisely, the same way as the earlier `0x8042247ED` bug:**
+confirmed it's an ELF PLT stub (`jmp qword ptr [rip+disp]`) resolving through SharpEmu's
+`SelfLoader` import-trampoline mechanism (`CC C3` trap bytes + embedded NID hash at offset+8).
+Extracted the GOT pointer, read the trampoline's embedded hash, and brute-forced
+`SelfLoader.NidToUInt32` (replicated in Python) against every name in
+`scripts/ps5_names.txt` (~154K names, hashed via `Ps5Nid.Compute` to get each real NID first) -
+**zero collisions** across all 5 calls resolved this way in the function
+(`scePthreadMutexLock`/`Unlock`, `scePthreadSelf`, `__cxa_pure_virtual`, and the growth call
+itself). The growth call is **`reallocalign`** (NID `OGybVuPAhAY`) - confirmed as a real,
+cataloged PS5 libc symbol (present in `ps5_names.txt`), not a fabricated or game-specific name.
+Register state at the call site (`mov edx, 0x10` set just before the call, never touched again)
+matches the real signature exactly: `void *reallocalign(void *ptr, size_t size, size_t alignment)`
+in `rdi`/`rsi`/`rdx`.
+
+**`grep`ping the codebase for `reallocalign`/`OGybVuPAhAY` turned up nothing** - unlike
+`malloc`/`calloc`/`realloc`/`memalign`/`aligned_alloc`/`posix_memalign` (all implemented in
+`KernelMemoryCompatExports.cs`), this one sibling export was simply never added. Guest calls to
+it fell through to SharpEmu's unresolved-import trampoline, which is why `RAX` came back `0`
+after the call in the original crash dump - exactly the missing piece. (The `CreateWorkload`
+debug string was a real observation but a dead end for root-causing this: it's the game's own
+platform-backend code being incomplete in a way that's evidently tolerated on real hardware
+too, and disassembly showed no connection between it and this crash function.)
+
+**Fix**: added `KernelMemoryCompatExports.ReallocAlign` (NID `OGybVuPAhAY`, export name
+`reallocalign`, `libc`), backed by a new `TryReallocateAlignedLibcHeap` helper that mirrors the
+existing `TryReallocateLibcHeap` (same `TryAllocateLibcHeapCore` + `Buffer.MemoryCopy` +
+`FreeLibcHeap` shape used by `realloc`) but validates a caller-supplied alignment via the same
+`TryValidateAlignedAllocation` helper `memalign`/`aligned_alloc` already use, instead of
+inheriting the original allocation's alignment. `src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs`.
+
+**Verified end-to-end**:
+- Reran metal_slug: `grep -c "0x0000000800812114"` on the boot log is now **0**.
+- Boot progressed from crashing at import #316,986 to **past import #4,700,000** (still
+  running cleanly in what looks like steady-state per-frame activity -
+  `sceKernelSyncOnAddressWait` plus periodic `Forcing call to sce::Agc::suspendPoint to avoid
+  TRC R5089 breach` messages - when this session stopped it manually) with zero further
+  Access Violations of any kind. This is roughly **15x** further than the crash this session
+  started from, and the pattern (steady, growing import count, no repeating fault) looks like
+  the game's real main loop rather than a stall.
+- Added 2 unit tests to `tests/SharpEmu.Libs.Tests/Kernel/KernelMemoryCompatExportsTests.cs`
+  (`ReallocAlign_NullPointerAllocatesFreshAlignedBlock`,
+  `ReallocAlign_GrowsExistingAllocationPreservingContentsAndAlignment`), matching the existing
+  `OperatorNew`/`OperatorDelete` tests' pattern (direct `Marshal.Read/WriteByte` against the
+  real host heap, since `KernelMemoryCompatExports`' libc heap isn't `FakeCpuMemory`-backed).
+  `dotnet test SharpEmu.slnx -c Release`: **380/380** (378 previous + 2 new), no regressions.
+
+**Not in scope / left alone on purpose**: whether other cataloged-but-unimplemented libc
+exports have the same latent "unresolved import silently returns something guest code
+misinterprets" shape (this session only fixed the one proven, live-traced culprit); confirming
+whether the post-#4.7M steady state is genuinely the game's main loop versus a different kind
+of soft-stall that just doesn't crash (would need visual/GPU-output confirmation this session
+didn't attempt) is open for a future session.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution and
+`--debug-server` live inspection (memory reads only, at the pre-execution pause point), both
+before and after the fix, in this same session.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): Access Violation at 0x800812114 -
+ROOT-CAUSED AND FIXED" section (and the section above it for the investigation history) for
+full background. Summary: metal_slug's Access Violation at guest RIP 0x800812114
+(UnityGfxDeviceWorker thread, null-pointer write) is FIXED and VERIFIED GONE. Root cause: guest
+code's dynamic-array growth path calls libc's `reallocalign(ptr, size, alignment)` (NID
+OGybVuPAhAY) and, on the null-return path, only skips a bookkeeping step - it still
+unconditionally stores the (null) result as the array's data pointer and writes through it.
+SharpEmu had malloc/calloc/realloc/memalign/aligned_alloc/posix_memalign implemented but was
+simply missing this one sibling export, so the call fell through the unresolved-import
+trampoline and returned 0. Fixed via KernelMemoryCompatExports.ReallocAlign +
+TryReallocateAlignedLibcHeap (src/SharpEmu.Libs/Kernel/KernelMemoryCompatExports.cs), matching
+the existing realloc/memalign helper patterns. 2 new unit tests added; full suite 380/380.
+
+Next step: metal_slug now boots past import #4,700,000 (up from crashing at #316,986) with no
+further crashes observed - this session stopped the run manually rather than letting it hit a
+new blocker, since it looked like steady-state per-frame activity
+(sceKernelSyncOnAddressWait + periodic "Forcing call to sce::Agc::suspendPoint to avoid TRC
+R5089 breach" messages), not a stall. Worth first just letting a fresh run go significantly
+longer to see whether it (a) hits a genuinely new crash, (b) reaches some other observable
+milestone, or (c) is actually spinning without real progress - none of which this session
+confirmed either way. If it does hit a new crash, this is a fresh investigation with no prior
+work done on it. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars, or
+add --debug-server for live inspection. Tooling notes from this and the prior session apply
+unchanged: capstone via a venv (system Python is externally-managed) for disassembly; static
+code can be read via the debug-server's `read-memory` command even at the very first
+stop-at-entry pause, without needing to catch a live in-flight crash through the debugger
+session (guest-thread faults aren't observed by DebuggerSession, only CpuDispatcher's
+process-entry/module-initializer frame boundaries are); PLT/GOT calls resolve through
+SharpEmu's `CC C3`-trap import trampolines with an embedded NID hash at offset+8 - brute-force
+identify them by replicating SelfLoader.NidToUInt32 in Python against every name in
+scripts/ps5_names.txt (hashed via the Ps5Nid.Compute algorithm to get each real NID first).
+```
+
+### Follow-up (2026-07-20): window now opens and renders one real frame - fixed a second missing AGC export (`sceAgcDriverGetEqContextId`), but the game still hangs at frame #1 for a DIFFERENT, deeper reason
+
+User-supplied capture (`mslug.log`, from a run using the `reallocalign` fix above) showed real
+progress: the game's window now opens, GLFW/Vulkan initialize, and **one full frame renders and
+presents** (`Vulkan VideoOut presented first frame: 1920x1080` /
+`presented guest frame: image=... 1920x1080`). But the window then shows a black screen at 0 fps
+with a flat/unchanging heap - it never presents a second frame.
+
+**First finding, fixed**: the very next log line after the first frame is an unresolved import:
+`Import#323876 unresolved: nid=Zw7uUVPulbw ...`. Brute-forced (same method as the `reallocalign`
+fix) to **`sceAgcDriverGetEqContextId`** - confirmed absent from the codebase, unlike its
+siblings `sceAgcDriverAddEqEvent`/`sceAgcDriverDeleteEqEvent` (`AgcExports.cs`, both already
+implemented and already backed by real, tested equeue-signaling plumbing - see
+`tests/SharpEmu.Libs.Tests/Agc/AgcEventQueueTests.cs`, itself from a prior fix for a different
+game, issue #173). Live-disassembled the exact call site via `--debug-server` + `read-memory`
+(readable even at the very first stop-at-entry pause, since code pages are static) +
+capstone, and this **overturned an initial guess from this session's own plan**: the call's
+`rsi`/`rdx`/`rcx`/`r8`/`r9` register values in the unresolved-import log are stale leftovers
+from the *immediately preceding* `sceKernelWaitEqueue` call (confirmed by NID-hash brute force
+of that call's own PLT target) - not real arguments to this function. The real signature is a
+single argument (`rdi` = pointer to the `SceKernelEvent` just filled in by `WaitEqueue`),
+returning a 32-bit value in `eax` that the caller immediately masks with `& 7` to index a
+per-queue array - i.e. this is a plain accessor, not a stateful "create a context" call.
+Matched against the kevent struct layout already established in `AgcEventQueueTests.cs`
+(`ident@0x00, filter@0x08, flags@0x0A, fflags@0x0C, data@0x10, udata@0x18`), the function reads
+back `udata` - exactly the `userData` the game itself passed to `sceAgcDriverAddEqEvent` at
+registration time. **Fix**: added `AgcExports.DriverGetEqContextId` (NID `Zw7uUVPulbw`,
+`sceAgcDriverGetEqContextId`, `libSceAgcDriver`) as a pure `TryReadUInt64(eventAddress + 0x18)`
+accessor, right next to `DriverAddEqEvent`/`DriverDeleteEqEvent`. Added 2 unit tests to
+`tests/SharpEmu.Libs.Tests/Agc/AgcEventQueueTests.cs`
+(`DriverGetEqContextId_ReadsUserDataFromDeliveredEvent`,
+`DriverGetEqContextId_NullEventPointerReturnsZero`) - the first test initially polluted shared
+static state in `KernelEventQueueCompatExports._registeredEvents` (process-wide, not reset
+between tests) and made two *pre-existing* tests in the same file order-dependently fail; fixed
+by explicitly calling `DeleteRegisteredEvent` at the end of the new test, matching how a
+well-isolated test in this file should behave (a latent gap in the file's existing tests, which
+had been passing only by lucky execution order until this file gained a third test).
+`dotnet test SharpEmu.slnx -c Release`, run 3x: **382/382**, no regressions or flakes.
+
+**Verified this specific fix is correct and doesn't error** (`SHARPEMU_LOG_AGC=1` trace):
+`agc.driver_get_eq_context_id event=... udata=0x0` now fires cleanly right after the first
+frame, exactly where the unresolved-import warning used to fire - confirming the NID
+identification and signature were both right.
+
+**But this was NOT the frame-pump gate - the black screen persists.** Re-ran without the
+unresolved-import warning (confirmed 0 occurrences across a fresh full log) and let it run over
+8.6M imports (~3 minutes): frame-presented count stayed at exactly **1** the entire time. With
+`SHARPEMU_LOG_AGC=1`, the trace shows the *real* story: after the single `driver_submit_dcb`
+completes (all its completion events firing correctly, including `videoout flip complete`), the
+game calls `driver_get_eq_context_id` once more, then the log becomes **100% one thing**:
+`agc.suspend_point` (i.e. `sceAgcSuspendPoint`, already implemented as a trivial always-succeed
+no-op) paired 1:1 with a *guest-printed* line (confirmed NOT a SharpEmu log - absent from `src/`
+entirely) `Forcing call to sce::Agc::suspendPoint to avoid TRC R5089 breach`, repeating roughly
+every ~250ms indefinitely with **no other AGC/kernel call interleaved** between repeats. That
+means the loop's exit condition is being polled via a plain guest-memory read, not through any
+HLE call SharpEmu can see - so the actual blocker is invisible to `SHARPEMU_LOG_AGC` tracing.
+
+Separately, `sceKernelSyncOnAddressWait` (many worker threads, NID `Hc4CaR6JBL0`) climbs into
+the millions during this same window - almost certainly idle `Background Job.Worker N` threads
+polling a job queue that the stuck main thread never produces work for, a *downstream symptom*
+of the real stall rather than the stall itself. **Important**: this file already had an
+apparently-complete, real futex-style implementation of `sceKernelSyncOnAddressWait`/`Wake`
+sitting **uncommitted** before this session even started
+(`src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs` + its test file, both visible in
+`git status` since the very first message of this session) - it's a real wait/wake pair
+(`GuestThreadExecution.RequestCurrentThreadBlock`/`WakeBlockedThreads`, with a host-thread
+fallback), not a stub, and since it's a normal `.cs` file it's already been compiled into every
+build this session. Millions of near-instant calls through a *real* blocking wait implementation
+strongly suggests the `current != pattern` fast-path (`SyncOnAddressWait` returns `EAGAIN`
+immediately without blocking when the guest's expected compare-value is already stale) is what's
+actually firing every time, not genuine parking-then-waking - consistent with a guest-side
+adaptive spin/retry loop, not proof of a bug in that file itself.
+
+**Not root-caused. Next step for a future session**: find what memory location/condition
+`sceAgcSuspendPoint`'s caller polls between retries. This needs the same live-disassembly
+approach used for the previous two fixes, but starting from `sceAgcSuspendPoint`'s own call site
+this time (its C# handler doesn't currently log a return address - would need a temporary
+`ctx.TryReadUInt64(ctx[CpuRegister.Rsp], ...)` added to `AgcExports.SuspendPoint` to capture one,
+mirroring the previous session's disposable `find-refs` debug command: add it, capture what's
+needed, remove it again). A parallel investigation this session (forked via `/btw`) reached the
+same conclusion independently and flagged `KernelSyncOnAddressCompatExports.cs` as the most
+likely next place to look - but emphasized (and this write-up agrees) that the file's `Wait`/
+`Wake` pair look correct in isolation; the bug is more likely that nothing ever calls
+`sceKernelSyncOnAddressWake` on whatever address gates frame #2, or that the gate is a
+completely different, not-yet-identified mechanism.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution and
+`SHARPEMU_LOG_AGC=1`-traced execution, both before and after the `GetEqContextId` fix.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20): window now opens and renders one real
+frame - fixed a second missing AGC export (sceAgcDriverGetEqContextId), but the game still
+hangs at frame #1 for a DIFFERENT, deeper reason" section (and the two sections above it) for
+full background. Summary: metal_slug now boots, opens its window, and presents ONE real frame
+via Vulkan (huge progress from the crash-fixing sessions before this one). This session found
+and fixed a second missing HLE export, sceAgcDriverGetEqContextId (NID Zw7uUVPulbw) - a plain
+accessor reading the udata field back out of a delivered SceKernelEvent - added to AgcExports.cs
+next to its siblings DriverAddEqEvent/DriverDeleteEqEvent, with 2 new unit tests
+(tests/SharpEmu.Libs.Tests/Agc/AgcEventQueueTests.cs). Verified via SHARPEMU_LOG_AGC=1 that this
+specific fix works correctly and the unresolved-import warning it fixed never recurs. Full test
+suite: 382/382, run 3x, no flakes.
+
+HOWEVER this did NOT fix the user's actual reported symptom (black screen, 0 fps, flat heap) -
+don't present it as a full fix. The real blocker is still open: after the first frame's DCB
+fully completes (confirmed via SHARPEMU_LOG_AGC=1 - all completion events including
+videoout-flip-complete fire correctly), the game enters an indefinite retry loop calling ONLY
+sceAgcSuspendPoint (already a real, correct no-op HLE) roughly every ~250ms, printing its own
+embedded debug string "Forcing call to sce::Agc::suspendPoint to avoid TRC R5089 breach" each
+time - confirmed to be genuine guest output, not a SharpEmu log. No other AGC or kernel HLE call
+is interleaved between these retries, meaning whatever condition gates the loop's exit is being
+checked via a plain guest-memory read SharpEmu can't currently see through tracing.
+
+Next step: find that memory location. Recommended approach: capture the guest return address
+for the sceAgcSuspendPoint call site (temporarily add `ctx.TryReadUInt64(ctx[CpuRegister.Rsp],
+out var ret)` + a trace line to AgcExports.SuspendPoint, rebuild, run briefly, capture one
+address, then REMOVE the temporary logging again - same disposable-diagnostic pattern used for
+the earlier find-refs debug command), then live-disassemble backward/forward from that address
+with capstone via --debug-server + read-memory (tooling unchanged from prior sessions) to find
+the actual polled condition. A same-session parallel investigation independently flagged
+src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (a real, already-implemented futex
+wait/wake pair that was sitting uncommitted before this session even started, now compiled into
+every build) as the most likely adjacent subsystem, but its Wait/Wake logic looks correct in
+isolation - the more likely bug is a missing sceKernelSyncOnAddressWake call somewhere (nothing
+signals the address the frame-2 gate polls) or an entirely different, not-yet-identified gate
+mechanism. Don't assume it's a SyncOnAddress bug without more evidence - trace the real call
+chain first. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars, or add
+`SHARPEMU_LOG_AGC=1` for AGC-level tracing (as used this session) or `--debug-server` for live
+memory inspection. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): traced the suspend-point watchdog and the SyncOnAddressWait spin to their real source - both turned out to be red herrings, but a concrete new lead (`GfxFlipThread`'s total silence) was found
+
+Continued straight from the previous entry. Used the same disposable-diagnostic pattern flagged
+there: temporarily added `ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var ret)` +
+`Console.Error.WriteLine` to `AgcExports.SuspendPoint`, rebuilt, ran ~10s, captured **all 11**
+calls coming from the exact same return address `0x8014E9542`, then reverted the change
+immediately (confirmed via re-reading the file that it matches the pre-diagnostic version
+exactly - no leftover diff).
+
+**`sceAgcSuspendPoint`'s caller is a TRC-compliance watchdog thread, not the render loop.**
+Live-disassembled the enclosing function (prologue at `0x8014E9440`, via the same
+`--debug-server` `read-memory` + capstone approach as always). Its shape: check a global
+"armed" flag on entry (else return immediately); loop forever: sleep 1 second (or 1ms in one
+special branch), check a global "still enabled" flag, check a global "should measure" flag, and
+if enough real time (a "3-unit" threshold) has passed since the last checkpoint, lock a mutex,
+read the current time, and - if a separate `0x80146ef80` call's result equals `0x1a` and two
+more flags are set - **calls `sceAgcSuspendPoint` on this watchdog thread's own behalf**,
+records the checkpoint time, then unlocks and loops. This exactly matches its own guest-printed
+string ("Forcing call to sce::Agc::suspendPoint **to avoid a TRC R5089 breach**" - a real Sony
+Technical Requirements Checklist rule about CPU yielding/idle behavior): **this thread exists
+specifically to detect that the real (main) thread has stopped calling real suspend-point
+checkpoints itself, and calls one on its behalf as a compliance mitigation.** It is a symptom
+of something else being stuck, not a bug in itself, and definitely not the frame-2 gate.
+
+**Went looking for the real stuck thread via `sceKernelSyncOnAddressWait`/`Wake` instrumentation
+(same disposable-diagnostic pattern, added to
+`src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs`, then fully reverted - verified
+via re-reading the file after removal).** First pass (dedupe-by-address, log first-seen
+address+pattern+thread-handle+caller-return-address): found `UnityGfxDeviceWorker` and
+`Gfx Task Executor` each parked on exactly one distinct address the entire ~30s run, and,
+critically, **`sceKernelSyncOnAddressWake` is never called on either address across the whole
+run** (confirmed via a second instrumentation pass logging every Wake call unconditionally - 16
+total Wake calls happen, none targeting these addresses). This initially looked like the smoking
+gun. **It wasn't** - a third pass capturing the guest return address for these specific waits
+showed `UnityGfxDeviceWorker` and `Gfx Task Executor` both call `SyncOnAddressWait` from the
+exact same address, `0x8018A90E8`, and disassembling that (prologue `0x8018A90CF`) revealed a
+**generic atomic-refcount semaphore-acquire primitive** (`lock xadd`/`lock cmpxchg` fast path at
+`0x8018A90C0`-`0x8018A90CE`, futex-style wait-then-recheck loop below it) - the shared
+"wait for available work" primitive Unity's JobSystem thread pool uses. Confirmed generic, not
+graphics-specific: `AssetGarbageCollectorHelper`, multiple `Job.Worker N`, and multiple
+`Background Job.Worker N` threads all block at this **same** return address too. **A worker
+thread idling here with nothing queued is completely normal, expected behavior** - real PS5
+hardware would show the same thing between frames. This session's earlier framing ("nothing ever
+wakes `UnityGfxDeviceWorker`, that's the bug") was too hasty and should not be repeated as
+established fact by a future session; it's ruled out.
+
+**The real new lead**: across the same ~30s observation window (in which `UnityGfxDeviceWorker`
+and `Gfx Task Executor` were both instrumented and both showed activity), **`GfxFlipThread`
+never once appears in the `SyncOnAddressWait` or `SyncOnAddressWake` diagnostic output** - zero
+calls to either. Every other graphics-adjacent thread touches this futex-family primitive at
+least once; the thread literally named for flip pacing touches it not at all. This means either
+(a) it's blocked on a genuinely different primitive (`sceKernelWaitSema`/`sceKernelPollSema` and
+`sceKernelWaitEventFlag`/`sceKernelPollEventFlag` are both already implemented in
+`KernelSemaphoreCompatExports.cs`/`KernelEventFlagCompatExports.cs` and are the next things worth
+instrumenting the same way), (b) it's spinning without ever calling a blocking primitive at all
+(would show up differently - worth checking with a similar one-shot diagnostic in whichever
+function is suspected), or (c) it already ran to completion and exited, which would be its own
+separate, interesting finding if confirmed (a whole additional per-frame stage silently not
+happening).
+
+**Not root-caused.** This entry corrects the previous one's premature conclusion and narrows the
+search space substantially: the bug is very unlikely to be anywhere in the
+`sceKernelSyncOnAddressWait`/`Wake` pair itself (looks correct, and the specific "stuck" threads
+found are behaving normally), and is now most plausibly either in `GfxFlipThread`'s own logic or
+in whatever's supposed to feed it after frame 1. Do not re-instrument `SyncOnAddressWait`/`Wake`
+expecting a different result without new evidence - that ground has been covered this session.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution,
+`--debug-server` live disassembly, and three rounds of temporary/reverted diagnostic
+instrumentation (`AgcExports.SuspendPoint`, `KernelSyncOnAddressCompatExports.SyncOnAddressWait`/
+`SyncOnAddressWake`) - all confirmed removed again before this write-up (verified via re-reading
+both files; `dotnet test SharpEmu.slnx -c Release`: 382/382 after cleanup, no changes beyond the
+`sceAgcDriverGetEqContextId` fix from the previous entry).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): traced the suspend-point
+watchdog and the SyncOnAddressWait spin to their real source - both turned out to be red
+herrings, but a concrete new lead (GfxFlipThread's total silence) was found" section (and the
+section above it) for full background. Summary: metal_slug boots, opens its window, and
+presents ONE real frame (huge progress from earlier sessions), then never presents a second one.
+Two prior hypotheses for the stall were investigated and RULED OUT this session - don't
+re-investigate them without new evidence:
+1. sceAgcSuspendPoint's caller is a TRC-compliance watchdog thread (detects the real thread
+   isn't yielding, calls suspendPoint on its behalf) - a symptom, not the cause.
+2. UnityGfxDeviceWorker/Gfx Task Executor parking in sceKernelSyncOnAddressWait is normal
+   Unity JobSystem worker-pool idle behavior (a generic semaphore-acquire primitive at guest
+   address 0x8018A90CF, shared by many unrelated worker threads including
+   AssetGarbageCollectorHelper and Job.Worker N) - not a bug, and sceKernelSyncOnAddressWait/
+   Wake itself (src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs) looks correct.
+
+The concrete new lead: GfxFlipThread - the thread literally named for frame-flip pacing - never
+calls sceKernelSyncOnAddressWait OR sceKernelSyncOnAddressWake even once across a 30-second
+observation window in which every other graphics-adjacent thread called one or both at least
+once. Next step: find out what GfxFlipThread is actually doing. Recommended approach, in order:
+1. Instrument sceKernelWaitSema/sceKernelPollSema (KernelSemaphoreCompatExports.cs) and
+   sceKernelWaitEventFlag/sceKernelPollEventFlag (KernelEventFlagCompatExports.cs) the same way
+   this session instrumented SyncOnAddressWait/Wake - a temporary Console.Error.WriteLine logging
+   thread handle + address/handle + (for Wait calls) the guest return address via
+   ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var ret), gated so it only fires once per distinct
+   key (a ConcurrentDictionary<TKey,bool> dedupe set, as done this session) to avoid log spam.
+   Correlate GfxFlipThread's handle (read from the "Scheduled guest thread 'GfxFlipThread'
+   handle=0x..." boot-log line, which differs per run) against what shows up.
+2. If GfxFlipThread doesn't touch those either, it may be spinning without blocking, or may have
+   already exited - check whether its handle appears in ANY later log activity at all
+   (grep the full boot log for its handle), and consider instrumenting scePthreadCreate itself
+   (or wherever GfxFlipThread's actual per-thread work function is invoked from the shared
+   entry=0x800BFACC0 trampoline) to confirm it's still alive.
+3. Once GfxFlipThread's real blocking point (if any) is found, disassemble it the same way as
+   every previous fix this multi-session investigation has used: --debug-server + read-memory
+   (works even at the very first stop-at-entry pause, since code pages are static) + capstone
+   via the venv at <scratchpad>/venv, brute-forcing any PLT/GOT call targets' NIDs by replicating
+   SelfLoader.NidToUInt32 against scripts/ps5_names.txt (via Ps5Nid.Compute) exactly as done for
+   every fix so far. ALWAYS revert temporary diagnostic instrumentation before finishing (verify
+   by re-reading the file) and rerun the full test suite (dotnet test SharpEmu.slnx -c Release,
+   currently 382/382) before considering the session's changes final.
+
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars, or add
+`SHARPEMU_LOG_AGC=1` / `--debug-server` as needed. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): `GfxFlipThread` fully disassembled and CLEARED - it is correctly implemented and patiently waiting; the real gate is on the main thread, which never submits frame 2 in the first place
+
+Continued straight from the previous entry's concrete lead. Two existing env-var trace flags
+(`SHARPEMU_LOG_SEMA=1`, `SHARPEMU_LOG_EVENT_FLAG=1` - both pre-existing, no instrumentation
+needed) turned up an event flag named **`PresentDoneFlag`** and semaphores named
+`SuspendSemaphore`/`ResumeSemaphore` plus an event `resumeEvent` - the latter three are PS5
+app-lifecycle (suspend/resume) primitives, confirmed irrelevant to the per-frame stall (a
+`sema.wait-host-block` on `SuspendSemaphore` blocking forever after frame 1 is *correct*: nothing
+should ever request a real OS suspend in this environment). `PresentDoneFlag` looked more
+promising at first but a closer read of `KernelEventFlagCompatExports.KernelCancelEventFlag`'s
+trace format clarified that its `guest_thread=` field logs the *caller* of cancel, not a
+cancelled waiter - so the one `cancel`+`set` pair seen for it is a normal one-time reset/signal
+during startup, not evidence of anything broken.
+
+**Found `GfxFlipThread`'s real per-thread work function directly, instead of chasing it through
+synchronization traces.** `scePthreadCreate`'s `entry=0x800BFACC0` is a shared trampoline for
+every worker thread (confirmed earlier this session); the real work function must live somewhere
+inside the per-thread `arg` struct passed to it. Added a one-shot temporary diagnostic to
+`KernelExports.PthreadCreateCore` (`src/SharpEmu.Libs/Kernel/KernelExports.cs`) that dumps 0x80
+bytes at the `arg` pointer specifically when `name == "GfxFlipThread"`, rebuilt, ran once,
+captured the bytes, then reverted immediately (verified via re-reading the file). Decoded the
+struct as little-endian qwords: confirmed it's an array of fixed 0x70-byte worker-descriptor
+entries (`arg+0x70` for `GfxFlipThread`'s entry exactly equals `UnityGfxDeviceWorker`'s own
+`arg` address seen in earlier boot logs, and that entry's own `+0x70` equals `Gfx Task
+Executor`'s `arg` - each entry chains to the next). Within `GfxFlipThread`'s entry: `+0x18` = 700
+(matches its logged thread priority, confirming the struct layout guess), `+0x40` = the literal
+ASCII string `"GfxFlipThread\0"`, and **`+0x28` = a guest *code* address, `0x00000008014BB6C0`** -
+the real work-function pointer.
+
+**Live-disassembled `0x8014BB6C0` (via `--debug-server` `read-memory` + capstone, same as every
+fix this multi-session investigation has used) and it settles the question completely.** The
+function: reads two time values, computes a refresh-rate-derived interval, calls
+`sceKernelCreateEqueue` (identified via the usual NID-hash-against-`ps5_names.txt` brute force),
+then `sceVideoOutAddFlipEvent(equeue, videoOutPort, userData=0)` - registering for **video-out
+flip events specifically**, a completely different, independently-implemented mechanism
+(`VideoOutExports.cs`'s `FlipEventRegistration`/`TriggerFlipEvents`,
+`OrbisKernelEventFilterVideoOut = -13`) from the AGC graphics-completion equeue path investigated
+in the previous two entries. Its main loop: check an exit/quit flag first; call
+`sceKernelWaitEqueue` with a 500ms timeout; **if the wait times out (the overwhelmingly common
+case - no new flip event yet), loop back to the top and wait again**; if it succeeds (a real
+flip event arrived), call `sceVideoOutGetFlipStatus` (identified via NID brute force too - this
+one hash had 2 other collision candidates in the 32-bit hash space, both semantically
+implausible C++-mangled PSN Leaderboards internals; `sceVideoOutGetFlipStatus` is the only
+candidate that makes sense for a flip-pacing thread and matches its call position exactly right
+after a successful wait), then continues the loop.
+
+**Conclusion: `GfxFlipThread` is correctly implemented, not stuck, and not the bug.** It is
+precisely doing what a flip-pacing thread should do: patiently polling (with a bounded 500ms
+timeout so it can still notice the exit flag) for the *next* flip-complete event, which would
+naturally arrive if frame 2 ever got submitted and flipped. It never touches
+`sceKernelSyncOnAddressWait` at all, which is exactly why the previous entry's instrumentation of
+that primitive never saw it - a different, unrelated primitive was always the reason, not a gap
+in that primitive's implementation. Combined with the previous entry's finding (no second
+`sceAgcDriverSubmitDcb`/`sceAgcDcbSetFlip` call ever happens, confirmed via `SHARPEMU_LOG_AGC=1`),
+the picture is now clear: **every graphics-adjacent thread this multi-session investigation has
+examined - `UnityGfxDeviceWorker`, `Gfx Task Executor`, `GfxFlipThread` - is behaving correctly
+and waiting for work that never arrives.** The actual gate must be upstream of all of them: on
+whichever thread runs Unity's main PlayerLoop/Update/Render dispatch (almost certainly the
+process's primordial main thread, not a `scePthreadCreate`-spawned one, which is why it never
+appeared in the "Scheduled guest thread" log lines used to correlate earlier findings) and is
+never reaching the point where it would build and submit frame 2's command buffer in the first
+place.
+
+**Not root-caused - this is now a substantially narrower, well-evidenced search space for a
+future session**, not a full fix. Do not re-investigate `GfxFlipThread`,
+`UnityGfxDeviceWorker`/`Gfx Task Executor`/other job-pool workers, or `sceAgcSuspendPoint`'s
+watchdog without new evidence - all three are confirmed correctly implemented and not the
+blocker this session.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution,
+`SHARPEMU_LOG_SEMA=1`/`SHARPEMU_LOG_EVENT_FLAG=1`/`SHARPEMU_LOG_AGC=1` tracing, `--debug-server`
+live disassembly, and one temporary/reverted diagnostic in `KernelExports.PthreadCreateCore`
+(confirmed removed; `dotnet test SharpEmu.slnx -c Release`: 382/382, no changes beyond the
+`sceAgcDriverGetEqContextId` fix from earlier in this session).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): GfxFlipThread fully
+disassembled and CLEARED - it is correctly implemented and patiently waiting; the real gate is
+on the main thread, which never submits frame 2 in the first place" section (and the two
+sections above it) for full background. Summary: metal_slug boots, opens its window, and
+presents ONE real frame, then never presents a second one. This multi-session investigation has
+now individually disassembled and RULED OUT three separate hypotheses as the cause - don't
+re-investigate any of them without new evidence:
+1. sceAgcSuspendPoint's caller is a TRC-compliance watchdog reacting to something else being
+   stuck - not the cause itself.
+2. UnityGfxDeviceWorker/Gfx Task Executor idling in sceKernelSyncOnAddressWait is normal Unity
+   JobSystem worker-pool behavior (a generic semaphore-acquire primitive at guest address
+   0x8018A90CF shared by many unrelated threads) - not a bug.
+3. GfxFlipThread (real work function found and fully disassembled at guest address 0x8014BB6C0,
+   via its arg struct's +0x28 field - the generic scePthreadCreate trampoline reads the real
+   per-thread function pointer from there) is a correctly-implemented flip-pacing loop:
+   sceKernelCreateEqueue -> sceVideoOutAddFlipEvent -> loop{check exit flag,
+   sceKernelWaitEqueue(500ms timeout) -> on success, sceVideoOutGetFlipStatus, loop again}. It
+   uses VideoOut's independently-implemented flip-event mechanism
+   (VideoOutExports.cs, OrbisKernelEventFilterVideoOut=-13), never touches
+   sceKernelSyncOnAddressWait at all, and is correctly waiting for a flip event that never comes
+   because nothing ever submits frame 2's DCB.
+
+Every graphics-adjacent thread examined so far is confirmed correctly implemented and simply
+waiting for work. The real gate must be on whichever thread runs Unity's main PlayerLoop -
+almost certainly the process's PRIMORDIAL main thread (not created via scePthreadCreate, so it
+never appears in "Scheduled guest thread" boot-log lines used to correlate every finding so
+far) - which never reaches the point of building/submitting frame 2's command buffer.
+
+Next step: identify and trace the main thread specifically. Recommended approach:
+1. Find the main thread's handle. It won't have a "Scheduled guest thread" log line; look for
+   its `Host thread: managed=N name='...'` identity via a live crash dump format, or correlate
+   via KernelPthreadState.GetCurrentThreadHandle() called from a temporary diagnostic placed
+   somewhere guaranteed to run on it early (e.g. the process entry point / first module
+   initializer), then confirmed by checking that the same handle never appears in any
+   "Scheduled guest thread" line.
+2. Determine what it's doing after frame 1 - is it blocked on a primitive (semaphore, event
+   flag, equeue, mutex - all of KernelSemaphoreCompatExports.cs/KernelEventFlagCompatExports.cs/
+   KernelEventQueueCompatExports.cs already have or can cheaply get SHARPEMU_LOG_* trace
+   support, per this session's discovery that SHARPEMU_LOG_SEMA=1 and SHARPEMU_LOG_EVENT_FLAG=1
+   already exist and needed no new instrumentation), or is it spinning/running normally through
+   guest code without ever reaching the AGC submission call (in which case tracing primitives
+   won't show anything and it needs direct disassembly of whatever Update-loop code it's
+   actually executing)?
+3. Whatever the answer, disassemble it the same way as every fix/finding so far: --debug-server
+   + read-memory (works even at the very first stop-at-entry pause, since code pages are static)
+   + capstone via the venv at <scratchpad>/venv; brute-force any PLT/GOT call targets' NIDs by
+   replicating SelfLoader.NidToUInt32 against scripts/ps5_names.txt (via Ps5Nid.Compute) - and
+   when a hash has multiple collision candidates (happened once this session for
+   sceVideoOutGetFlipStatus), pick the one that's semantically plausible for the call site, not
+   just the first alphabetical/first-found match.
+4. If instrumentation is added to find any of this, it must be temporary and reverted before the
+   session ends (verify by re-reading the file), and the full test suite (dotnet test
+   SharpEmu.slnx -c Release, currently 382/382) must stay green.
+
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars, or add
+`SHARPEMU_LOG_AGC=1`/`SHARPEMU_LOG_SEMA=1`/`SHARPEMU_LOG_EVENT_FLAG=1`/`--debug-server` as
+needed. metal_slug eboot.bin is at /home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): found the exact gate blocking frame 2 - the primordial main thread permanently blocks on an unsignaled `sceKernelWaitSema("SuspendSemaphore")` before its real per-frame loop can even start once
+
+Continued straight from the previous entry's ruled-out list (watchdog thread, JobSystem worker
+pool, `GfxFlipThread` - all confirmed correctly implemented, not the blocker). Two more rounds of
+live disassembly this session (`--debug-server` + `read-memory` + capstone, unchanged
+methodology) found the real gate.
+
+**A methodological gap was found and fixed first.** The earlier session's `SyncOnAddressWait`
+diagnostic deduped by *address*, which hides a thread that keeps re-hitting the *same* address
+via the fast `current != pattern` EAGAIN path thousands of times per second - indistinguishable
+from "genuinely blocked once" in that view. Added a temporary per-thread call-count diagnostic
+(`ConcurrentDictionary<ulong,long>`, top-6 printout every 200K calls) to
+`KernelSyncOnAddressCompatExports.SyncOnAddressWait`, rebuilt, ran, reverted. Found the fastest
+caller was an *unnamed* thread (`"Thread-<hex>"`, no descriptive pthread name) with a **unique,
+non-generic entry point** `0x8042312B0` and a distinct CPU affinity mask (`0x3C` vs. `0x7F` for
+every named worker thread) - confirmed stable across 12 different captured runs (guest code
+addresses aren't ASLR'd, only host-side handles are). Disassembled it: it's a thin generic C++
+runtime thread-launch trampoline (`baselib::Thread`-shaped: acquire a TLS pointer, atomically
+install it, call an indirect function pointer at `[rbx+0x10]` with arg `[rbx+0x18]`) - the real
+loop body isn't visible statically since it's reached only through that indirect call. Captured
+its actual `SyncOnAddressWait` return address live (temporary diagnostic again, reverted) and
+disassembled *that*: **the same generic semaphore-acquire template found in the previous entry**
+(`lock xadd`/`lock cmpxchg` fast path, futex-wait-then-recheck slow path), just a separate
+compiled instantiation at a different address (`0x8042e4a8f` vs. the earlier `0x8018a90cf`).
+**Conclusion: this thread is also just a correctly-blocked, idle semaphore waiter - high call
+frequency alone does not indicate a bug**, since different semaphore instances legitimately poll
+at different cadences. This rules out "which thread calls SyncOnAddressWait most" as a useful
+heuristic and closes out that entire line of investigation - every worker/helper/GC/job thread
+examined across both entries is confirmed correctly implemented.
+
+**Found the process's primordial main thread and proved it's the one that's actually stuck.**
+Every thread examined so far was created via `scePthreadCreate`/`pthread_create`, which always
+produces a "Scheduled guest thread ..." boot-log line. The one thread that *never* gets such a
+line is the process's own original thread (the ELF entry point's thread, never itself the
+subject of a `pthread_create` call). Captured its handle directly and unambiguously: added a
+temporary one-shot diagnostic to `KernelExports.PthreadCreateCore` that logs
+`KernelPthreadState.GetCurrentThreadHandle()` the first time `scePthreadCreate`/`pthread_create`
+is ever called (by definition, that first call can only come from the primordial thread, since
+nothing else exists yet to make it) - reverted after use. Cross-referenced against the same
+run's `SHARPEMU_LOG_SEMA=1` output (a **second, independent** pre-existing trace flag needing no
+new instrumentation, alongside `SHARPEMU_LOG_EVENT_FLAG=1` from the previous entry) and found an
+exact handle match: the very same thread later calls `sceKernelWaitSema` on a semaphore named
+`"SuspendSemaphore"` (guest-created via `sceKernelCreateSema`, handle=2, initial count=0,
+max=256) and blocks via `KernelSemaphoreCompatExports.WaitSemaphoreOnHostThread` - the *real*
+host-thread-blocking fallback path (not the cooperative guest-scheduler path), confirmed by the
+trace's `guest=0x0000000000000000` field, which fires specifically when
+`GuestThreadExecution.RequestCurrentThreadBlock` returns false - consistent with this thread
+never having been registered as a cooperative guest thread, since (unlike every other thread
+examined) it was never created via `scePthreadCreate` in the first place. This block happens
+**immediately** after the frame-1 present log line - one line apart, nothing else in between.
+
+**Disassembled the actual gated function and confirmed the wait is unconditional.** The
+semaphore wait's guest return address (`0x8042D88FE`) sits inside a function starting at
+`0x8042D88C0` whose overall shape is unmistakable: it takes a callback function pointer as its
+first argument (`rdi` -> `r14`), and after some setup/hook-table calls (`mov edi, N; call rax`
+through several distinct global function-pointer slots, `N` observed = 1, 2, 6, 7, 8, 9 - an
+internal engine callback/hook table, not yet further traced), it enters a loop:
+`call r14` (the real per-frame callback) -> `call 0x8042d9690` (pump one pending OS/system
+message) -> `call r14` again -> loop while the callback keeps returning 0. **This is Unity's
+real PS5 platform-backend main-loop driver** - the function responsible for invoking Unity's
+actual Update/Render callback repeatedly, once per iteration. Critically, the
+`sceKernelWaitSema(SuspendSemaphore)` call sits *before* this loop, gating entry to it entirely.
+Disassembled *both* branches that reach this point (one gated by a global flag at
+`0x807E29520`, read as `0` at the very first stop-at-entry pause - i.e. zero-initialized BSS,
+set to nonzero by other code before this function runs, not yet traced) and confirmed **both
+converge on the exact same wait call** - the flag only controls whether some extra
+frame-timing/hook bookkeeping happens first, not whether the wait itself happens. There is no
+path that starts the real per-frame loop without first passing this gate.
+
+**What's confirmed vs. still open, precisely:**
+- Confirmed, with register-level/log-level evidence at every step: main thread identity, the
+  exact semaphore and wait call, the exact gated function and its loop shape, that the gate is
+  unconditional on both branches, and that nothing ever signals the semaphore
+  (`SHARPEMU_LOG_SEMA=1` shows zero `sema.signal`-family lines for handle 2 across every capture
+  this session).
+- **Not confirmed**: what real PS5 mechanism is supposed to signal this semaphore. Checked the
+  most obvious hypothesis (`sceSystemServiceReceiveEvent`, a real NID cataloged in
+  `scripts/ps5_names.txt` for exactly this kind of app-lifecycle event polling) against every
+  captured boot log by computing its NID via `Ps5Nid.Compute` and grepping for it, resolved or
+  unresolved - **it never appears**, meaning the guest doesn't call it (at least not before the
+  hang). Same negative result for `sceSystemServiceEnableSuspendNotification`,
+  `sceSystemServiceDeclareReadyForSuspend`, `sceSystemServiceIsAppSuspended`,
+  `sceSystemServiceResumeLocalProcess`/`SuspendLocalProcess`, and
+  `sceSystemServiceGetAppFocusedAppStatus` - **do not re-try this specific hypothesis without new
+  evidence.** `src/SharpEmu.Libs/SystemService/SystemServiceExports.cs` currently implements only
+  9 unrelated NIDs (title ID, params, display safe area, HDR luminance, splash screen, abnormal
+  termination) - zero event/notification/lifecycle-callback surface exists at all.
+- A concrete, not-yet-followed lead: the gated function's disassembly shows a call to guest
+  address `0x804000620` immediately after the semaphore wait returns - a very low address near
+  the image base, in a different range from every PLT/GOT trampoline range identified elsewhere
+  in this investigation (`0x8019bXXXX`, `0x8042eXXXX`). Not yet disassembled.
+- Also confirmed this session (research only, no code changes needed): no precedent exists
+  anywhere in `KernelSemaphoreCompatExports.cs` for reacting to a semaphore's *name* - the name
+  is stored (from `sceKernelCreateSema`) but never pattern-matched. Per this repo's explicit
+  "prefer generic implementations over game-specific hacks" norm, a fix must not special-case the
+  literal string `"SuspendSemaphore"` - it needs to be the real underlying PS5 mechanism, once
+  identified. `KernelSemaphoreCompatExports.KernelSignalSema(CpuContext ctx, uint handle, int
+  signalCount)` (line 295) is the existing logic a generic fix would need to trigger, but
+  `_semaphores`/`_nextSemaphoreHandle` are currently file-private - a fix that needs to signal a
+  semaphore from a context other than a direct guest HLE call may need a small, generic
+  (non-semaphore-name-aware) public entry point added.
+
+**No code changes in this entry** - purely investigation, with all temporary diagnostics
+(`SyncOnAddressWait` call-counter, `SyncOnAddressWait` per-thread return-address capture,
+`PthreadCreateCore` first-caller capture, `WaitSemaphoreOnHostThread`'s trace-line
+`KernelPthreadState` handle addition) added and fully reverted (verified by re-reading each file
+after removal). `dotnet test SharpEmu.slnx -c Release`: 382/382, unchanged from the previous
+entry.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via direct `eboot.bin` execution,
+`SHARPEMU_LOG_SEMA=1` tracing, `--debug-server` live disassembly, and four rounds of
+temporary/reverted diagnostic instrumentation across
+`KernelSyncOnAddressCompatExports.cs`/`KernelExports.cs`/`KernelSemaphoreCompatExports.cs`.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): found the exact gate
+blocking frame 2 - the primordial main thread permanently blocks on an unsignaled
+sceKernelWaitSema('SuspendSemaphore') before its real per-frame loop can even start once"
+section (and the sections above it) for full background. Summary: metal_slug boots, opens its
+window, and presents ONE real frame, then hangs forever. The exact gate is now fully located and
+proven with register/log-level evidence at every step (not a guess): the process's primordial
+main thread (never created via scePthreadCreate, confirmed via a first-pthread-create-caller
+diagnostic cross-referenced against SHARPEMU_LOG_SEMA=1 output) runs Unity's real per-frame
+Update/Render loop driver (guest function at 0x8042D88C0 - takes a callback function pointer,
+loops calling it while pumping OS messages between calls). Before that loop can start even once,
+the function makes an UNCONDITIONAL (confirmed: both control-flow branches into this point
+converge on the same call, no skip path exists) one-time call to sceKernelWaitSema on a
+guest-created semaphore named "SuspendSemaphore" (handle=2, count=0, max=256). Nothing in
+SharpEmu ever signals it, so this blocks forever and the real per-frame loop's first iteration
+never happens (the one frame that did render came from an earlier, separate init/splash code
+path, not this loop).
+
+What's NOT yet known: which real PS5 API is supposed to signal this semaphore. The obvious guess
+(sceSystemServiceReceiveEvent and friends - real, cataloged NIDs for app-lifecycle event
+polling) was checked by computing each NID via Ps5Nid.Compute and grepping every captured boot
+log - NONE of them ever appear, resolved or unresolved, meaning the guest never calls them
+before the hang. Do not re-investigate this specific hypothesis without new evidence.
+
+Next step (in order, per the approved plan at the time this was written - a plan file may or may
+not still exist depending on session boundaries, but the steps remain valid regardless):
+1. Disassemble guest address 0x804000620 - a call made immediately after the semaphore wait
+   returns, at a very low address near the image base, in a different range from every other
+   PLT/GOT trampoline range found so far (0x8019bXXXX, 0x8042eXXXX). Not yet examined at all.
+2. Trace the callback/hook-table calls in the gated function (mov edi, N; call rax, N observed =
+   1, 2, 6, 7, 8, 9, through distinct global function-pointer slots) to see if any is Unity's own
+   suspend/resume handling hook - if the game's own code is responsible for eventually signaling
+   this semaphore itself (e.g. from a registered callback invoked elsewhere), the real gap may be
+   a different, not-yet-identified missing piece that chain depends on.
+3. Once the real mechanism is identified, implement it GENERICALLY (per CLAUDE.md's "prefer
+   generic implementations over game-specific hacks" - confirmed this session that no
+   semaphore-name-matching precedent exists anywhere in KernelSemaphoreCompatExports.cs and none
+   should be introduced) in the appropriate SharpEmu.Libs module - let the disassembly evidence
+   decide which NID/module, don't guess. KernelSemaphoreCompatExports.KernelSignalSema(CpuContext
+   ctx, uint handle, int signalCount) (line 295) is the existing signal logic; _semaphores is
+   currently file-private and may need a small generic public entry point if the fix needs to
+   trigger it from outside a direct guest HLE call.
+4. Add unit tests, verify full suite stays green (382/382), rerun metal_slug and confirm frame
+   presents continue (or document precisely what new/different thing happens if they don't -
+   don't force a claim of success).
+
+Tooling: --debug-server + read-memory (works even at the very first stop-at-entry pause, guest
+code is static) + capstone via the venv at <scratchpad>/venv; NIDs identified via
+SelfLoader.NidToUInt32 replicated in Python against scripts/ps5_names.txt (hashed via
+Ps5Nid.Compute). SHARPEMU_LOG_SEMA=1/SHARPEMU_LOG_EVENT_FLAG=1/SHARPEMU_LOG_AGC=1 are pre-existing
+trace flags needing no new C# instrumentation - check for more before adding diagnostics. Any
+temporary diagnostic added must be reverted before the session ends (verify by re-reading the
+file). Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars.
+metal_slug eboot.bin is at /home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): three more leads chased on the `SuspendSemaphore` gate - all ruled out except one still-open thread; a reusable "trap + real crash dump" technique confirmed to work around the debugger's breakpoint limitation
+
+Continued directly from the previous entry, following its plan (documented and approved via this
+session's plan-mode step). Three concrete next actions from that plan's step 2/3 were attempted.
+
+**`0x804000620` (the call right after the semaphore wait returns) is a dead end - it's a
+genuine, compiled-in no-op.** Disassembled it directly: the address is the entire body of a
+tiny standalone function - literally just `ret`, padded with `int3` on both sides before the
+next real function starts at `0x804000630`. No `CC C3` trap signature (so not a PLT/GOT import
+stub either) - this is real, static guest code that intentionally does nothing. Almost certainly
+a default/weak no-op implementation of an overridable engine hook. Rules this address out
+entirely; don't re-investigate it.
+
+**The "hook table" turned out to be a single shared event-dispatch callback, not six separate
+hooks - and it's unregistered (null) at the very first pause.** All three `mov rax, [rip+disp]`
+loads checked in the previous entry's disassembly (for `edi=1`, `6`, `7`) resolve to the exact
+same absolute address, `0x80803BEC8` - i.e. `if (g_eventCallback) g_eventCallback(N)` repeated
+for different event codes `N`, not six independent function-pointer slots. Read at the very
+first stop-at-entry pause (before any guest code runs): `0x0000000000000000` - as expected for
+zero-initialized BSS this early, not informative about its state by itself.
+
+**A real debugger limitation was found and worked around.** Attempted to set a live execution
+breakpoint (`add-breakpoint`, `kind=Execute`) at the semaphore-wait call site
+(`0x8042D88F9`) to catch the main thread in the act and read the callback slot's value live at
+that exact moment. It never fired, even after the guest ran freely (burning real CPU, confirmed
+via `ps`) for 15+ minutes past the point it should have been hit within seconds - strongly
+suggesting `add-breakpoint`'s execution breakpoints don't get evaluated for guest threads that
+were never registered with `GuestThreadExecution`'s cooperative scheduler (the same gap
+documented in the previous entry for `WaitSemaphoreOnHostThread`'s fallback path) - i.e. the
+primordial main thread specifically may not be one the debugger's breakpoint mechanism watches.
+**Worked around this** using the same technique that root-caused every earlier bug in this
+multi-session investigation, which doesn't depend on the debugger's thread tracking at all:
+connected while paused at the very first stop-at-entry pause, used `write-memory` to patch a
+`ud2` (`0F 0B`) directly over the semaphore-wait `call` instruction itself, then drove the
+session through `continue` calls until state became `Running` and disconnected - letting the
+process's own independent VEH/signal handler catch the resulting `SIGILL` and print a full,
+ordinary crash dump (this is the exact same mechanism that produced every crash dump analyzed
+across this entire investigation's earlier sessions - unrelated to and unaffected by the
+debug-server's breakpoint-tracking gap). **This is a generically useful technique worth
+remembering**: when a live execution breakpoint doesn't fire on a specific thread, patching a
+trap opcode directly and using the normal crash-dump path is a reliable fallback.
+
+**The crash dump's frame chain and "recent import calls" were both mined for clues - both point
+to normal engine bootstrap/logging activity, not a suspend/resume-specific mechanism.**
+`Host thread: managed=4 name='SharpEmu Emulation'` (the generic/default host-thread name, unlike
+every `scePthreadCreate`d thread's `SharpEmu-<name>` pattern) confirms this is the primordial
+thread, consistent with the previous entry. The "recent import calls" trailing the crash showed
+heavy `_Znwm`/`_ZdlPv`/`malloc`/`free` activity (all already-identified NIDs from earlier fixes
+this session) plus `pthread_mutex_trylock` on guest address `0x80803BA20` (376 bytes from the
+shared callback slot at `0x80803BEC8` - plausibly part of the same object/registry) and one
+`strchr` call splitting a string on `/` (path parsing). Disassembled two of the frame chain's
+return addresses (`0x80420EF3E`/frame#6, `0x8041F8D1C`/frame#7, which turned out to be
+caller/callee of the same function) and both land in generic UTF-16-length-to-byte-count string
+construction/allocation code - i.e. **this whole immediate context is building/formatting a
+string (almost certainly a log message)**, not signaling or registering anything
+suspend/resume-specific. This closes out the "trace the frame chain backward" angle as
+unproductive for this specific question; don't re-walk these same frames expecting a different
+answer.
+
+**Net result this entry**: two of the previous entry's three candidate leads (`0x804000620`,
+the hook-table calls) are now conclusively ruled out or shown to be a dead end from this
+specific vantage point. The real missing piece - what's supposed to populate the shared
+`0x80803BEC8` callback slot (or otherwise trigger `sceKernelSignalSema` on `SuspendSemaphore`)
+in the first place - is still open. No code changes this entry (pure investigation); the `ud2`
+patch was applied only via the live debug protocol (`write-memory`), never written to any
+source file, and the process that received it was allowed to crash and exit naturally - nothing
+to revert. `dotnet test SharpEmu.slnx -c Release`: 382/382, unchanged.
+
+**Given the depth reached without landing the final answer, the most likely productive next
+step is implementing a proper "find all references to address X" debug-server command** (a
+disposable, temporary addition per this repo's own established precedent - an earlier session in
+this same investigation built and then removed exactly such a command,
+`SHARPEMU_DEBUG_FIND_REFS=1`, for an analogous problem) to directly find every instruction that
+writes to `0x80803BEC8`, rather than continuing to guess at call chains one frame at a time.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `--debug-server` live memory reads, one
+live `write-memory` trap patch (not persisted to any file), and the resulting native crash dump.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): three more leads chased on
+the SuspendSemaphore gate - all ruled out except one still-open thread; a reusable 'trap + real
+crash dump' technique confirmed to work around the debugger's breakpoint limitation" section (and
+the two sections above it) for full background. Summary: metal_slug boots, opens its window,
+presents ONE real frame, then hangs forever. Root cause is fully pinned down to one specific
+guest function and one specific call (documented in detail two entries above this one) - the
+process's primordial main thread runs Unity's real per-frame Update/Render loop driver (guest
+function at 0x8042D88C0), but before that loop can start even once, it makes an unconditional
+one-time call to sceKernelWaitSema on a semaphore named "SuspendSemaphore" that nothing in
+SharpEmu ever signals. This entry ruled out two of three follow-up leads:
+- 0x804000620 (a call right after the wait returns) is a genuine, compiled-in no-op (just `ret`)
+  - not an import stub, not missing HLE, dead end.
+- The "hook table" (edi=1,2,6,7,8,9 calls) is actually ONE shared event-dispatch callback slot at
+  guest address 0x80803BEC8, not six separate hooks - confirmed null at the very first
+  stop-at-entry pause (uninformative on its own, needs a live-later read to be useful).
+- A live execution breakpoint at the wait call site never fired even after 15+ minutes of real
+  guest execution time - likely because the primordial main thread isn't tracked by
+  GuestThreadExecution's cooperative scheduler (same gap noted for semaphore blocking in the
+  entry above this one). WORKED AROUND by patching a ud2 trap directly via write-memory at the
+  call site and letting the normal VEH crash-dump path catch it instead - this technique is
+  provider-agnostic and worth reusing whenever a live breakpoint doesn't fire on a given thread.
+- The resulting crash dump's frame chain (frames 0-7, all disassembled or partially disassembled)
+  leads into generic UTF-16 string construction/allocation code - almost certainly building a log
+  message, not a suspend/resume-specific mechanism. Dead end for tracing backward through this
+  particular call chain further.
+
+Next step (recommended, not yet attempted): implement a temporary "find all references to
+address X" debug-server command (an earlier, different session in this investigation already
+built and removed exactly this once, gated by SHARPEMU_DEBUG_FIND_REFS=1, for an analogous
+problem - re-derive it using the project's existing Iced-based IcedDecoder, add it to
+DebugCommandDispatcher.cs, use it, then REMOVE it again afterward per that established
+precedent) to directly find every instruction that writes to 0x80803BEC8 (the shared
+event-callback slot) - this should reveal exactly what's supposed to register a handler there,
+which is very likely either the direct fix or one hop away from it. Once found, implement the
+real, generic PS5 mechanism (not a semaphore-name-matching hack - confirmed twice now that no
+such precedent exists in this codebase and CLAUDE.md explicitly discourages game-specific hacks).
+
+Tooling: --debug-server + read-memory/write-memory (both work even at the very first
+stop-at-entry pause, guest code is static) + capstone via the venv at <scratchpad>/venv; NIDs
+identified via SelfLoader.NidToUInt32 replicated in Python against scripts/ps5_names.txt (hashed
+via Ps5Nid.Compute) - or, for NIDs already showing up resolved in a crash dump's "recent import
+calls" list, just grep the codebase directly for `Nid = "<the nid>"` rather than re-deriving via
+hash brute force. If a live execution breakpoint doesn't fire on the primordial main thread,
+don't keep waiting - fall back to the write-memory ud2-trap + natural-crash-dump technique
+immediately, it's proven reliable throughout this whole investigation. Repro: build (`dotnet
+build SharpEmu.slnx -c Debug`), run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug
+eboot.bin>` with no env vars. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): built and used a working reference-scan technique (discovered SharpEmu already ships one) - traced the event-callback slot all the way to its registered handler, which turns out to be a real, correctly-wired, but IRRELEVANT no-op for this bug
+
+Continued directly from the previous entry's recommended next step (build a `find-refs`
+tool). Before writing any new code, researched what already exists (via a background Explore
+agent, read-only) and found **this project already ships a fully-implemented reference
+scanner** - `DirectExecutionBackend.DumpGuestReferenceDiagnostics()`
+(`src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Exceptions.cs:686-761`), gated by env var
+`SHARPEMU_LOG_REFSCAN_ADDRS` (comma-separated hex addresses). It scans
+`0x0000000800000000`-`0x0000000810000000` and reports, per target address, every RIP-relative
+memory-operand reference (reads *and* writes) and every direct near CALL/JMP reference, using
+the same `IcedDecoder` already used elsewhere in this codebase - **no new source code needed**,
+just the right env var plus a way to trigger it.
+
+**One wiring detail mattered**: this diagnostic only runs from the Access Violation branch of
+the crash handler, not the Illegal Instruction branch the previous entry's `ud2` trap used - so
+reusing that exact trap wouldn't have triggered it. Fixed by patching a different
+instruction instead: `mov eax, dword ptr [0]` (`8B 04 25 00 00 00 00`, 7 bytes) - an
+absolute-addressed, register-state-independent guaranteed-fault read of guest address 0 - in
+place of the semaphore-wait call site, which raises a genuine Access Violation and reaches the
+scanner. (Interestingly, this particular fault turned out to be *auto-recovered* by SharpEmu's
+own low-address-redirect logic rather than fatal - the process kept running afterward, which
+didn't matter since the diagnostic output had already been printed by the time recovery
+happened.)
+
+**First scan (target: the shared event-callback slot, `0x80803BEC8`) found real writes**, cutting
+straight through what direct disassembly-only tracing hadn't been able to find: three
+`mov [80803BEC8h], rbx` sites (`0x8042D9547`, `0x8042D9557`, `0x8042D9578`), all inside one small
+function starting at `0x8042D9500` - a one-argument setter (`rdi` -> stored into the slot across
+three conditional branches, each gated by different validation/logging steps, one of them
+tail-calling into a separate cleanup function for the previous value - a textbook "set the
+registered handler, cleaning up whatever was there before" pattern).
+
+**Second scan (target: that setter function's own entry point, `0x8042D9500`) found exactly one
+caller**: `0x804242232`, inside a larger one-time subsystem-initialization function (guarded by
+an "already initialized" flag at `0x8042421E0`, itself set at the end - runs exactly once) that
+calls a whole sequence of what look like "register subsystem N" functions, each preceded by a
+`lea rdi, [rip+...]` loading its argument.
+
+**Read the actual bytes at the computed argument address (`0x804242610`) to settle what's really
+being registered - real code (`push rbp; mov rbp, rsp`, a genuine function prologue), confirming
+this is a real registered event-handler callback, not a string (an initial guess based on
+the argument looking identical in disassembly to a neighboring string-taking call - correctly
+not trusted without checking the actual bytes; `lea rdi, [rip+disp]` looks identical for a string
+address and a function address in disassembly alone).**
+
+**Disassembled that handler (`0x804242610`) and this is the decisive, if disappointing, result:
+it only does anything when its first argument (the event code, `edi`) equals `3`** - for every
+*other* value, including the exact codes the wait-gating function actually dispatches through
+this slot (`edi=1`, `6`, `7`, all confirmed via the original disassembly two entries back), the
+handler's very first check (`cmp edi, 3; jne <tail-return>`) sends it straight to a trivial
+tail-jump with no side effects. The `edi==3` branch does linked-list-style cleanup (walking a
+list via a predicate call, unlinking matched entries) - shaped like a memory-pressure/GC
+notification handler, unrelated to app suspend/resume. **Critically, the semaphore-wait call
+(`sceKernelWaitSema` on `SuspendSemaphore`) happens completely unconditionally right after the
+`edi=6` hook check regardless of what that hook does or returns** (confirmed via the original
+disassembly: `test rax,rax; je <skip-to-wait>; mov edi,6; call rax` - the call falls through to
+the wait either way). **This means the whole event-callback mechanism - real, correctly
+registered, correctly invoked - has nothing to do with why the semaphore is never signaled.** It
+was a legitimate, well-evidenced lead that turned out to be a dead end for this specific bug, not
+a wrong turn in the tracing itself.
+
+**Net effect: the "what signals SuspendSemaphore" question is still open, and the event-callback
+angle is now conclusively closed - don't re-open it without new evidence.** The real mechanism
+must be something the wait-gating function's own code doesn't touch at all - most likely a
+genuinely separate code path (a different thread, a different registration API, or a kernel-level
+mechanism with no user-space "register a handler" step at all) that this session's tracing never
+reached because it only ever followed leads reachable from inside the one function that blocks.
+
+**Reusable outcome, independent of this specific bug**: the `SHARPEMU_LOG_REFSCAN_ADDRS`
+env-var-gated scanner is a real, working, already-shipped tool - future sessions investigating
+"what writes/calls address X" should reach for it directly (patch a guaranteed-Access-Violation
+instruction like `8B 04 25 00 00 00 00` somewhere reachable, set the env var, run) instead of
+building anything new. No source code was added or needs reverting this entry - the `ud2`/AV
+patches were both applied only via the live debug protocol (`write-memory`), never persisted to
+any file, on processes that were allowed to exit naturally afterward.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `--debug-server` live memory reads and
+writes, two live-patched Access Violation traps (each on a fresh process, neither persisted to
+disk), and the resulting `SHARPEMU_LOG_REFSCAN_ADDRS` diagnostic output.
+`dotnet test SharpEmu.slnx -c Release`: 382/382, unchanged.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): built and used a working
+reference-scan technique (discovered SharpEmu already ships one) - traced the event-callback slot
+all the way to its registered handler, which turns out to be a real, correctly-wired, but
+IRRELEVANT no-op for this bug" section (and the sections above it, especially the one two back
+that fully documents the gate itself) for full background. Summary: metal_slug boots, opens its
+window, presents ONE real frame, then hangs forever. Root cause is fully pinned down to one
+specific call: the process's primordial main thread runs Unity's real per-frame Update/Render
+loop driver (guest function 0x8042D88C0), gated by an unconditional, one-time
+sceKernelWaitSema(SuspendSemaphore) call that nothing in SharpEmu ever signals.
+
+This session traced the ENTIRE event-callback mechanism that same function reads from (a shared
+slot at guest address 0x80803BEC8) all the way to its source and confirmed it's a dead end:
+- Found real write sites via SharpEmu's own already-shipped SHARPEMU_LOG_REFSCAN_ADDRS diagnostic
+  (src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Exceptions.cs:686 -
+  DumpGuestReferenceDiagnostics - only fires from the Access Violation exception branch, not
+  Illegal Instruction, so trigger it with a guaranteed-AV patch like `8B 04 25 00 00 00 00`
+  ("mov eax,[0]") rather than a ud2 trap).
+- Traced: registration function at 0x8042D9500 (a 1-arg setter, 3 conditional write sites all
+  confirmed via the scanner to hit the same slot) <- its one and only caller at 0x804242232
+  (inside a one-time, flag-guarded subsystem-init function) <- the registered handler itself at
+  0x804242610 (confirmed via reading real bytes there - not guessed - that it's genuine code, a
+  real function, not a string, despite looking identical to a neighboring string-taking call in
+  disassembly alone).
+- The handler ONLY does anything for event code (edi) == 3 - a linked-list cleanup shaped like a
+  memory-pressure/GC callback. For the actual codes the wait-gating function dispatches through
+  this slot (1, 6, 7), it's a complete, correct no-op. AND the semaphore wait itself is
+  unconditional regardless of what this handler does. So this whole event-callback mechanism -
+  real, correctly wired - is irrelevant to the bug. Don't re-investigate it without new evidence.
+
+The "what signals SuspendSemaphore" question is still open. The real mechanism must be something
+NOT reachable from inside the wait-gating function itself - most likely a different thread
+entirely, or a kernel-level/direct mechanism with no "register a handler" step visible from this
+angle.
+
+**CORRECTION to a mistake in an earlier draft of this write-up**: candidate "(b)" originally
+suggested here (re-tracing `edi=7`/`edi=1`'s hook slots as if they were different from `edi=6`'s)
+was wrong and should not be pursued - a precise recomputation confirmed all three really do
+resolve to the exact same address, `0x80803BEC8`, exactly as the main entry two sections above
+this one already established. That whole slot is already fully traced (see above): don't
+re-open it.
+
+**Already tried and also negative this same session**:
+- Let metal_slug run for a full 90 seconds with `SHARPEMU_LOG_SEMA=1` (`timeout 90 ...`, no
+  `--debug-server`, no patches - a plain, undisturbed run): **zero** `sema.signal` lines for any
+  semaphore appear in the entire run, not just `SuspendSemaphore`. This is a clean, unambiguous
+  negative - it's not that the signal is merely slow to arrive; nothing in this game's own
+  runtime ever calls `sceKernelSignalSema` at all within the window this investigation can
+  observe. Don't re-try "just let it run longer" expecting a different result without a reason
+  to believe something changes past 90 seconds.
+- Checked whether `sceKernelCreateSema` (real NID `188x57JYp0g`, confirmed earlier this
+  investigation) is called directly from the same one-time subsystem-init function that
+  registers the event callback (`0x8042421E0`, see above) - read the first 6 bytes of all 12 of
+  that function's call targets (`0x8042e2760`, `0x8042e23c0`, `0x8042e2840`, `0x8042e2830`,
+  `0x8042e2850`, `0x8042e2610`, `0x8042d48e0`, `0x8042e2750`, `0x8042e26b0`, `0x8042e38f0`,
+  `0x8042d46e0`, `0x8042e2ba0`): **none** start with the `FF 25` PLT-stub signature - every one
+  is genuine internal guest code (`55 48 89 E5` prologues or direct data-manipulation
+  instructions), not a direct HLE import call. So the semaphores aren't created directly in this
+  function either - `sceKernelCreateSema` must be nested somewhere inside one of these 12
+  internal helpers, which is a much more diffuse search than anything tried so far (would need
+  to descend into each one, or find a faster way to locate the "SuspendSemaphore" string literal
+  directly and scan for references to *that* instead of guessing which helper calls the create
+  function).
+
+Given the effort already invested this session across many rounds of live disassembly (the
+initial gate discovery, the ruled-out watchdog/JobSystem/GfxFlipThread threads, the fully-traced
+but irrelevant event-callback mechanism, and now this negative result on both the "wait longer"
+and "check the init function's direct calls" fronts), **this specific investigation has reached
+a natural pause point** for a single session. The remaining productive avenues (descending into
+the 12 internal helper functions one by one, or locating the "SuspendSemaphore" string literal
+directly to refscan for references to it) are real but would benefit from a fresh session with a
+clear head, rather than continuing to extend an already very long one.
+
+Tooling: SHARPEMU_LOG_REFSCAN_ADDRS=<comma-separated hex addrs> + a guaranteed-Access-Violation
+memory patch (NOT ud2/illegal-instruction - confirmed this session that only the AV branch
+triggers the scanner) via --debug-server write-memory at any reachable point, is now a proven,
+reusable technique - reach for it before manual frame-chain/hook-table tracing. Standard
+reminders still apply: capstone via <scratchpad>/venv for follow-up disassembly; NIDs already
+resolved in a crash dump's import trace can be grepped directly (`Nid = "<nid>"`) instead of
+re-derived via hash brute force; verify actual bytes at a computed address before assuming what
+they are (this session caught its own wrong assumption this way); always confirm no stray
+SharpEmu process before starting a new one. Repro: build (`dotnet build SharpEmu.slnx -c Debug`),
+run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars for a
+plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, later session): found and traced every static reference to the SuspendSemaphore string AND its handle global — the "creation" and "third reference" leads are now fully resolved (one is real CreateSema, the other is a second WaitSema consumer, not a signaler); the real signal source is now provably NOT reachable via static reference tracing at all
+
+Continued directly from the previous entry's recommendation to locate the `"SuspendSemaphore"`
+string literal and reference-scan from there, since the event-callback-slot angle was already
+closed. Root cause context is unchanged from all prior entries this investigation: the primordial
+main thread blocks forever on `sceKernelWaitSema(SuspendSemaphore)` before Unity's real per-frame
+loop can run even once, and nothing in SharpEmu ever signals it.
+
+**Built and used a new temporary in-process byte-pattern scanner** (`SHARPEMU_LOG_MEMSCAN_TEXT`,
+`DumpGuestMemScanDiagnostics` in `src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Exceptions.cs`,
+next to the existing `DumpGuestReferenceDiagnostics`/`SHARPEMU_LOG_REFSCAN_ADDRS`) since no such
+tool existed anywhere in the repo (confirmed via research before writing it — the existing scanner
+only finds references *to* a known address, not raw bytes *in* memory). Unlike the reference
+scanner, it walks committed+readable regions regardless of the executable bit, since string
+literals live in rodata. **Decision: kept this one permanently** (unlike most one-off diagnostics
+in this investigation) — it's exactly as generically useful as `SHARPEMU_LOG_REFSCAN_ADDRS` itself
+was when it was kept after an earlier session, and the two are natural complements (find the bytes,
+then find who references them). `dotnet build`/`dotnet test -c Release`: 382/382 unaffected.
+
+**Found the string's guest address**: `0x000000080749B860`, via `SHARPEMU_LOG_MEMSCAN_TEXT=SuspendSemaphore`.
+
+**Reference-scanned that address and found exactly one hit**: `lea rsi,[80749B860h]` at guest
+address `0x8042E41DF`, immediately followed by `call 0x8042e67a0` (7-arg setup: `rdi=<other
+string>, rsi="SuspendSemaphore", edx=0, ecx=0, r8d=0x100, r9d=0`). **Confirmed via a live NID
+trace** (see tooling note below) that this call is the real, already-cataloged `sceKernelCreateSema`
+(`nid=188x57JYp0g`) — args match exactly: `rdi=0x80803CD30` (a global slot storing the resulting
+handle), name="SuspendSemaphore", `initCount=0`, `maxCount=0x100=256` — precisely the `count=0,
+max=256` already known from `SHARPEMU_LOG_SEMA=1`. This is the actual creation site, fully pinned
+down for the first time (previously only inferred indirectly).
+
+**The same function creates a second, different semaphore immediately after**, via the same
+`sceKernelCreateSema` PLT stub, storing its handle in the adjacent global `0x80803CD38` with a
+different name string at `0x807495225` (name not yet resolved — not pursued, since the search was
+specifically about `SuspendSemaphore`).
+
+**Reference-scanned the handle global `0x80803CD30` itself (not just the name string) and found
+exactly three hits in the whole 256 MB image** — this is the key new result:
+1. `0x8042E41D8`: the creation site above (writes the handle).
+2. `0x8042E431D` (inside a function at `0x8042E4240`, a generic ~256-slot linked-list
+   registration/disposal utility — unrelated in shape to suspend/resume): reads the handle, then
+   `esi=1; call 0x8042e67c0`. **Confirmed via a live-execution test (patched a guaranteed AV
+   exactly at this instruction, `0x8042E432E`, and let the game run to its normal steady hang
+   state) that this whole function is never entered during a plain boot** — genuinely dead code
+   in this run, not the answer. Don't re-chase this specific site without new evidence it becomes
+   reachable.
+3. `0x8042E44CC` (inside a different function at `0x8042E4400`, which walks the *same* ~256-slot
+   registry checking each entry's disposal/type-tag state via a query call, incrementing a
+   counter for entries that need action): reads the handle, `edx=0`, then **tail-jumps** (not
+   calls) to `0x8042e6800`. **Confirmed via a live-execution test that this exact instruction IS
+   reached** during a normal boot (unlike site #2) — genuinely live code, executed with the
+   counter non-zero.
+
+**Resolved site #3's target NID and it is NOT a signal — it's `sceKernelWaitSema` (`Zxa0VhQVTsk`),
+a second, independent consumer of the same semaphore.** Getting to this required working around
+two dead ends: the direct "patch right after the call, read the return-address trace" trick
+doesn't work for a tail-*jmp* (no return address exists in this function), and the only other
+static reference to the `0x8042e6800` PLT stub in the whole image is a `call` at `0x8042E43CD`
+that — separately confirmed via the same live-crash-at-return-address technique used throughout
+this investigation — takes the "skip" branch (its own gating counter is zero) and never actually
+executes this run either. The NID was instead resolved by **temporarily widening an existing,
+already-shipped-but-narrowly-scoped debug line** (`ImportStubMap:` in
+`SetupImportStubs`, `src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs:1237`, originally
+hardcoded to two unrelated address ranges from an earlier investigation) to also match on
+`resolvedExport.Name` containing `"Sema"`/`"EventFlag"` — this dumped every semaphore/event-flag
+NID's *resolved per-module stub table address* (e.g. `sceKernelCreateSema` at
+`0x00006FFFFF0010B0`, matching a value independently read straight out of the eboot module's own
+GOT earlier in this same entry — confirming the two addressing schemes really do meet at that
+value). Computing the target GOT slot for the `0x8042e6800` stub (`0x807b73020`, by decoding its
+`jmp qword ptr [rip+disp]` bytes the same way as for the `CreateSema` stub) and reading its live
+resolved value (`SHARPEMU_LOG_POINTER_WINDOWS`, same AV-trap trigger as always) gave
+`0x00006FFFFF001110`, which matches `sceKernelWaitSema` exactly in the dumped list. **This edit
+was reverted** after use (it was pure one-off address-range-guessing scaffolding, unlike the
+memscan tool above) — verified by re-reading the file; `dotnet build`/`test -c Release`: 382/382
+unchanged.
+
+**Net result: all three static references to the SuspendSemaphore handle are now fully accounted
+for and explained (creation, a dead code path, and a second real-but-independently-stuck waiter),
+and neither of the two non-creation sites is a signal call.** Combined with the previous entry's
+already-closed event-callback-slot angle, **every code path reachable by simple static reference
+tracing from either the semaphore's name string or its handle global has now been exhausted** —
+this is a materially stronger, evidence-backed version of the standing hypothesis (the real
+mechanism must be something else: a different thread with no reference to this specific global, a
+separate name-based lookup API, or a kernel/host-level event SharpEmu never delivers). Don't
+re-attempt reference-tracing from the string or the handle global without a genuinely new target
+address; both are now dead ends.
+
+**A newly noticed, not-yet-pursued detail**: site #3's containing function (`0x8042E4400`) itself
+tries to `sceKernelWaitSema` the *same* semaphore other code is also blocked on — meaning if this
+function's thread is not the primordial main thread (not yet confirmed either way), SharpEmu now
+has **at least two independently-stuck waiters** on `SuspendSemaphore`, not just the one
+documented in every prior entry. Worth confirming which thread runs `0x8042E4400` next session
+(same techniques as used elsewhere in this investigation for thread identification — e.g. the
+first-`scePthreadCreate`-caller trick, or checking the host thread name in a crash dump triggered
+from inside that function).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via many rounds of `--debug-server` +
+`write-memory` AV/trap patching, `SHARPEMU_LOG_MEMSCAN_TEXT`, `SHARPEMU_LOG_REFSCAN_ADDRS`,
+`SHARPEMU_LOG_POINTER_WINDOWS`, and one temporarily-widened-then-reverted `ImportStubMap` debug
+line, across ~15 separate process launches this session.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, later session): found and traced every
+static reference to the SuspendSemaphore string AND its handle global" section (and the sections
+above it, especially the one three back that fully documents the gate itself) for full background.
+Summary: metal_slug boots, opens its window, presents ONE real frame, then hangs forever. Root
+cause is fully pinned down to one specific call: the process's primordial main thread runs Unity's
+real per-frame Update/Render loop driver (guest function 0x8042D88C0), gated by an unconditional,
+one-time sceKernelWaitSema(SuspendSemaphore) call that nothing in SharpEmu ever signals
+(SHARPEMU_LOG_SEMA=1 shows zero sema.signal lines for it, confirmed repeatedly across sessions).
+
+This session traced EVERY static reference to both the semaphore's name string (0x80749B860) and
+its handle global (0x80803CD30) to exhaustion:
+- The string has exactly one reference: the real sceKernelCreateSema call itself (nid=188x57JYp0g,
+  at guest address 0x8042E41F3), now fully confirmed with live register evidence (count=0,
+  max=256, matching SHARPEMU_LOG_SEMA=1's already-known values).
+- The handle global has exactly three references: the creation site above, a dead-code path
+  (confirmed unreached this run, function at 0x8042E4240), and a genuinely-reached but unrelated
+  SECOND sceKernelWaitSema call on the SAME semaphore (nid=Zxa0VhQVTsk, function at 0x8042E4400) -
+  i.e. another independent consumer, not the missing signal.
+- The event-callback-slot angle from two sessions ago is also still closed (real, correctly wired,
+  irrelevant to this bug).
+
+Net effect: every code path reachable via simple static reference tracing from either the string
+or the handle is now exhausted and explained. NONE of them is the missing signal call. The real
+mechanism must be something structurally different - a thread or code path that never references
+this specific global directly (e.g. a separate name-based sceKernelOpenSema-style lookup elsewhere
+in the image, or a genuinely different subsystem/thread), or a kernel/host-level event SharpEmu
+never delivers at all (no sceSystemService* event/lifecycle NID is ever called in any captured
+boot log - checked and ruled out two sessions ago, don't re-check without new evidence).
+
+Two concrete not-yet-tried next steps:
+1. Identify which thread runs the function at 0x8042E4400 (containing the second WaitSema
+   consumer) - if it's a DIFFERENT thread from the main one, SharpEmu now provably has at least
+   two independently-stuck waiters on the same semaphore, which may be a useful clue about the
+   real subsystem this belongs to (its neighboring ~256-slot registry-walk pattern, shared with
+   the dead-code function at 0x8042E4240, suggests some kind of async resource-disposal/GC
+   subsystem, similar in shape to the edif=3 GC-looking handler from two sessions ago - possibly
+   the SAME subsystem, worth checking whether they're actually connected).
+2. Search for a NAME-based semaphore lookup instead of the handle-based one this session
+   exhausted - e.g. ref-scan for any OTHER occurrence of the exact string bytes "SuspendSemaphore"
+   beyond the one found this session (there was only one, but a case-insensitive or partial-match
+   variant, or a related string like "ResumeSemaphore"/"AppSuspend", might exist - the second,
+   not-yet-named semaphore created in the same function at 0x807495225 is worth resolving too,
+   just in case it's more directly relevant than assumed).
+
+Tooling: SHARPEMU_LOG_MEMSCAN_TEXT=<comma-separated ASCII strings> (new this session, kept
+permanently, src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.Exceptions.cs next to
+DumpGuestReferenceDiagnostics - same AV-trap trigger mechanism, same env-var-gated pattern) finds
+raw string/byte addresses; SHARPEMU_LOG_REFSCAN_ADDRS finds references TO a known address; chain
+them together (string -> address -> references -> handle global -> references) as this session
+did. For resolving a PLT stub's NID: prefer patching a genuine returning `call` site's return
+address over a tail-`jmp` (which has no return address at all); if the only reachable call sites
+are dead/unreached this run, fall back to computing the target's GOT slot address (decode its
+`jmp qword ptr [rip+disp]` bytes) and reading the live resolved value via
+SHARPEMU_LOG_POINTER_WINDOWS, then cross-reference against the module's full stub table (visible
+by temporarily widening the hardcoded ImportStubMap address-range check at
+src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs:1237 to filter by resolvedExport.Name
+instead - revert this widening after use, it's throwaway scaffolding, unlike the memscan tool).
+Standard reminders still apply: capstone via <scratchpad>/venv; verify actual bytes/values before
+trusting an assumption (this session's register-based NID-trace attempt on a tail-jmp site was a
+dead end caught this way); always confirm no stray SharpEmu process before starting a new one.
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars for a
+plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+**Marker note (2026-07-20, same day, spotted from a fresh full log capture, `mslug.log`, not yet
+investigated at the time of writing this note):** `sceKernelDlsym failed` warnings for Unity's
+native-plugin-interface symbols (`UnityPluginLoad`, `UnityRenderEvent`, etc.) against
+`handle=0x9`/`handle=0xB` are **not a bug** - those handles are `PSN.prx`/`SaveData.prx`
+(confirmed via the log's `[RUNTIME] Registered module handle=...` lines), core Sony system
+libraries that would fail this exact same Unity plugin-autodetect probe on real hardware too.
+**But their surrounding position is a fresh, not-yet-chased lead**: `sceKernelLoadStartModule`
+for both only fires very late in boot (`Import#758341`-`Import#771219` range in that capture),
+immediately followed by the same `Forcing call to sce::Agc::suspendPoint` steady-hang spin
+already identified elsewhere in this investigation. `SaveData.prx` in particular is exactly the
+kind of system library that would legitimately need real app-suspend/resume semaphore semantics
+(to avoid corrupting a save write across a system suspend) - an angle distinct from everything
+this session's static reference-tracing already exhausted (that tracing only covered references
+to the *specific* `SuspendSemaphore` name/handle already found; it never looked at what
+`SaveData.prx`'s own module-start routine does independently). Not yet disassembled or traced at
+the time of writing - see the follow-up entry immediately after this one (if present) for the
+outcome, or treat this as the next concrete step if no such entry exists yet.
+
+### Follow-up (2026-07-20, later session): rebased onto origin/main (26 commits), which surfaced and then reframed the entire SuspendSemaphore investigation — real progress, but the core bug is confirmed still open with new, much more precise evidence
+
+Continued from the marker note above. This session first rebased `bubble_puzzle` onto
+`origin/main` (2 local commits, 26 upstream commits, merge-base `daaeb62`). Three real conflicts:
+
+- `KernelMemoryCompatExports.cs` (twice): both were genuine textual overlaps, not design
+  conflicts — kept our added `IsWithinTrackedLibcHeap` fast-path bypass wholesale (main hadn't
+  touched that function at all), and combined main's `NormalizeMountRelativePath` normalization
+  with our `ResolveApp0RelativePath` flat-repack fallback in `ResolveGuestPath`'s bare-relative
+  branch (matching the pattern the sibling branches already used).
+- `AgcExports.cs`: a **silent duplicate**, not a marked conflict — both our branch and main
+  independently added `sceAgcGetIsTrinityMode` (NID `BfBDZGbti7A`), landing in different, non
+  -overlapping spots so git's merge never flagged it. Caused a `CS0111` duplicate-member build
+  error after the rebase completed; fixed by deleting the redundant copy (kept the better
+  -commented one) and folding the fix into the offending commit via `git rebase --autosquash`.
+  **Lesson for future rebases in this repo**: a clean `git rebase` exit does not guarantee no
+  duplicate NIDs — always build immediately after and grep for `Nid = "..."` duplicates
+  (`grep -oP 'Nid = "\K[^"]+' <file> | sort | uniq -d`) before trusting the result.
+- `KernelSyncOnAddressCompatExports.cs`: a genuine add/add design conflict — main independently
+  shipped its own `sceKernelSyncOnAddressWait`/`Wake` (PR #422, commit `09bd4f0`, a different
+  contributor) around the same time this investigation built its own, more spec-faithful version
+  (documented earlier in this file, the "936k-warning storm gone" entry). Initially kept main's
+  version (simpler: unconditional park + fixed 100ms self-heal, no compare-pattern or real
+  timeout handling) on the reasoning that it was already-merged/tested upstream. **This choice was
+  reversed later this same session — see below.**
+
+Full suite after the rebase: 493/493 (up from the pre-rebase 382, reflecting main's 26 commits'
+own new tests plus this session's own).
+
+**Chasing an unrelated lead (a benign `sceKernelDlsym` warning against `SaveData.prx` — see the
+marker note above) led to rerunning metal_slug with `SHARPEMU_LOG_SEMA=1` on the freshly-rebased
+tree, and the result rewrites the entire prior investigation's status.** With main's kept
+`SyncOnAddressWait`, `SuspendSemaphore` (handle=2) **is** being created, waited, signaled, and
+woken — repeatedly, in a cycle with `ResumeSemaphore` (handle=3, the second, previously-unnamed
+semaphore this investigation found weeks/sessions ago, now identified by name for the first time).
+The signaling `ret=0x8042E432E`/waiting `ret=0x8042D88FE` addresses are exactly the ones this
+whole investigation already mapped — `guest=0x0000000000000000` on the wait lines is the
+established signature of the **primordial main thread** (`KernelSemaphoreCompatExports.cs:685`),
+confirming this really is the documented gate, not a different thread reusing the same code. The
+"unconditional, one-time" framing from the original discovery entry was also wrong — it fires
+repeatedly, not once.
+
+**But the game still only ever presents ONE frame and still hangs forever** — confirmed by letting
+it run unmodified for 4+ minutes with no second `Vulkan VideoOut presented` line, at which point a
+**new mechanism from main** (a "repeating import loop" watchdog, `ShouldForceGuestExitOnImportLoop`
+in `DirectExecutionBackend.Imports.cs:1741` — matches on NID + return address + first two
+arguments, sampled every 256th dispatch, needs 6 consistent hits over a
+`SHARPEMU_IMPORT_LOOP_GUARD_SECONDS`-configurable window, default 5s) fired and force-exited the
+guest cleanly instead of hanging silently, printing a full recent-import dump. **This is a
+genuinely useful new diagnostic tool this investigation didn't have before** — it turns "run for
+minutes and eyeball whether progress stalled" into an automatic, fast, self-documenting exit.
+
+The dump showed the primordial main thread (`guest=0x0`) calling
+`sceKernelSyncOnAddressWait(addr=0x605E7D0B0, pattern=0, timeout=NULL)` with **byte-identical
+arguments 64+ times in a row** — a genuine tight busy-spin, not a legitimate block. Root cause:
+main's kept `SyncOnAddressWait` never checks whether `*addr` still equals `pattern` — it
+unconditionally reports success after ≤100ms regardless. The guest's own contended-mutex retry
+loop (already disassembled in an earlier session: atomic-refcount fast path → only the contended
+path calls this NID) re-checks the same condition after every "success" and finds it still
+unresolved, so it calls again — forever, at ~100ms cadence (matches the observed ~40 "Forcing call
+to sce::Agc::suspendPoint" watchdog-thread prints per ~100K-import window).
+
+**Critically, main's broken implementation was not merely failing safely — it was
+*accidentally enabling* the SuspendSemaphore signal cycle**, most likely by spuriously "waking"
+some other `SyncOnAddressWait`-gated critical section that the real signaling thread
+(`guest=0x00007F3718885ED0`, inside the list-registry function at `0x8042E4240`) needed to pass
+through on its way to the `SignalSema` call — not because anything real woke it, but because main's
+implementation lies about success on a timer. **Restoring this session's own, spec-correct
+implementation** (real compare-pattern check + `EAGAIN`-without-blocking on mismatch + real
+timeout, recovered byte-for-byte from the pre-rebase commit `d35df43` via `git show
+d35df43:<path>`, including its 6-test suite) **re-exposes the exact original, fully-documented
+permanent hang**: confirmed via a full run to 8.9M imports with **zero** `sema.signal` lines for
+either semaphore, ever. `dotnet test`: 499/499 (+6 from the restored test file) both before and
+after this swap.
+
+**Decision, made deliberately despite the regression to a visible hang**: kept our (correct)
+`SyncOnAddressWait` implementation rather than main's (convenient but wrong) one. Papering over a
+real futex-semantics bug with a 100ms "always succeed" timer is not an acceptable fix even though
+it happens to unblock this specific game — the correctness bug in main's version could cause
+subtler failures in other titles that actually rely on `TRY_AGAIN`/real-timeout semantics. The
+*real* fix is finding what should genuinely wake the signaling thread, not re-introducing a
+known-wrong implementation. `src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs` and
+`tests/SharpEmu.Libs.Tests/Kernel/KernelSyncOnAddressCompatExportsTests.cs` are back to this
+session's original (pre-rebase) content; if this decision needs revisiting, note that main's
+version can be recovered via `git show 184e24f:src/SharpEmu.Libs/Kernel/
+KernelSyncOnAddressCompatExports.cs` (`184e24f` = the pre-rebase main tip this branch rebased
+onto).
+
+**Added one new permanent diagnostic** (kept, mirroring the already-permanent `SHARPEMU_LOG_SEMA`
+pattern exactly): `SHARPEMU_LOG_SYNCADDR=1` on `KernelSyncOnAddressCompatExports.cs` logs every
+`wait-block`/`wait-eagain`/`wait-cooperative-resume`/`wait-host-wake`/`wait-host-timeout`/`wake`
+event with the target address, pattern, and `FormatCallSite` (guest thread handle + return
+address). A one-off `ImportStubMap` address-range widening (in
+`DirectExecutionBackend.cs:1242`, used twice this session to resolve two PLT stub NIDs via
+their per-module stub-table address rather than a live nid-trace — reusable technique: read the
+stub's `jmp qword ptr [rip+disp]` bytes to compute its GOT address, read the GOT's live-resolved
+value at the very first stop-at-entry pause since resolution happens eagerly at load, then
+temporarily widen this exact hardcoded range check to that value and rebuild) was reverted after
+use both times — confirmed via `git diff --stat` matching the pre-widening baseline.
+
+**A full `SHARPEMU_LOG_SYNCADDR=1` capture (with our restored implementation) found the shape of
+the real remaining bug, precisely for the first time**: `GuestThreadExecution.Scheduler.
+WakeBlockedThreads` — the *cooperative* wake path — returned **0 matched threads on every single
+call this session observed (16/16)**. Every wait/wake pair that actually succeeded did so through
+the separate, non-cooperative host-thread fallback (`_gates`/`Monitor.Wait`/`Monitor.PulseAll` in
+`WaitOnHostThread`), not the cooperative scheduler path `RequestCurrentThreadBlock` is supposed to
+provide. Several distinct addresses are waited on but **never** appear in any wake line at all in
+the captured run: a `0x0000000600108D70`-`0x0000000600108F80` block (~30 addresses, 0x10 stride)
+and roughly half of a `0x0000000600715xxx`/`0x0000000600716xxx` range (alternating with addresses
+that *do* get woken via the host-gate path, ~0x150 stride between apparent per-thread slots,
+suggesting two sync primitives per worker thread where only one half is ever signaled). Not yet
+determined whether this cooperative-wake-always-returns-0 pattern is itself a distinct, generic
+`GuestThreadExecution`-level bug (which would be a bigger, more valuable fix if true — it would
+affect every NID that uses `RequestCurrentThreadBlock`, not just this one) or specific to how
+`SyncOnAddressWait`'s wake-key construction interacts with the scheduler. **This is the most
+promising concrete lead for a future session**, more precise than anything found in every prior
+entry in this file.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), across the rebase, two multi-minute
+`SHARPEMU_LOG_SEMA=1` captures (one per `SyncOnAddressWait` implementation), one
+`SHARPEMU_LOG_SYNCADDR=1` capture, and the new import-loop-guard's automatic force-exit
+diagnostic. `dotnet test SharpEmu.slnx -c Release`: 499/499, clean build, 0 stray processes
+confirmed before every run.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, later session): rebased onto origin/main
+(26 commits), which surfaced and then reframed the entire SuspendSemaphore investigation" section
+(and the marker note immediately above it) for full background. Summary: bubble_puzzle was rebased
+onto origin/main (26 upstream commits) this session. That rebase brought in main's own,
+spec-incorrect sceKernelSyncOnAddressWait implementation (PR #422) which - purely by accident,
+because it always reports success after ~100ms instead of genuinely checking the futex compare
+-pattern - was letting metal_slug's SuspendSemaphore/ResumeSemaphore signal cycle complete
+(previously, across many earlier sessions, this was NEVER observed happening at all). This
+session deliberately reverted to this investigation's own, correct SyncOnAddressWait
+implementation (real EAGAIN-on-mismatch + real timeout, recovered from pre-rebase commit d35df43)
+since papering over a real futex bug isn't an acceptable fix - doing so re-exposed the original,
+fully-documented permanent hang (confirmed via an 8.9M-import run: zero sema.signal lines for
+either semaphore, ever).
+
+The real remaining bug is now much more precisely characterized than in any earlier entry: a new
+SHARPEMU_LOG_SYNCADDR=1 diagnostic (added and kept permanently this session, mirrors
+SHARPEMU_LOG_SEMA's pattern in the same file) shows GuestThreadExecution.Scheduler.
+WakeBlockedThreads (the COOPERATIVE wake path) returns 0 matched threads on every single call
+observed (16/16) - every wait/wake pair that actually works does so through the SEPARATE
+non-cooperative host-thread fallback (_gates/Monitor.Wait/PulseAll in WaitOnHostThread), not the
+cooperative scheduler path RequestCurrentThreadBlock is supposed to provide. Several addresses are
+waited on but NEVER woken at all in a captured run: a 0x600108D70-0x600108F80 block (~30
+addresses) and roughly half of a 0x600715xxx/0x600716xxx range (alternating with addresses that DO
+get woken, suggesting two sync primitives per worker thread where only one is ever signaled).
+
+Next step (not yet attempted): determine whether "cooperative wake always returns 0" is a GENERIC
+GuestThreadExecution-level bug (would affect every NID using RequestCurrentThreadBlock, not just
+SyncOnAddressWait - check other NIDs' wake paths, e.g. semaphores/event flags, for the same
+symptom) or specific to how SyncOnAddressWait's wake-key construction interacts with the scheduler
+(check GetWakeKey/RequestCurrentThreadBlock's key-matching logic directly, and whether
+scePthreadCreate'd worker threads are actually registering with the cooperative scheduler at all
+before they call SyncOnAddressWait - the fact that host-gate fallback covers for them suggests
+RequestCurrentThreadBlock might be returning false even for properly-created cooperative threads
+for this specific NID, which would be a very different and more actionable finding than a
+scheduler-wide bug). Once the real gap is found, the concrete question that would close out this
+entire multi-session investigation is: does fixing it let the thread at guest=0x00007F3718885ED0
+(or whatever handle it has in a fresh run) reach its SignalSema(SuspendSemaphore) call inside
+0x8042E4240 reliably, and does metal_slug then present a second frame.
+
+Tooling notes: SHARPEMU_LOG_SYNCADDR=1 (new, kept, KernelSyncOnAddressCompatExports.cs) + the
+existing SHARPEMU_LOG_SEMA=1 together give full visibility into both synchronization primitives at
+once - but SHARPEMU_LOG_SYNCADDR alone on an unfiltered run generates enormous volume (millions of
+lines in tens of seconds from wait-cooperative-resume alone, which fires on every scheduler
+predicate poll, not just final resolution) - redirect straight to a file and grep for specific
+event types rather than tailing live, and kill the process well before it fills disk. The new
+"repeating import loop" watchdog (ShouldForceGuestExitOnImportLoop, DirectExecutionBackend.
+Imports.cs:1741, SHARPEMU_IMPORT_LOOP_GUARD_SECONDS to tune, default 5s) is a fast, reliable way to
+confirm "still genuinely stuck" without waiting minutes - prefer it over a long manual timeout.
+Always grep a rebase result for duplicate NIDs (`grep -oP 'Nid = "\K[^"]+' <file> | sort | uniq -d`)
+immediately after any future rebase in this repo - this session found one that git's merge didn't
+flag as a conflict at all. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars for a
+plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, later session): fixed the LLE-libc-allocator-family regression from an earlier session — auto-detects IL2CPP titles instead of a global hardcode, so metal_slug keeps working without breaking other titles
+
+An earlier session hardcoded `DirectExecutionBackend.CanUseLleLibcAllocatorFamily()`
+(`src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs`) to unconditionally `return false`,
+forcing the entire `malloc`/`free`/`calloc`/`realloc`/`memalign`/`aligned_alloc`/`posix_memalign`/
+`malloc_usable_size` family to always use SharpEmu's own HLE heap instead of the guest's real,
+compiled LLE libc — globally, for every title, with no override. This fixed Metal Slug Tactics
+(root cause documented earlier in this file: a real host `memalign()` can return recycled,
+non-zeroed memory, and metal_slug's IL2CPP-style per-thread allocator bucket bookkeeping lazily
+initializes a field only "if it reads as zero," which only breaks under real memory, not
+SharpEmu's always-fresh HLE heap) but was observed by the user to break other titles that needed
+the real LLE allocator — the prior default (deleted in that same fix, via a helper called
+`HasUsableLleLibcExport`) was LLE-preferred-when-usable, not always-HLE.
+
+**Rejected a first design** (a per-title `PerGameSettings` JSON toggle) because a user launching
+metal_slug normally would have no way to discover they need to find and enable a specific hidden
+setting — it would fix the regression but reintroduce a discoverability gap.
+
+**Landed instead on automatic, title-agnostic detection**, since the bug is specifically an IL2CPP
+allocator pattern and IL2CPP-compiled PS5 titles always ship a module literally named
+`Il2cppUserAssemblies.prx` (confirmed in metal_slug's own boot log). `SharpEmuRuntime.
+LoadAdjacentSceModules` already does a complete, up-front filesystem scan of every `.prx`/`.sprx`
+file across all module search directories before any module is loaded or has its imports bound —
+added a one-line check there (`allModulePaths.Any(entry => ... .Contains("Il2cpp", ...))`) that
+sets `Environment.SetEnvironmentVariable("SHARPEMU_DETECTED_IL2CPP", "1")` and logs
+`[RUNTIME] Detected IL2CPP title (Il2cpp*-named module present).` when found. This happens well
+before the later, single, fully-merged `SetupImportStubs` call that's what actually consults
+`CanUseLleLibcAllocatorFamily` per NID (confirmed via the "Setup 4046/4046 import stubs" line
+appearing once, late, in every captured boot log — import resolution is one unified pass over all
+modules' merged NIDs, not per-module, so there's no load-order race between module discovery and
+import binding to worry about).
+
+**Restored the deleted `HasUsableLleLibcExport` helper and `CanUseLleLibcAllocatorFamily`'s old
+seven-check body verbatim** (using the still-intact `TryResolveRuntimeSymbolAddress`,
+`EnumerateRuntimeSymbolCandidates`, `IsDirectImportTargetUsable` primitives the deleted helper
+used), gated behind the new detection signal: if `SHARPEMU_DETECTED_IL2CPP=1` **or** a manual
+escape hatch `SHARPEMU_FORCE_HLE_LIBC_ALLOCATOR=1` (for a hypothetical non-IL2CPP title hitting the
+same pattern some other way; not wired into `PerGameSettings`/the GUI — a plain debug env var like
+the family's existing `SHARPEMU_DISABLE_LLE_LIBC`/`SHARPEMU_LLE_LIBC_ALL`/`SHARPEMU_LLE_LIBC_SAFE_ONLY`,
+none of which are GUI-exposed either), force HLE; otherwise fall through to the restored usability
+check (LLE-preferred-when-usable), matching the pre-regression default for every non-IL2CPP title.
+
+**Verified**:
+- `dotnet build` clean, `dotnet test SharpEmu.slnx -c Release`: 499/499 (current baseline,
+  unaffected — no existing test references this function or the deleted helper).
+- metal_slug, **no env vars at all**: `[RUNTIME] Detected IL2CPP title...` fires automatically,
+  boots and presents frame 1 exactly as before this session's fix, zero exceptions.
+- **Unplanned but genuinely useful real-world confirmation**: the user had a separate SharpEmu
+  process already running against a different title, `dreaming_sarah`
+  (`dsarah.log` in the repo root), using this session's rebuilt binary. Its log shows **no**
+  `Detected IL2CPP` line (correctly not an IL2CPP title) and **no** allocator-related crash —
+  it ran cleanly through to a normal `ORBIS_GEN2_ERROR_NOT_IMPLEMENTED` stop (an ordinary
+  unimplemented-NID outcome, unrelated to allocators) and exited via a clean host shutdown, not a
+  fault. This is real evidence the restored default doesn't regress a genuinely different,
+  non-IL2CPP title, beyond just code-review confidence.
+- The negative code path (no `Il2cpp*`-named module present) was also sanity-checked directly:
+  running a bare-`eboot.bin`-only scratch copy of metal_slug (no adjacent modules at all) correctly
+  never printed the detection line — though this specific test failed earlier, in `SelfLoader.Load`
+  itself (`"Unable to reserve an import stub region in virtual memory"`), an unrelated artifact of
+  running an incomplete/adjacent-file-free test harness, not a regression from this change (this
+  code path isn't touched by anything in this fix — confirmed by reading the stack trace, which
+  never reaches `LoadAdjacentSceModules` at all).
+
+**No other PS5 game content beyond `metal_slug` and (via the user's own separately-running process)
+`dreaming_sarah` exists in this environment** — the fix's correctness for IL2CPP titles other than
+metal_slug rests on the detection heuristic being structurally sound (Unity's own standard PS5
+IL2CPP build output naming), not on having tested another IL2CPP title directly. Worth confirming
+against a second real IL2CPP title if one becomes available.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug, this session's own run) and Dreaming Sarah
+(dreaming_sarah, via the user's independently-running process, observed not modified). `dotnet test
+SharpEmu.slnx -c Release`: 499/499.
+
+### Follow-up (2026-07-20, later session): found and fixed a real, generic cooperative-scheduler bug (spurious immediate wake), and traced the remaining stall down to a specific, contended, never-released Unity engine mutex
+
+Continued directly from the "auto-detect IL2CPP" session. Resumed the SuspendSemaphore/frame-2
+investigation.
+
+**Found and fixed a real bug in `KernelSyncOnAddressCompatExports.cs`.** `DirectExecutionBackend`'s
+cooperative scheduler (`RunGuestThread`, `DirectExecutionBackend.cs:4922-4934`, and the analogous
+`ResumeBlockedNestedGuestCallback` path) makes one synchronous "is the condition already
+satisfied?" recheck immediately after any guest thread transitions to `Blocked` — a correct
+anti-lost-wakeup optimization for waiters with a real re-checkable condition (a semaphore's count,
+an event flag's bits: see `KernelSemaphoreCompatExports.cs`/`KernelEventFlagCompatExports.cs`'s
+wait predicates, which genuinely re-test their condition each call). `SyncOnAddressWait`'s own
+predicate had no real condition — it treated *any* invocation as proof of a genuine wake ("a raw
+futex wake carries no condition to re-check... being invoked at all means a real Wake targeted
+this key"). That assumption is correct for a call arriving via `WakeBlockedThreads` (only reachable
+from an explicit `sceKernelSyncOnAddressWake`), but false for the scheduler's own immediate,
+synchronous recheck — which is structurally guaranteed to be spurious under single-threaded
+cooperative scheduling (no other guest thread can have run a real Wake in the window between this
+wait registering and that recheck). Every `SyncOnAddressWait` call was therefore resolving
+instantly as a false success, and the guest's own retry loop just re-entered the same call forever.
+**Fix**: the predicate now ignores its first invocation unconditionally and only honors a later,
+genuinely separate call.
+
+**Verified as a real, working fix**, not just a plausible theory: before the fix, the
+`SuspendSemaphore`/`ResumeSemaphore` wait/signal/wake cycle (see the previous entry) repeated
+endlessly; after, it settles after its first pair. A previously-unseen call site
+(`ret=0x8018A6415`) now correctly returns real `ORBIS_GEN2_ERROR_TIMED_OUT` results instead of
+silent fake successes. `dotnet test SharpEmu.slnx -c Release`: 499/499, unaffected — this is a
+generic scheduler-interaction fix, not specific to this game or this NID's callers, though only
+`SyncOnAddressWait` was confirmed to have the broken all-invocations-are-real-wakes predicate
+shape.
+
+**Frame 2 still doesn't render.** A `/btw`-triggered background check clarified a live-GUI overlay
+value the user had noticed, "FLIP is at 0.3": `FLIP` is `PerfOverlay`'s **submitted**-flip-rate
+counter (`src/SharpEmu.Libs/VideoOut/PerfOverlay.cs:131-132,177`, `PerfOverlay.RecordSubmit()`
+called from `VideoOutExports.cs:1173`), distinct from `FPS` (confirmed **completed** presents, the
+same counter behind the `"Vulkan VideoOut presented"` log line). This initially looked like it
+might reframe the whole bug (submissions happening but not completing) — **directly checked with a
+fresh `SHARPEMU_LOG_VIDEOOUT=1` capture and ruled this out**: exactly **two** `videoout.submit_flip`
+lines ever appear, total, across 90+ seconds of a plain run (one `index=-1` clear-flip, one real
+`index=0` frame, the second going through the deferred `ordered_completion=True` path) — submits
+themselves stop, not just presents. `FLIP 0.3` was almost certainly a decaying rolling average of
+those same two early submits, not evidence of ongoing periodic submission. **This closes out the
+submit/present-pipeline hypothesis — don't re-open it without new evidence.** The real block is
+before the *next* `SubmitFlip` call is ever reached, consistent with the original framing all
+along.
+
+**Traced the actual `0x6080EE3D8` wait (the dominant post-fix symptom) to its source**, using the
+same proven `--debug-server` + guaranteed-AV-patch (`8B 04 25 00 10 00 00` at the wait's own return
+address) + crash-dump technique used throughout this investigation:
+- **Confirmed it's the primordial main thread** (no `Guest thread:` line in the crash dump — the
+  same signature established for `SuspendSemaphore`'s waiter many sessions ago).
+- **Disassembled the call site** (`0x8018A6380`-`0x8018A6466`) and identified the exact pattern:
+  a timed counting-semaphore acquire. `sceKernelSyncOnAddressWait(addr=r14, pattern=0,
+  timeout=&local)` is called; on return, the code does `mov rax,[r14]; test rax,rax; jle
+  <retry>; lea rcx,[rax-1]; lock cmpxchg [r14],rcx; jne <retry>` — a classic atomic
+  decrement-if-positive semaphore fast path. `[r14]` (`0x6080EE3D8`) never goes positive, so this
+  loops forever, retrying the timed wait each time — exactly matching the observed
+  rapid-TIMED_OUT-then-immediately-retry behavior.
+- **Found the caller** via the crash dump's stack (`[rsp+0x48] = 0x800B05C32`, inside the **main
+  eboot module**, not the giant IL2CPP blob) and disassembled it
+  (`0x800B05B80`-`0x800B05D0B`): a `lock xadd dword ptr [rbx+0x130], eax` (a ticket/refcount atomic
+  decrement) feeding a contended/uncontended branch — the textbook fast-path-mutex-with
+  -kernel-fallback shape already documented earlier in this investigation for
+  `sceKernelSyncOnAddressWait`'s original discovery, but this is a **different instance**: `rbx`
+  is a distinct, larger context object (the semaphore pointer lives at `[rbx+0x128]`, the ticket
+  counter at `[rbx+0x130]`, with further fields at `+0x1e0`/`+0x200` feeding debug-assertion calls
+  — `lea rdi,[rip+...]; lea rsi,[rip+...]; lea rcx,[rip+...]; mov r8d,0x30/0x35; call
+  0x8019b0a70` is an assertion/log-with-file/line pattern, `r8d`=48/53 reading like source line
+  numbers). This has every hallmark of **Unity baselib's own internal `Mutex` implementation**
+  (ticket-based fast path, kernel-primitive-backed contended path, debug-mode assertions) — engine
+  -level synchronization code, not anything PS5-specific or game-specific.
+
+**Net effect**: the main thread is blocked trying to **acquire a lock that something else is
+holding and never releases.** This is architecturally the same *shape* of bug as the original
+`SuspendSemaphore` mystery (something never signals/releases a synchronization primitive), but a
+different, specific instance of it, one level removed from anything PS5-kernel-visible — a
+Unity-internal engine mutex, not a `sceKernel*` object. **Not yet found**: which subsystem/object
+owns this specific mutex instance, or what's supposed to release it. This is a real, well
+-evidenced, concrete next step, not a guess — deliberately stopped here to check in rather than
+descend further into IL2CPP-compiled engine internals without confirming direction, matching this
+investigation's own established discipline about not overextending a single sitting.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via many rounds of `--debug-server` +
+`write-memory` AV-trap patching, `SHARPEMU_LOG_SEMA=1`, `SHARPEMU_LOG_VIDEOOUT=1` (new-this-session
+existing-but-unused trace flag), and the new-this-session `SHARPEMU_LOG_SYNCADDR=1` (kept
+permanently, mirrors `SHARPEMU_LOG_SEMA`'s pattern — caution: unfiltered, it produces millions of
+lines within seconds from `wait-cooperative-resume` alone, since that fires on every scheduler
+predicate poll, not just final resolution; redirect straight to a file, never tail live, and
+prefer the AV-patch/crash-dump technique for single-address identity questions instead of a long
+capture). `dotnet test SharpEmu.slnx -c Release`: 499/499.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, later session): found and fixed a real,
+generic cooperative-scheduler bug (spurious immediate wake), and traced the remaining stall down
+to a specific, contended, never-released Unity engine mutex" section (and the two sections above
+it - the rebase entry and the FLIP/FPS-adjacent context) for full background. Summary: metal_slug
+boots, presents ONE frame, then hangs forever - the root cause is now pinned down to the primordial
+main thread being permanently blocked trying to ACQUIRE a Unity-internal engine mutex (a
+ticket-counter + kernel-semaphore-fallback pattern, NOT a sceKernel* object) that something else
+holds and never releases. The wait object is at guest heap address 0x6080EE3D8 (a
+sceKernelSyncOnAddressWait-backed counting semaphore, count field never goes positive); the
+acquire attempt is at eboot-module code 0x800B05C21-0x800B05C32 (call to the semaphore-acquire
+utility at 0x8018A6300, itself inside the IL2CPP module); the ticket/refcount atomic lives at
+[rbx+0x130] of a larger context object whose semaphore pointer is at [rbx+0x128]. This whole
+generic scheduler-level bug class (SyncOnAddressWait's predicate treating the scheduler's own
+speculative post-block recheck as a real wake) is ALREADY FIXED this session
+(src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs) and verified real (previously
+-endless SuspendSemaphore/ResumeSemaphore cycling now settles after one pair; a previously
+-invisible call site now returns honest TIMED_OUT results). Two hypotheses were checked and
+RULED OUT this session, don't re-open without new evidence:
+1. The FLIP=0.3 overlay value indicating ongoing periodic frame submission - directly disproven
+   via SHARPEMU_LOG_VIDEOOUT=1 (only 2 videoout.submit_flip calls ever happen, total, across 90+
+   seconds; the overlay value was a decaying rolling average of those same two, not evidence of a
+   submit/present pipeline gap).
+2. Any connection to the already-cleared GfxFlipThread/JobSystem-idle-pattern (0x8018A90CF) - the
+   new 0x6080EE3D8 wait is confirmed structurally distinct and unrelated to those.
+
+Next step (not yet attempted): find what's supposed to RELEASE the mutex/semaphore at
+[rbx+0x128]/0x6080EE3D8 - i.e. who else references [rbx+0x130] (the ticket counter) or the
+semaphore pointer, and specifically who's expected to signal it. This requires descending further
+into the IL2CPP-compiled engine internals (the calling function at 0x800B05B00-ish, and whatever
+calls INTO that, per the return-address-walking technique already used successfully this session)
+rather than the eboot module - the eboot-module frame found this session (0x800B05C21) is just
+ONE caller of a shared, generic acquire-with-timeout utility, not the actual owner/releaser.
+Consider also: is [rbx] itself a per-frame/per-subsystem singleton whose lifecycle ties to
+something already traced earlier in this investigation (the per-frame loop driver at 0x8042D88C0,
+the event-callback slot at 0x80803BEC8, or the list-registry functions at 0x8042E4240/0x8042E4400
+already fully traced) - check for any structural connection before assuming this is entirely
+unrelated new territory.
+
+Tooling: the proven --debug-server + guaranteed-AV-patch (8B 04 25 00 10 00 00, target=0x1000 to
+avoid the low-address-redirect auto-recovery path that swallows the more common `mov eax,[0]`
+patch) + crash-dump technique (gives Guest thread: identity, full registers, and a stack-qword
+dump directly - no live breakpoint needed, works around the debugger's known gap for the
+primordial main thread) is what found everything this session; prefer it over
+SHARPEMU_LOG_SYNCADDR's raw volume for single-address questions. capstone via <scratchpad>/venv
+for follow-up disassembly. Always confirm no stray SharpEmu process before starting a new one -
+the user may have their own instance running independently this session, don't touch a process
+you didn't start. Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars for a
+plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): found and fixed a second real bug (a classic Monitor.PulseAll lost-wakeup race in the host-thread fallback), confirmed it works, but traced the remaining bottleneck to the *releaser* itself being called far too rarely — not our side
+
+Continued directly from the previous entry, per the user's explicit direction to keep tracing who
+releases the mutex at `0x6080EE3D8`.
+
+**Found the exact NID-index approach was a dead end** (adjacent PLT stub index guessing for
+`sceKernelSyncOnAddressWake` resolved to an uncataloged NID, `dZGYu5wObJs`, not found anywhere in
+`scripts/ps5_names.txt`'s 154,457-name catalog even via a full hash sweep) — abandoned static
+index-adjacency guessing in favor of direct empirical evidence via `SHARPEMU_LOG_SYNCADDR=1`.
+
+**Also clarified (important correction): `0x8018a6300`/`0x8019b2050`/the whole traced call chain
+is inside the main eboot module (base `0x800000000`), not `Il2cppUserAssemblies.prx` (base
+`0x804000000`) as loosely stated in the previous entry** — Unity's IL2CPP-transpiled *game* C# code
+lives in the separate `.prx`, but Unity's own native engine/baselib runtime is statically linked
+into the eboot player executable itself. This reinforces (rather than undermines) the "Unity
+baselib Mutex" identification from the previous entry.
+
+**Found direct, empirical proof a real release genuinely happens** (not "nothing ever releases
+it" as in the original `SuspendSemaphore` mystery): a `SHARPEMU_LOG_SYNCADDR=1` capture caught one
+real `sceKernelSyncOnAddressWake(0x6080EE3D8, count=1)` call, from a real cooperative guest thread
+(`guest=0x00007CA1C8137D50`), with caller return address `0x0000000800B05877` — but
+`cooperative_woken=0` (expected: the waiting primordial main thread doesn't use the cooperative
+scheduler path at all).
+
+**Found a second real, confirmed bug**: `WaitOnHostThread`'s bare `Monitor.Wait`/`SyncOnAddressWake`'s
+bare `Monitor.PulseAll` pair is a classic missed-wakeup race — `Monitor.PulseAll` only reaches a
+thread that is *already* inside `Monitor.Wait` at that exact instant; it has no persisted/remembered
+signaled state. Since the guest's own retry loop only holds each individual wait for a short,
+finite duration before doing other work (recomputing timeouts, rechecking the fast-path count) and
+re-entering, there's a real window where a genuine wake arrives while the thread isn't actively
+blocked, and it's silently lost forever. Empirically confirmed: the one captured wake this session
+did **not** produce a matching `wait-host-wake` before the fix.
+
+**Fix**: added a per-address wake-generation counter to `KernelSyncOnAddressCompatExports.cs`
+(`_wakeGenerations`, bumped by `SyncOnAddressWake` before it pulses), captured by
+`SyncOnAddressWait` before anything can yield and rechecked in a loop under the *same* lock
+`SyncOnAddressWake` pulses under, instead of trusting `Monitor.Wait`'s pulsed/timed-out return
+value alone — this is the exact same pattern main's original (now-reverted) implementation used
+for this specific purpose, restored and combined with this session's correct
+pattern-compare/EAGAIN/real-timeout semantics rather than main's spec-incorrect "always succeed"
+behavior. **Verified as a real, working fix**: a fresh `SHARPEMU_LOG_SYNCADDR=1` capture after the
+fix caught the same rare real wake and this time it **did** produce a matching `wait-host-wake`
+(1 occurrence, vs. 0 before) — the race is closed. `dotnet test SharpEmu.slnx -c Release`: 499/499.
+
+**Frame 2 still doesn't render** — closing this specific race wasn't sufficient by itself, because
+**the releaser itself is simply invoked extremely rarely** (~1 real wake observed per ~24,000
+wait attempts in a 40-second capture), independent of anything on the waiting side. Disassembled
+the release function directly (`0x800B05805`-`0x800B05877`, in the eboot module):
+
+```asm
+mov rdi, [rbx+0x128]              ; same semaphore object the acquire side uses
+mov edx, [rdi+8]                  ; read a "registered waiter count" field (separate from
+...                                ; the main count at [rdi] itself)
+lock cmpxchg [rdi+8], r9d
+test edx, edx
+jns 0x800b05675                   ; if the OLD value was non-negative (no waiters), skip
+                                   ; the wake entirely and return early
+...
+lock add qword ptr [rdi], rsi     ; only reached when waiters were registered: bump the
+call 0x8019b2060                  ; real count, then sceKernelSyncOnAddressWake
+```
+
+This is a real `Semaphore::Release()`, correctly conditional on its own waiter-tracking field —
+not obviously broken in itself. **The open question shifts one level further out**: is this
+release FUNCTION called rarely because *its own caller* is rarely reached (the more likely
+explanation, given the acquire side's registration window - the negative `[rdi+8]` state - should
+persist for the requested wait's full outer duration, not just one short internal retry, so a
+release landing "in between" shouldn't be this rare if release itself were called often), or does
+release's caller run often but pass a count/condition that usually doesn't touch this particular
+semaphore instance? Not yet traced.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via `SHARPEMU_LOG_SYNCADDR=1` (before/after
+A-B comparison), `--debug-server` + `read-memory` + capstone for the release function's
+disassembly, and a full-catalog NID hash sweep (dead end, documented so it isn't re-tried).
+`dotnet test SharpEmu.slnx -c Release`: 499/499 both before and after this fix.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): found and fixed a second
+real bug (a classic Monitor.PulseAll lost-wakeup race in the host-thread fallback), confirmed it
+works, but traced the remaining bottleneck to the releaser itself being called far too rarely"
+section (and the two sections above it) for full background. Summary: metal_slug boots, presents
+ONE frame, hangs forever. TWO real, confirmed bugs have been found and fixed this session in
+src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs:
+1. SyncOnAddressWait's cooperative-path wake predicate treated the scheduler's own speculative
+   post-block recheck as a real wake (fixed: ignore the first invocation).
+2. The host-thread fallback path (WaitOnHostThread/SyncOnAddressWake) had a classic
+   Monitor.PulseAll lost-wakeup race - a wake landing while the waiter wasn't yet inside
+   Monitor.Wait vanished with no persisted effect (fixed: a wake-generation counter, bumped by
+   Wake, checked under the same lock before/after each Monitor.Wait).
+
+Both fixes are verified real via before/after SHARPEMU_LOG_SYNCADDR=1 A-B captures - each one
+measurably changed observed behavior in the expected direction. Neither was sufficient alone to
+unblock frame 2. The primordial main thread is blocked trying to acquire a Unity baselib-style
+semaphore/mutex at guest address 0x6080EE3D8 (a heap object with count at [addr], waiter-count at
+[addr+8]) via an acquire function at eboot-module code 0x8018A6300-ish. The RELEASE function was
+found and disassembled at 0x800B05805-0x800B05877 (also eboot module) - it's conditionally correct
+(only wakes when its own waiter-count field is negative), but is itself only CALLED extremely
+rarely (~1 real wake per ~24,000 wait attempts observed).
+
+Next step (not yet attempted): find and disassemble the CALLER of the release function
+(0x800B05805) - i.e. what guest code decides when to call Semaphore::Release on this specific
+object, and why it does so so rarely. Use the same crash-dump-via-stack-walk technique already
+proven this session (or SHARPEMU_LOG_REFSCAN_ADDRS on 0x800B05805 itself to find all its callers
+statically, cross-referenced against which are actually reached). Consider whether this semaphore
+is itself gated by something ELSE not yet traced (a job-completion count, a frame-budget throttle,
+or similar) - i.e. keep asking "why is X rare" one level further out rather than assuming this is
+the final answer.
+
+Tooling: SHARPEMU_LOG_SYNCADDR=1 (kept permanently, KernelSyncOnAddressCompatExports.cs) is the
+most direct way to empirically confirm/deny a wake-related hypothesis - grep for
+"syncaddr.wake addr=0x<target>" and "syncaddr.wait-host-wake addr=0x<target>" specifically rather
+than tailing the raw firehose (redirect to file, 40s captures generate ~10MB). The
+--debug-server + guaranteed-AV-patch (8B 04 25 00 10 00 00, target=0x1000) + crash-dump technique
+remains the fastest way to get a specific call site's live register/stack state and thread
+identity. A full-catalog Ps5Nid hash sweep against scripts/ps5_names.txt (script recreated ad hoc
+this session, ~0.1s for all 154,457 names) is available if a new unresolved NID needs identifying,
+but PLT-stub-index adjacency is NOT a reliable way to guess which NID a neighboring stub resolves
+to - confirmed wrong this session, don't reuse that shortcut. Always confirm no stray SharpEmu
+process before starting a new one; the user may have their own instance running independently.
+Repro: build (`dotnet build SharpEmu.slnx -c Debug`), run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env vars for a
+plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): found the releaser's identity (Unity's `Loading.PreloadManager` thread), ruled out "just needs more patience" with an 18-minute negative result, and found a new anomaly (import-rate collapse) worth checking before further disassembly
+
+Continued directly from the previous entry, per the user's explicit direction to trace the release
+function's caller.
+
+**Found the releaser's identity directly via a crash-dump stack walk** (same `--debug-server` +
+guaranteed-AV-patch technique, this time at `0x800B05805`, the release function's own body):
+`Guest thread: handle=0x000079FD04011820 name='Loading.PreloadManager'` — a real, named Unity
+engine thread (Unity's own asynchronous asset-loading/preload subsystem, not
+game-specific code). `last_import=tn3VlD0hG60` = `scePthreadMutexUnlock`, consistent with normal
+internal work-queue bookkeeping, not evidence of a problem by itself. A second captured crash
+dump for the same thread showed a **deep, actively-executing IL2CPP call stack**
+(`ZT4ODD2Ts9o+0x1045...` repeated across 7+ frames) — i.e. `PreloadManager` is not itself
+deadlocked or idle; it's genuinely busy running real (IL2CPP-compiled) code when sampled.
+
+**This raised a real, worth-testing alternative hypothesis: maybe there's no bug left at all, and
+frame 2 just needs more wall-clock time than any prior test window gave it** (SharpEmu's I/O/asset
+-decode paths could legitimately be slower than real hardware). **Tested this directly and got a
+clean, unambiguous negative**: ran metal_slug with no env vars for a full 18 minutes (1080s) — zero
+new `"Vulkan VideoOut presented"` lines the entire time, still exactly the same 2 lines from frame
+1's initial setup. **This rules out "just needs patience" — don't re-try a longer plain wait
+without new evidence something changed.**
+
+**New anomaly noticed while wrapping up, not yet investigated**: the `Import#N` counter reached only
+`~3,200,000` after the full 18-minute run — far slower than earlier, shorter captures this same
+session reached in a fraction of the time (e.g. ~2.1 million imports in just 120 seconds in an
+earlier capture, over 10x this run's effective rate). Since the `Import#` counter only increments
+on HLE dispatch, not on pure guest-code computation, this drop is consistent with either (a)
+genuinely slow real work happening inside guest code between HLE calls (plausible given the
+`PreloadManager` stack sample), or (b) something now spinning in a **tight, HLE-invisible busy-wait
+inside guest code that never calls back into any traced kernel primitive at all** — which none of
+this session's import-based tracing (`SHARPEMU_LOG_SYNCADDR`, `SHARPEMU_LOG_SEMA`,
+`SHARPEMU_LOG_VIDEOOUT`, the `Import#N` counter itself) would ever surface, since all of it is
+keyed on HLE call dispatch. **Not yet distinguished between these two** - the natural next check is
+live RIP sampling (pause via `--debug-server` at several points a few seconds apart and read
+`rip`/registers each time, or use `SnapshotThreads`-style state if exposed) to see whether
+execution is stuck tightly in one place (spin) or genuinely moving through varied code (real,
+if slow, work).
+
+**Two real, confirmed fixes remain in place from this session** (`KernelSyncOnAddressCompatExports.cs`
+— the cooperative-scheduler spurious-wake fix and the host-thread-fallback lost-wakeup
+generation-counter fix) and are still correct and worth keeping regardless of how the remaining
+mystery resolves — both were independently verified via before/after A-B captures earlier this
+session. `dotnet test SharpEmu.slnx -c Release`: 499/499, unaffected by this entry's
+investigation-only work (no code changes this entry).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), via one 18-minute unattended plain run (no env
+vars) and the crash-dump stack-walk technique at the release function.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): found the releaser's
+identity (Unity's Loading.PreloadManager thread), ruled out 'just needs more patience' with an
+18-minute negative result" section (and the two sections above it) for full background. Summary:
+metal_slug boots, presents ONE frame, hangs forever. TWO real bugs already fixed and verified this
+session in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (a spurious-wake predicate
+bug and a Monitor.PulseAll lost-wakeup race) - both correct, keep them, but neither alone unblocks
+frame 2. The primordial main thread is blocked acquiring a Unity baselib-style semaphore at guest
+address 0x6080EE3D8; the releaser was identified by name via a crash-dump stack walk as Unity's own
+"Loading.PreloadManager" thread (real engine subsystem, asynchronous asset loading) - not
+game-specific code. A live sample showed this thread genuinely executing deep, active IL2CPP code
+when caught (not idle/deadlocked itself).
+
+Directly tested and RULED OUT "just needs more wall-clock time": an 18-minute (1080s) unattended
+plain run produced zero additional presented frames. Don't re-try a longer passive wait without new
+evidence something changed.
+
+New, not-yet-resolved anomaly found at the very end of this session: the same 18-minute run's
+Import#N counter only reached ~3.2 million, roughly 10x SLOWER than an earlier, much shorter
+capture this same session reached in a fraction of the time. Since Import#N only counts HLE
+dispatches, this could mean either (a) PreloadManager is doing genuinely slow real work between HLE
+calls (consistent with the deep-IL2CPP-stack sample), or (b) something is now spinning in a tight,
+HLE-invisible busy-wait that never calls any kernel primitive at all - which would be completely
+invisible to every trace flag used this session (SHARPEMU_LOG_SYNCADDR/SEMA/VIDEOOUT are all keyed
+on HLE dispatch). This wasn't distinguished before the session ended.
+
+Next step (not yet attempted): distinguish these two via live RIP sampling - pause the process via
+--debug-server at several points a few seconds apart (note: the debug-server's pause doesn't
+reliably work on the PRIMORDIAL main thread specifically, per an earlier session's finding, but
+should work on PreloadManager since it's a real registered cooperative guest thread) and read
+rip/registers each time. If RIP is stuck in a narrow address range across samples, that's a genuine
+spin (find what condition it's waiting on and why, same as the SyncOnAddressWait bugs already
+found - could be a THIRD instance of the same missing-wake bug class, possibly in a different HLE
+primitive entirely that hasn't been traced yet since it's invisible to the flags already in place).
+If RIP varies widely and keeps advancing through new code, that's genuine (if slow) work, and the
+investigation shifts toward "why is this particular workload so slow under SharpEmu" - a
+potentially very different, performance-oriented question rather than a synchronization bug.
+
+Tooling: all techniques from the previous two entries remain valid and proven (--debug-server +
+guaranteed-AV-patch [8B 04 25 00 10 00 00, target=0x1000] + crash-dump for identity/stack
+questions; SHARPEMU_LOG_SYNCADDR=1 for wait/wake-specific empirical questions, redirect to file,
+never tail raw). Always confirm no stray SharpEmu process before starting a new one; the user may
+have their own instance running independently. Repro: build (`dotnet build SharpEmu.slnx -c
+Debug`), run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` with no env
+vars for a plain repro. metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): CPU-sampled the spin, found it's real 99%+ on one host
+thread, but a key architectural wrinkle undermines a clean spin-vs-real-work verdict
+
+Picked up the "distinguish spin vs. real work" thread from the previous entry using host-level CPU
+sampling instead of live RIP sampling (`--debug-server`'s `pause` still doesn't work reliably on
+the primordial main thread, confirmed again this session).
+
+**Per-thread CPU accounting** (`/proc/<pid>/task/*/stat` utime+stime deltas over a full 20-second
+window, more reliable than instantaneous `top -H` snapshots which can miss bursty threads):
+the main-PID host OS thread consumed **100.2%** of a core continuously; every other thread in the
+process (69 total) combined consumed **under 1.5%**. This is a sustained, single-thread-hot
+pattern, not rotation across engine threads.
+
+**New diagnostic added and kept permanently**: `SHARPEMU_LOG_RET_ADDRS` in
+`DirectExecutionBackend.Imports.cs` (comma-separated `0x`-hex addresses via the existing
+`ParseDiagnosticAddresses` helper) - logs full call details (NID, export name, args, dispatch
+index) every time an HLE import's *return address* matches one of the given addresses, regardless
+of the normal every-100,000th sampling. Mirrors `SHARPEMU_LOG_REFSCAN_ADDRS`'s
+address-list-via-env-var pattern but keyed on runtime call-site identity instead of a static
+string scan. Useful whenever you know a guest call site (from disassembly) and want to know what
+NID it resolves to without guessing via GOT/PLT arithmetic (which has repeatedly proven unreliable
+this investigation - see below).
+
+**A real side-quest, not (so far) shown to be the main blocker**: while chasing what the hot thread
+was doing, noticed the guest print `"Forcing call to sce::Agc::suspendPoint to avoid TRC R5089
+breach"` (a string embedded in the eboot itself, from Sony's statically-linked AGC SDK code, not
+anything SharpEmu prints) appearing 187+ times back-to-back with zero other HLE activity
+interleaved in one earlier capture. Traced this to a dedicated guest watchdog thread (`entry=
+0x8014E9440`, matches the boot log's `Thread-772FE4931F90`) via
+`SHARPEMU_LOG_MEMSCAN_TEXT` (find the string's guest address, `0x801C19411`) +
+`SHARPEMU_LOG_REFSCAN_ADDRS` (find the `lea rdi,[...]` reference at `0x8014E9550`) + reading/
+disassembling the surrounding function with the debug-server's `mem` command (`write`/`mem` are
+paused-only, but pausing IS reliable at every module's natural `EntryPoint` stop - use that
+instead of fighting `pause`/breakpoints against an already-running thread, which don't reliably
+interrupt it once it's mid-spin).
+
+The disassembled loop has a legitimate `elapsed >= 3 seconds` throttle gate before firing that
+print (reads "now" via a PLT-style call to `0x8019b1be0`, computes `now - lastCheckpoint`, and
+resets `lastCheckpoint = now` right before printing) - so under normal operation this print should
+fire at most once per ~3 real seconds. The 187-in-a-row burst with no gap is inconsistent with that
+gate working correctly. However, a **separate, fresh capture** of the same loop's return addresses
+(via the new `SHARPEMU_LOG_RET_ADDRS` tool, targeting every call site in the loop body) over an
+8-second window showed only `scePthreadMutexUnlock` firing, at a normal ~1/second cadence -
+i.e. in that window the loop was behaving completely normally, not spamming. So the throttle
+failure is bursty/conditional, not constantly broken - not yet isolated to a specific trigger.
+Resolving the PLT/GOT-encoded call targets directly (e.g. `0x0000700000001590`-style values read
+from a stub's GOT slot) remains unreliable - this is the same unexplained `0x7000_0000_XXXX`-style
+encoding an earlier session already hit a dead end on; don't re-attempt static GOT decoding, use
+`SHARPEMU_LOG_RET_ADDRS` against known call/return-site addresses instead.
+
+**Important architectural caveat that reopens the spin-vs-real-work question**: SharpEmu's
+cooperative guest-thread scheduler can multiplex *multiple* guest threads (this Agc watchdog, the
+spinning primordial thread, and presumably `Loading.PreloadManager`) onto the *same* underlying
+host OS thread, taking turns via park/resume continuations rather than each getting a dedicated OS
+thread. The Agc watchdog thread's normal ~1 Hz mutex-lock/unlock activity, observed on the *same*
+host PID that CPU-sampling showed as "the one hot thread," is direct evidence that other guest
+threads *are* getting scheduled time on that same OS thread. This means the earlier per-OS-thread
+CPU sampling conclusion ("only one thread is ever hot, so nothing else - including PreloadManager -
+is doing real work") does **not** actually distinguish "pure spin" from "real work interleaved
+cooperatively on the same host thread" - both look identical at the OS-thread level. The
+CPU-sampling technique from the previous entry is therefore weaker evidence than it appeared;
+import-call diversity/rate (not host-thread CPU attribution) is the right signal to keep using.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), multiple short runs with the debug-server plus
+the new memscan/refscan/ret-addr diagnostics; no code fix landed this entry (diagnostics only,
+`SHARPEMU_LOG_RET_ADDRS` addition aside). `dotnet build` (Debug and Release) both clean.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): CPU-sampled the spin, found
+it's real 99%+ on one host thread, but a key architectural wrinkle undermines a clean
+spin-vs-real-work verdict" section (and the "found the releaser's identity" section above it) for
+full background. Status: metal_slug boots, presents ONE frame, hangs forever. Two real bugs already
+fixed and verified in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake
+predicate + Monitor.PulseAll lost-wakeup race) - keep both, neither alone unblocks frame 2. The
+primordial main thread spins on sceKernelSyncOnAddressWait at guest address 0x6080EE3D8
+(ret=0x8018A6415); the releaser was identified by name as Unity's "Loading.PreloadManager" thread.
+
+Per-OS-thread CPU sampling (20s window via /proc/*/task/*/stat deltas) showed the main host thread
+at 100%+ with every other thread under 1.5% combined - BUT this does NOT cleanly prove "pure spin,
+nothing else running": SharpEmu's cooperative scheduler can multiplex multiple guest threads onto
+one host OS thread, and this session found direct evidence of that (a separate Agc watchdog guest
+thread doing normal ~1Hz mutex activity on the same sampled-as-hot host thread). So CPU-per-OS-
+thread is not a reliable spin-vs-real-work signal here - don't re-use it as primary evidence.
+
+Next step (not yet attempted): track import-call DIVERSITY and RATE instead of OS-thread CPU. E.g.
+count distinct NIDs called per second during the steady-state stall (not just the dominant
+SyncOnAddressWait spam) - if PreloadManager is doing real asset-loading work, expect to see
+periodic file-I/O-ish or memory-related HLE calls (mmap, read, decompression-related NIDs)
+interleaved at some nonzero rate; if truly starved/stuck, expect to see nothing but
+SyncOnAddressWait forever. The existing every-100,000th Import# milestone trace plus the new
+SHARPEMU_LOG_RET_ADDRS tool (call-site-targeted, see above) are both suited to this without needing
+to re-solve the GOT/PLT static-decoding dead end.
+
+Also unexplored: the Agc watchdog thread's "Forcing call to sce::Agc::suspendPoint to avoid TRC
+R5089 breach" print (guest string at 0x801C19411, printed from 0x8014E9550, entry=0x8014E9440 aka
+'Thread-772FE4931F90') has an elapsed>=3-second throttle gate that appeared to fail once (187
+back-to-back prints with zero gap) but behaved normally (~1/sec) in a later capture - bursty, not
+constant. Probably a secondary/unrelated issue, not yet shown to affect frame 2, but worth
+isolating if it recurs (may point at a real bug in whatever clock/time HLE call backs
+0x8019b1be0 - use SHARPEMU_LOG_RET_ADDRS targeting 0x8014E94E7 and 0x8014E954D, the loop's two
+time-read call sites, to identify the NID next time).
+
+Tooling recap: --debug-server's `pause`/breakpoints do NOT reliably interrupt an already-running
+thread (confirmed again) - but pausing IS reliable at every module's natural EntryPoint stop, so
+patch-at-the-paused-RIP (guaranteed-AV technique: write 8B042500001000 at the current rip, then
+continue) works well for triggering crash-dump diagnostics deterministically right after a fresh
+launch. SHARPEMU_LOG_MEMSCAN_TEXT (find a string's guest address) + SHARPEMU_LOG_REFSCAN_ADDRS
+(find what code references an address) + SHARPEMU_LOG_RET_ADDRS (find what NID a specific call
+site resolves to, added this session) + SHARPEMU_LOG_SYNCADDR (wait/wake empirical tracing) are all
+permanent, reusable, comma-separated-hex-address env vars now. Always confirm no stray SharpEmu
+process before starting a new one. Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-20, same session): NidHistogram found the real hot loop - a Unity JobSystem
+worker doing real (if very fast) job dequeue/execute cycles, not a silent starve
+
+Acted on the previous entry's "track import-call diversity/rate instead of OS-thread CPU" next
+step. Two more permanent diagnostics added to `DirectExecutionBackend.Imports.cs` (same
+env-var-gated pattern as the existing ones):
+
+- `SHARPEMU_LOG_NID_HISTOGRAM=1` - dumps a per-NID call-count breakdown every ~2 real seconds
+  (flushed and reset each window, not accumulated forever), so a capture shows what's firing
+  *right now* rather than being dominated by boot-time activity.
+- `SHARPEMU_LOG_NID_RET_SAMPLE=<nid>` - once a hot NID is identified via the histogram, samples
+  its caller's return address periodically (every 3000th call) throughout the whole run, so the
+  actual hot call site can be found without knowing it up front (the inverse of
+  `SHARPEMU_LOG_RET_ADDRS`, which needs the address already known).
+
+**Finding, in order of discovery:**
+
+1. During steady-state stall, `SHARPEMU_LOG_NID_HISTOGRAM` showed `distinct=1` every single 2-second
+   window: only `libKernel:scePthreadMutexUnlock` (nid `tn3VlD0hG60`), at a sustained **~4,400
+   calls/second**. Critically, this does NOT include the well-documented
+   `sceKernelSyncOnAddressWait` TIMED_OUT spam at all, even though that's clearly still happening in
+   the same raw log - confirms there are two separate import-dispatch code paths in
+   `DirectExecutionBackend.Imports.cs` (an older one around line ~550-600 with a shorter WARN
+   format, and the newer one around line ~1300-1370 that these new tools instrument); each NID
+   consistently goes through only one of the two.
+
+2. First hypothesis (WRONG, worth recording so it isn't re-tried): assumed this was the
+   `Thread-772FE4931F90` Agc watchdog loop from the previous entry, since its disassembly has an
+   unconditionally-reached `scePthreadMutexUnlock` call (`ret=0x8014E9571`). Directly checked via
+   `SHARPEMU_LOG_RET_ADDRS=0x8014E9571`: only ~1.4 calls/sec return there - nowhere near 4,400/sec.
+   That watchdog thread is NOT the hot loop; it's still behaving normally. Don't re-assume "same
+   target function bytes = same caller" - always verify empirically via return-address matching.
+
+3. Used the new `SHARPEMU_LOG_NID_RET_SAMPLE=tn3VlD0hG60` to find the real caller (periodic
+   sampling throughout the run avoids only catching boot-time callers). Steady-state samples
+   converged on `rdi=0x00000006080EE380` with two dominant return addresses,
+   `0x0000000800B04E90` (6/15 samples) and `0x0000000800B05B4A` (3/15). **`0x6080EE380` is only
+   0x58 bytes from `0x6080EE3D8`** - the exact guest address the primordial main thread is blocked
+   on via `sceKernelSyncOnAddressWait` (documented in the two entries above) - almost certainly the
+   same underlying object, different field.
+
+4. Disassembled around `0x800B04E00`-`0x800B05000` (paused at a module's natural EntryPoint,
+   `mem` + capstone, same technique as before). This is a **Unity JobSystem-style work-queue
+   worker loop**: locks a mutex at `[rbx+0x110]`, checks queue depth at `[rbx+0x200]` (jumps to a
+   separate "empty" path if zero - not yet read), unlocks, peeks the front entry, executes it via
+   vtable calls (`[rax+0x58]`) bracketed by its own before/after timestamp reads (`call
+   0x8019b0c80` twice, subtracting to accumulate elapsed time - a normal profiling pattern, not the
+   suspendPoint throttle from the previous entry), re-locks, removes the completed entry from the
+   queue (`call 0x8019b22b0`), decrements the count, unlocks again. The dominant hit
+   (`0x800B04E90`) is the unlock reached only on the **non-empty** branch (the empty-queue jump at
+   `0x800B04E78` bypasses it) - meaning the queue is genuinely finding and completing work most of
+   the time this loop runs, not just re-checking an empty queue in a tight spin.
+
+**Read on this**: this looks like legitimate, correctly-functioning Unity JobSystem worker
+behavior - not an obvious bug to fix, unlike the two real synchronization bugs already fixed this
+session. If `rbx+0x110` (mutex) and the primordial thread's wait target `0x6080EE3D8` really are
+fields of the same object (offset ~0x58 apart, not yet confirmed which field is which), this ties
+the JobSystem's dequeue/execute cycle directly to whatever the primordial thread is ultimately
+waiting on - i.e. frame 2 is plausibly gated on this JobSystem worker finishing enough real (if
+fast/small-grained) job cycles, not on a missing wake or a silent spin. At ~4,400 job cycles/sec,
+if the total job count needed is very large (a full asset-loading job graph), this reframes the
+open question from "synchronization bug" toward "SharpEmu's guest execution throughput is too slow
+for this workload to complete in reasonable wall-clock time" - a performance question, not a
+missing-primitive question. Not confirmed either way yet; the previous entry's 18-minute negative
+result is consistent with both "will finish eventually, just very slowly" and "never finishes
+because job count is unbounded/faulty," and this entry doesn't distinguish them further.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), multiple short instrumented runs. No code fix
+landed - `SHARPEMU_LOG_NID_HISTOGRAM` and `SHARPEMU_LOG_NID_RET_SAMPLE` are the only production
+code changes, both diagnostics-only. `dotnet build` (Debug + Release) and `dotnet test
+SharpEmu.slnx -c Release`: 499/499, unaffected.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-20, same session): NidHistogram found the real
+hot loop - a Unity JobSystem worker doing real (if very fast) job dequeue/execute cycles, not a
+silent starve" section (and the two sections above it) for full background. Status: metal_slug
+boots, presents ONE frame, hangs forever. Two real synchronization bugs already fixed and verified
+in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake predicate +
+Monitor.PulseAll lost-wakeup race) - keep both. The primordial main thread spins on
+sceKernelSyncOnAddressWait at guest address 0x6080EE3D8 (ret=0x8018A6415); a separate,
+independently-verified hot loop was found via SHARPEMU_LOG_NID_HISTOGRAM: a Unity JobSystem-style
+worker at guest 0x800B04E00-ish region locking/unlocking a mutex at [queue_obj+0x110] and
+dequeuing/executing real jobs at ~4,400 cycles/sec, operating on an object only 0x58 bytes from the
+primordial thread's wait address (0x6080EE380 vs 0x6080EE3D8) - very likely the same underlying
+JobSystem/queue structure. This looks like correctly-functioning engine behavior, not an obvious
+bug.
+
+Two hypotheses remain undistinguished: (a) this JobSystem queue has a large-but-finite amount of
+real work (e.g. a full asset-loading job graph) that will eventually drain and unblock the
+primordial thread, just very slowly under SharpEmu's emulated execution speed - meaning the fix
+path is a performance investigation (why is guest-code execution/job-processing this slow compared
+to real hardware), not a bug hunt; or (b) something is enqueueing jobs faster than they can ever
+drain (or re-enqueueing something that should terminate), meaning the job count is effectively
+unbounded and this will never finish no matter how long you wait - closer to a bug, just a
+different kind (queue-depth/logic bug rather than missing-wake).
+
+Next steps (not yet attempted): (1) read the disassembly of the "empty queue" path at guest
+0x800b0504a (jumped to when [rbx+0x200]==0) - not yet examined, may reveal a sleep/backoff or an
+immediate re-loop, and reading the full function around the entry point that CALLS this worker loop
+would reveal whether it's called once per "there's a job" event or in a tight host-visible retry
+loop of its own. (2) find out what's actually being enqueued into this queue and by whom - if it's
+literally asset-load chunks for Loading.PreloadManager, track [rbx+0x200] (queue depth) over time
+across several SHARPEMU_LOG_NID_HISTOGRAM-instrumented samples to see if it trends toward zero
+(draining, supports (a)) or stays roughly constant/grows (supports (b)). (3) consider whether
+SharpEmu's DirectExecutionBackend has any obvious per-import-dispatch overhead that would make
+4,400 calls/sec of real work take dramatically longer wall-clock than the equivalent on real PS5
+hardware - if so this becomes a legitimate performance/profiling task, a different kind of
+investigation than everything done in this thread so far.
+
+Tooling recap: all previous entries' tools remain valid
+(SHARPEMU_LOG_MEMSCAN_TEXT/REFSCAN_ADDRS/RET_ADDRS/SYNCADDR, guaranteed-AV-patch-at-paused-RIP
+technique). New this entry: SHARPEMU_LOG_NID_HISTOGRAM=1 (per-NID call-rate breakdown every ~2s,
+DirectExecutionBackend.Imports.cs) and SHARPEMU_LOG_NID_RET_SAMPLE=<nid> (periodic caller-address
+sampling for a specific NID, same file) - both permanent. Remember debug-server's pause/breakpoints
+don't reliably interrupt an already-running thread; pause is only reliable at natural module
+EntryPoint stops. Always confirm no stray SharpEmu process before starting a new one. Repro:
+`dotnet build SharpEmu.slnx -c Debug`, run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu
+<metal_slug eboot.bin>` (add --debug-server for live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, same session): the JobSystem worker is a perpetually-cycling ring
+buffer, not draining/growing job-count work - REFRAMES the whole lead as very likely a red herring
+
+Acted on the previous entry's three next steps: (1) disassemble the empty-queue path and the
+worker's caller, (2) track queue depth over time, (3) only assess dispatch overhead if 1-2 showed
+real finite work.
+
+**Step 1 - disassembled `0x800B04D80`-`0x800B051E0` in full** (paused at a module's natural
+EntryPoint, `--debug-server` `mem` + capstone via a venv at `<scratchpad>/venv` - `capstone` is not
+preinstalled and the system Python is externally-managed, same tooling note as every prior session
+that used this). Confirmed the full "process one job" iteration: lock mutex at `[rbx+0x110]`,
+check depth at `[rbx+0x200]`, if zero jump to `0x800b0504a` which **just unlocks the mutex and
+returns immediately** - no sleep, no backoff, no condition wait. If non-empty: peek the head
+pointer, unlock, execute the job via vtable (`[rax+0x58]`) bracketed by `call 0x8019b0c80` (a clock
+read) timestamps, and only if execute() returns true AND a secondary flag condition holds does it
+re-lock, call `0x8019b22b0` (an array memmove-style "shift queue down by one slot" pop), decrement
+`[rbx+0x200]`, and unlock again - otherwise the peeked job is left in place for the next pass
+un-removed (normal "not ready yet, retry later" semantics, not obviously a bug by itself). This
+confirmed the *caller's* cadence, not this function, controls the empty-queue retry rate - exactly
+the open question from the previous entry.
+
+**Step 2 - added a new permanent diagnostic, `SHARPEMU_LOG_MEM_U64=<hex addr>`, to
+`DirectExecutionBackend.Imports.cs`**, which reads and logs one guest u64 alongside every
+`SHARPEMU_LOG_RET_ADDRS` hit - lets a field (e.g. a queue-depth counter) be sampled at the natural
+cadence of a known call site instead of needing a live pause (confirmed once again this session:
+`--debug-server`'s `pause` still does not reliably stop the already-running primordial thread).
+Computed `queue_obj = 0x6080EE380 (mutex) - 0x110 = 0x6080EE270`, so depth lives at
+`queue_obj+0x200 = 0x6080EE470`. Ran with
+`SHARPEMU_LOG_RET_ADDRS=0x800B04E90,0x800B05B4A SHARPEMU_LOG_MEM_U64=0x6080EE470` for about a
+minute during steady-state stall, capturing **1,048,423 samples**:
+
+- Queue depth (`mem[0x6080EE470]`) was `1` in 1,048,421 of 1,048,423 samples (`0` only twice, the
+  instantaneous empty-window right after a pop and before the next push) - **flat, steady-state,
+  neither draining toward zero nor growing**. This doesn't match either original hypothesis (a)
+  "finite, will eventually drain" or (b) "unboundedly growing" - it's a fixed-size equilibrium.
+- The `rsi` register value sampled at the peek-unlock return site (`0x800B04E90`, incidental to the
+  call - not an argument to `scePthreadMutexUnlock` itself, just whatever was live in `rsi` at that
+  program point) **increments by exactly `0x10` (16 bytes) on every single one of the 524,216
+  samples taken at that site, with exactly one wraparound observed in the whole run**: from
+  `0x7FFFFC` straight back down to `0xC`. `0x800000` = 8 MiB, and `0x800000 / 0x10` = 524,288 slots
+  - matching the ~524,210-524,216 distinct/total values seen almost exactly. This is the signature
+  of a monotonic write cursor over a fixed 8 MiB ring buffer of 16-byte slots (a bump allocator or
+  per-frame temp-allocation arena), not a counter tied to any finite job graph.
+
+**Read on this, superseding the previous entry's framing**: this worker loop is not "slowly
+draining a large-but-finite job graph" (hypothesis a) and not "growing unboundedly due to a bug"
+(hypothesis b, in the sense of a runaway leak) - it's a **perpetual, self-recycling
+allocator/scheduler heartbeat that is designed to run forever** at steady state, with no natural
+termination condition of its own. Combined with the empty-queue path's instant, no-backoff return
+(step 1), this strongly suggests the loop will keep running at ~4,400 cycles/sec indefinitely
+regardless of anything else in the game's state - **this looks like a real, healthy Unity
+JobSystem/allocator subsystem operating exactly as designed, and is very likely NOT the actual
+gate on the primordial thread's `sceKernelSyncOnAddressWait` at `0x6080EE3D8`**, despite being only
+0x58 bytes away in memory (that offset proximity was always circumstantial, never confirmed as
+"same struct, causally linked field" - treat it as most likely coincidental now). Step 3 (dispatch
+overhead) is now out of scope as originally framed, since steps 1-2 didn't show finite real work
+being slowly ground through - there's no "total work" to measure overhead against.
+
+**This is a real pivot, not a dead end**: the actual signal/wake source for `0x6080EE3D8` is still
+completely unidentified and is now, again, the open question - this JobSystem lead should be
+considered explored and set aside unless new evidence ties it back in. `dotnet build` (Debug +
+Release) and `dotnet test SharpEmu.slnx -c Release`: 499/499, unaffected by this entry's
+diagnostics-only change (`SHARPEMU_LOG_MEM_U64` addition to `DirectExecutionBackend.Imports.cs`).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), one instrumented ~60-second capture via the
+new `SHARPEMU_LOG_MEM_U64` diagnostic plus `SHARPEMU_LOG_RET_ADDRS`, and manual disassembly reads
+via `--debug-server` + capstone. No functional code changed - diagnostics only.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, same session): the JobSystem worker is a
+perpetually-cycling ring buffer, not draining/growing job-count work - REFRAMES the whole lead as
+very likely a red herring" section (and the two sections above it) for full background. Status:
+metal_slug boots, presents ONE frame, hangs forever. Two real synchronization bugs already fixed
+and verified in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake
+predicate + Monitor.PulseAll lost-wakeup race) - keep both.
+
+The primordial main thread still spins on sceKernelSyncOnAddressWait at guest address
+0x6080EE3D8 (ret=0x8018A6415), unchanged since many sessions ago. A previously-promising lead - a
+Unity JobSystem-style worker loop at guest ~0x800B04E00 operating on an object only 0x58 bytes from
+the primordial thread's wait address - has now been reframed as VERY LIKELY A RED HERRING: this
+entry fully disassembled the loop (lock mutex [queue_obj+0x110], check depth [queue_obj+0x200],
+peek/execute/conditionally-pop a job) and instrumented queue depth live via a new permanent
+diagnostic (SHARPEMU_LOG_MEM_U64=<hex addr>, reads/logs one guest u64 alongside every
+SHARPEMU_LOG_RET_ADDRS hit - added to DirectExecutionBackend.Imports.cs this entry). Over a
+~60-second, 1M+-sample capture: queue depth stayed at exactly 1 the entire time (steady-state
+equilibrium, neither draining nor growing), and a register value sampled at the same call site
+turned out to be a monotonic cursor wrapping cleanly around an 8 MiB ring buffer (one full
+wraparound observed: 0x7FFFFC -> 0xC, consistent with a 524,288-slot x 16-byte bump allocator).
+This is the signature of a perpetual, self-recycling allocator/scheduler heartbeat with no natural
+termination condition - NOT a finite job graph slowly draining, and NOT a runaway leak either. The
+empty-queue path (0x800b0504a) also confirmed to have zero backoff/sleep - it just unlocks and
+returns instantly, meaning its retry cadence is entirely caller-controlled and this loop plausibly
+runs forever by design regardless of anything else happening in the game.
+
+Conclusion: this JobSystem lead should be considered EXPLORED AND SET ASIDE (unless new evidence
+ties it back to the actual hang) rather than pursued further as the primary lead. The 0x58-byte
+memory proximity to the primordial thread's wait address that motivated chasing this in the first
+place was always circumstantial and is now believed most likely coincidental.
+
+Next step (not yet attempted): go back to first principles on what would actually signal/wake
+0x6080EE3D8. Earlier sessions traced the releaser to Unity's "Loading.PreloadManager" thread by
+name (crash-dump stack walk) and confirmed it's genuinely busy running deep IL2CPP code, not
+idle/deadlocked - but never found the SPECIFIC line of code, in PreloadManager or elsewhere, that
+is supposed to call sceKernelSyncOnAddressWake (or an equivalent semaphore/event primitive) on that
+exact address. Consider: (1) use SHARPEMU_LOG_SYNCADDR (already permanent) to confirm, with fresh
+eyes, whether ANY wake/signal targeting 0x6080EE3D8 (or its neighboring 0x6080EE380 - now that
+that address is understood to be a coincidentally-nearby, unrelated allocator/mutex, not
+necessarily the same struct) has EVER fired even once during a run, however far apart in time -
+this hasn't been directly, recently re-confirmed since the two lost-wakeup bugs were fixed earlier
+this session block. (2) if truly zero wakes ever fire, the missing piece is upstream: find what
+guest code is SUPPOSED to call the wake and why it isn't reached - likely requires tracing
+PreloadManager's own call graph forward (not just identifying it by name) rather than continuing
+to lean on the JobSystem loop found via NidHistogram, since that lead is now understood to be
+probably unrelated background noise.
+
+Tooling recap: all previous entries' tools remain valid
+(SHARPEMU_LOG_MEMSCAN_TEXT/REFSCAN_ADDRS/RET_ADDRS/SYNCADDR/NID_HISTOGRAM/NID_RET_SAMPLE,
+guaranteed-AV-patch-at-paused-RIP technique). New this entry: SHARPEMU_LOG_MEM_U64=<hex addr>
+(reads/logs one guest u64 alongside every SHARPEMU_LOG_RET_ADDRS hit, DirectExecutionBackend.Imports.cs)
+- permanent. capstone disassembly requires a venv (system Python is externally-managed):
+`python3 -m venv <scratchpad>/venv && <scratchpad>/venv/bin/pip install capstone`, then
+`capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64).disasm(raw_bytes, base_addr)`. Remember
+debug-server's pause/breakpoints don't reliably interrupt an already-running thread; pause is only
+reliable at natural module EntryPoint stops. Always confirm no stray SharpEmu process before
+starting a new one. Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session): found the real gate - Loading.PreloadManager DOES wake the primordial thread once, then immediately self-blocks forever on a sibling address inside the SAME JobSystem struct investigated (and dismissed) last entry
+
+Acted on the previous entry's next step: used two permanent diagnostics that existed but had never
+actually been pointed at this specific question - `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1` (per-
+second `state`/`block`/`wake` dump for every guest thread) and `SHARPEMU_LOG_GUEST_THREADS=1`
+(thread-creation/naming events) - combined with the existing `SHARPEMU_LOG_SYNCADDR=1`, across three
+separate captures (90s, 180s, 60s; ~330s combined) instead of continuing manual disassembly.
+
+**Finding, in order of discovery:**
+
+1. `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS` immediately identified `Loading.PreloadManager`
+   (handle=`0x00007C8368A7A090`) as itself **`state=Blocked`** on `sceKernelSyncOnAddressWait`, with
+   its `imports` counter frozen at exactly **22900 for the entire remainder of every capture** (90s,
+   180s, and a later 60s run all agree). This directly overturns the multi-session-old belief (from
+   a crash-dump stack walk several sessions ago) that PreloadManager is "genuinely busy running deep
+   IL2CPP code, not idle/deadlocked" - that read was wrong, or was only true up to the exact moment
+   captured here, before this session's diagnostics existed to catch the transition.
+
+2. Grepping the raw `SHARPEMU_LOG_SYNCADDR` trace around where PreloadManager last made progress
+   found the actual state transition, in exact order:
+   - `wait-block addr=0x6080EE3D8 ... ret=0x8018A6415` / `wait-host-timeout` - the primordial thread,
+     as always, times out on its own poll (confirmed still `pattern=0x00000000`, `timeout=finite`,
+     ~780 retries/sec, `guest=0x0` meaning it's on the host-thread-fallback path, not a cooperative
+     guest thread).
+   - Next iteration: `wait-block addr=0x6080EE3D8` then **`wait-host-wake addr=0x6080EE3D8`** -  this
+     specific iteration is genuinely woken, not timed out.
+   - **`wake addr=0x00000006080EE3D8 count=1 cooperative_woken=0 guest=0x00007C8368A7A090
+     ret=0x0000000800B05877`** - the wake was called by **`Loading.PreloadManager` itself**
+     (`guest=` matches its handle exactly). So PreloadManager *does* call
+     `sceKernelSyncOnAddressWake` on the primordial thread's exact address - contrary to the framing
+     of every prior entry in this investigation ("what's supposed to wake `0x6080EE3D8` and why does
+     it never happen" - it does happen, once).
+   - The very next line: **`wait-block addr=0x00000006080EE318 pattern=0x00000000 timeout=infinite
+     guest=0x00007C8368A7A090 ret=0x0000000800B0588A`** - immediately after firing that wake,
+     PreloadManager itself calls `SyncOnAddressWait` on a *different*, nearby address
+     (`0x6080EE318`, only `0xC0` bytes from the primordial thread's own wait target), this time with
+     an **infinite** timeout (not a poll loop) - and never returns. Followed by
+     `Guest thread 'Loading.PreloadManager' state=Blocked reason=sceKernelSyncOnAddressWait`,
+     confirming the scheduler agrees.
+   - This exact same sequence (one wake on `0x6080EE3D8`, then immediate infinite self-block on
+     `0x6080EE318`) was independently reproduced in a fresh 180s run (`wake` line at a different but
+     analogous point, `guest=` again PreloadManager's handle).
+
+3. Grepped all three captures (330s combined) for any `wake addr=0x...EE318` line: **zero, in every
+   run.** PreloadManager's own wait is never satisfied. This is why its import counter never moves
+   again - it isn't "slow," it is **permanently, provably blocked**, and has been the whole time
+   every prior session speculated about what it might be doing.
+
+4. The primordial thread's single successful wake (step 2) did **not** unblock it for good - the
+   very next samples show it back to `wait-block`/`wait-host-timeout` on `0x6080EE3D8` as before.
+   This matches ordinary futex semantics (a wake only releases whoever is *in* `Monitor.Wait` at
+   that instant; the guest's own poll loop re-checks its real condition afterward and, since nothing
+   else changed, just calls wait again) - not a new SharpEmu bug, and consistent with the two
+   already-fixed lost-wakeup bugs both working correctly.
+
+5. **The `0x58`-byte-proximity theory from last entry, dismissed as "probably coincidental," turns
+   out to be partially right after all - just via a different mechanism than originally guessed.**
+   Using last entry's math (`queue_obj = mutex_addr 0x6080EE380 - 0x110 = 0x6080EE270`):
+   `0x6080EE318 = queue_obj + 0xA8`, `0x6080EE380 = queue_obj + 0x110` (the ring-buffer worker's
+   mutex), `0x6080EE470 = queue_obj + 0x200` (its depth counter), and `0x6080EE3D8 = queue_obj +
+   0x168` (the primordial thread's own wait target). **All four addresses are inside the same
+   allocated struct.** Not "queue depth directly gates the primordial wait" (the theory tested and
+   rejected last entry - correctly, that specific mechanism was ruled out), but a shared
+   JobGroup/completion-fence-style object with several independent wait words at different offsets
+   for different roles - one of which (`+0xA8`) is exactly what PreloadManager is now stuck on.
+
+6. Extended `SHARPEMU_LOG_MEM_U64` to watch `queue_obj+0xA8` (`0x6080EE318`) directly, combined with
+   `SHARPEMU_LOG_RET_ADDRS` on the ring-buffer worker's two already-known call sites
+   (`0x800B04E90`, `0x800B05B4A`) from last entry. Over 190,436 samples across ~60s: **the value at
+   `+0xA8` stayed exactly `0x0000000000000000` for the entire capture** - it never changes and is
+   never woken. A fresh 180s `SHARPEMU_LOG_NID_HISTOGRAM` capture reconfirmed steady state is
+   *still* only the same ~4,400/sec `scePthreadMutexUnlock` ring-buffer heartbeat with `distinct=1`
+   every window - no other NID fires even once, so whatever would need to happen to write/wake
+   `+0xA8` has to originate from inside that one worker loop's own logic (or something it calls,
+   e.g. the peeked job's `execute()` vtable call) - nothing external is running that could do it.
+
+**Read on this**: the actual gate on frame 2 is now precisely `Loading.PreloadManager` stuck forever
+on `queue_obj+0xA8`, not a missing wake on the primordial thread's address (that wake genuinely
+fires, just isn't sufficient by itself). Last entry's disassembly of the ring-buffer worker loop
+noted, but did not further dig into, a "secondary flag condition" that gates whether the peeked job
+actually gets popped after `execute()` returns - that unexplored branch is now the leading
+candidate for where `+0xA8` should get written/woken from and currently doesn't. The JobSystem loop
+is therefore **not** fully a red herring after all - last entry correctly ruled out its literal
+queue-depth/mutex fields as the direct gate, but the object it operates on turns out to still be
+causally connected via this third field.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), three instrumented runs (90s + 180s + 60s) via
+`SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`/`SHARPEMU_LOG_GUEST_THREADS`/`SHARPEMU_LOG_SYNCADDR`/
+`SHARPEMU_LOG_NID_HISTOGRAM`/`SHARPEMU_LOG_MEM_U64`/`SHARPEMU_LOG_RET_ADDRS` (all pre-existing, no
+new diagnostics added this entry). No code changes - diagnostics-only investigation.
+`dotnet build` (Debug) clean; no test run needed this entry (no production code touched).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session): found the real gate -
+Loading.PreloadManager DOES wake the primordial thread once, then immediately self-blocks forever
+on a sibling address inside the SAME JobSystem struct investigated (and dismissed) last entry"
+section (and the section above it, the JobSystem-ring-buffer entry) for full background. Status:
+metal_slug boots, presents ONE frame, hangs forever. Two real synchronization bugs already fixed
+and verified in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake
+predicate + Monitor.PulseAll lost-wakeup race) - keep both.
+
+BIG reframe this entry: the primordial main thread's wait on 0x6080EE3D8 IS genuinely woken once by
+Loading.PreloadManager (guest thread handle 0x00007C8368A7A090, wake call at ret=0x800B05877) - this
+is normal, working futex semantics, not a bug (the guest's own poll loop just rechecks its real
+condition afterward and finds nothing else changed, so it waits again - expected). The REAL,
+confirmed-permanent gate is one hop upstream: immediately after firing that wake, PreloadManager
+itself calls sceKernelSyncOnAddressWait with an INFINITE timeout on 0x6080EE318 (ret=0x800B0588A)
+and never returns - confirmed via SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS across three captures (90s +
+180s + 60s, ~330s combined) that PreloadManager's import counter freezes at exactly 22900 forever
+and zero wakes ever target 0x6080EE318.
+
+0x6080EE318 = queue_obj+0xA8, INSIDE the same struct as the "JobSystem ring-buffer worker" object
+from the entry before this one (queue_obj=0x6080EE270, mutex at +0x110=0x6080EE380, depth counter at
++0x200=0x6080EE470, primordial thread's own wait at +0x168=0x6080EE3D8). Last entry correctly ruled
+out queue depth as a direct gate (confirmed steady at 1, ring-buffer semantics) - but the object
+itself is still causally connected via this different field. SHARPEMU_LOG_MEM_U64=0x6080EE318 over
+190,436 samples (~60s) showed the value pinned at 0 the whole time, never written, never woken.
+SHARPEMU_LOG_NID_HISTOGRAM (180s) reconfirmed nothing except the same ~4,400/sec
+scePthreadMutexUnlock ring-buffer heartbeat runs in steady state - distinct=1 every 2s window, no
+other NID fires - so whatever should write/wake +0xA8 must originate from inside that one worker
+loop (guest ~0x800B04E00-0x800B051E0) or something it calls.
+
+Next step (not yet attempted): last entry's disassembly of the ring-buffer worker noted a
+"secondary flag condition" (checked after the peeked job's execute() vtable call returns, gating
+whether the job actually gets popped/re-locked/removed) but did not record its exact branch address
+or dig into what sets it. That branch is now the leading candidate for where a write/wake to
+queue_obj+0xA8 (0x6080EE318) should come from and currently doesn't. Concretely: (1) re-disassemble
+0x800B04E00-0x800B051E0 (paused at a module EntryPoint, --debug-server mem + capstone via the venv
+technique below) specifically around the post-execute() comparison/branch, get its exact address,
+then use SHARPEMU_LOG_RET_ADDRS on it (or on whatever it calls when taken) to sample whether it's
+EVER taken during a long capture - if never, that's the smoking gun. (2) consider whether the
+peeked job's execute() vtable call ([rax+0x58]) itself depends on some other HLE call that's
+missing/wrong, causing it to always return false/0 and never reach the "job complete, notify" path -
+this would mean the real root cause is even further upstream than the worker loop itself. (3) it's
+still possible +0xA8 is meant to be written directly (not via SyncOnAddressWake) and the primordial
+/PreloadManager wait design expects a plain memory write it never sees rather than an explicit wake
+call - worth checking whether ANY write (not just SyncOnAddressWake) ever touches 0x6080EE318 across
+a long capture, which SHARPEMU_LOG_MEM_U64 alone can't distinguish from "wake never called" (it only
+samples at RET_ADDRS hit points, so a write between samples could be missed - consider a tighter
+sampling interval or a dedicated write-watch if one gets added).
+
+Tooling recap: all previous entries' tools remain valid and this entry used only existing ones -
+no new diagnostics added. SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1 and SHARPEMU_LOG_GUEST_THREADS=1
+(both pre-existing but newly useful this entry) are the highest-value tools for quickly
+distinguishing "genuinely blocked" from "busy" per-thread without disassembly - reach for these
+FIRST in future sessions before assuming a named thread (identified via crash-dump stack walk) is
+still doing what an old stack walk once showed. capstone disassembly requires a venv (system Python
+is externally-managed): `python3 -m venv <scratchpad>/venv && <scratchpad>/venv/bin/pip install
+capstone`, then `capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64).disasm(raw_bytes,
+base_addr)`. Remember debug-server's pause/breakpoints don't reliably interrupt an already-running
+thread; pause is only reliable at natural module EntryPoint stops. Always confirm no stray SharpEmu
+process before starting a new one. Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session, same day): pinned the exact never-taken branch in the ring-buffer worker, and found the whole JobSystem worker pool is a dead thread pool during the stall - not just this one loop
+
+Acted on this session's own previous entry's next step: disassembled the ring-buffer worker's
+post-`execute()` gating logic with exact addresses (via `--debug-server` + `SharpEmu.DebugClient`
+`mem`, paused at the natural `ModuleInitializer` stop for `libfmod.prx` - memory for not-yet-executed
+code is already mapped and readable at any pause point, confirmed again), then empirically confirmed
+which branch is actually taken via a fresh capture.
+
+**Finding:**
+
+1. Full disassembly of `0x800B04E00`-`0x800B051FF` (superseding/refining last entry's partial read)
+   shows the loop, after the peeked job's `execute()` vtable call (`[r15+0x58]`, matches before)
+   returns true, does a SECOND gate before the pop/notify path: `ebx = [r15+0x48]` (a field on the
+   peeked job, loaded before `execute()`) must equal `1`, AND a locally-computed flag `cl` (built
+   from bits of the job's pre-`execute()` state plus the return value of a second vtable call,
+   `[r15+0x30]`) must be `0`. Both checks are `jne 0x800b051ef` (straight to the function epilogue,
+   returning false, no pop/no notify) at exact addresses **`0x800B04F2D`** (`ebx==1` check) and
+   **`0x800B04F35`** (`cl==0` check). Only if both pass does execution reach **`0x800B04F3B`**,
+   which re-locks the queue mutex, pops the job (`call 0x8019b22b0`, a memmove-style shift),
+   decrements the depth counter, and eventually (after two more vtable calls and a refcount
+   `lock dec [r12+0xc]` hitting zero) reaches a plain guest-to-guest call at `0x800B051EA` to
+   `0x800808c80` with a group-id argument in `esi` - the leading candidate for "job group complete,
+   notify" (not further traced this entry, since the branch leading to it turned out to never
+   fire at all - see below).
+
+2. Instrumented the exact re-lock inside the pop path with
+   `SHARPEMU_LOG_RET_ADDRS=0x800B04E90,0x800B05B4A,0x800B04F4B` (the third address is the return
+   site immediately after the pop path's `call 0x8019b1740` at `0x800B04F46`) over a 90s capture:
+   **`0x800B04F4B` fired zero times**, while the loop's two already-known call sites fired 157,551
+   and 157,554 times respectively (~315k total iterations). **The pop/notify path is never taken,
+   not even once, in over 300k iterations of this loop.** This is the concrete, addressed version of
+   the "secondary flag condition" flagged as unexplored in the entry before this session's first
+   entry today.
+
+3. Cross-checked against `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS` data from earlier this session: the
+   17 `Job.Worker N` / `Background Job.Worker N` guest threads are each blocked on their own
+   semaphore-style wait slot (`0x600108D70`-`0x600108F80`, spaced `0x10` apart - a classic
+   per-worker wake-slot array). Grepped every `SHARPEMU_LOG_SYNCADDR` capture taken this session
+   (four runs, ~450s combined raw log) for any wake targeting that address range: **26 wakes found,
+   all from the same caller (`ret=0x0000000800A9FA82`), and all clustered within the first ~1,700
+   lines of a 526,800-line 90s capture - i.e. all at boot time, during the initial job dispatch.
+   Zero occur during the steady-state stall in any capture.** The entire Job.Worker thread pool was
+   given its first (and only) batch of real work at boot and has been fully asleep ever since.
+
+**Read on this, tying both findings together**: the ring-buffer worker loop investigated across the
+last three entries never sees a "real," completion-tracked job (`type==1` via `[job+0x48]`) not
+because of a bug in the loop itself, but most likely because **no new real jobs are ever being
+enqueued for it to find** - consistent with the Job.Worker pool being permanently dormant after
+boot. The loop's ~4,400/sec cycle is very likely churning through low-priority/heartbeat-type ring
+allocations only (`type != 1`), which is exactly what a healthy allocator subsystem would look like
+even while the actual game-logic JobSystem sits idle. This reframes the open question one more hop
+upstream, away from "what does this loop do wrong" (nothing, as far as traced) and toward: **what is
+supposed to periodically enqueue new work and wake a `Job.Worker` (via the `ret=0x800A9FA82` call
+site) during normal per-frame operation, and why does that never happen again after the initial
+boot-time batch?** Plausible candidates, not yet checked: the primordial main thread's own
+(currently stalled) per-frame loop is itself responsible for scheduling new batched jobs each frame
+(a common Unity pattern - `JobHandle.ScheduleBatchedJobs()` called from the main thread), which
+would make this a real circular dependency (primordial thread needs PreloadManager to finish
+loading -> PreloadManager needs a `type==1` job to complete -> that job needs a `Job.Worker` to run
+it -> workers need `ret=0x800A9FA82` to fire again -> that call is plausibly gated on the primordial
+thread's own per-frame loop, which never runs because it's still blocked on `0x6080EE3D8`). If true,
+this would mean the two "known-fixed, both correct" sync bugs and everything traced so far are all
+downstream symptoms of one real design/emulation gap still not located: either an HLE call that's
+supposed to keep re-arming this dispatch cycle independent of the main thread and doesn't, or a
+genuine circular wait that would also deadlock on real hardware unless something breaks the cycle
+via a mechanism not yet identified (e.g. a watchdog/timeout in Unity's own engine code, or the
+suspend-point watchdog thread from several sessions ago turning out to be relevant after all).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), one `--debug-server`/`SharpEmu.DebugClient`
+paused-read session (no code changes, memory reads only) plus one 90s instrumented capture via
+existing `SHARPEMU_LOG_RET_ADDRS`/`SHARPEMU_LOG_SYNCADDR` (no new diagnostics added this entry -
+all tools were already permanent from prior sessions). `dotnet build` (Debug) clean; no test run
+needed (no production code touched).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session, same day): pinned the exact
+never-taken branch in the ring-buffer worker, and found the whole JobSystem worker pool is a dead
+thread pool during the stall - not just this one loop" section (and the two sections above it) for
+full background. Status: metal_slug boots, presents ONE frame, hangs forever. Two real
+synchronization bugs already fixed and verified in
+src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake predicate +
+Monitor.PulseAll lost-wakeup race) - keep both.
+
+Chain established across this session's three entries, most-recent-first: (1) the ring-buffer
+worker loop at guest 0x800B04E00-0x800B051FF only pops/notifies a peeked job if [job+0x48]==1 AND a
+second flag (built from pre-execute() state + a [job+0x30] vtable call's return) is 0 - both gates
+verified via disassembly, both branch addresses are 0x800B04F2D and 0x800B04F35 (jne
+0x800b051ef=skip). Empirically confirmed via SHARPEMU_LOG_RET_ADDRS=...,0x800B04F4B over 90s /
+~315k loop iterations: the pop path is NEVER taken. (2) All 17 Job.Worker/Background Job.Worker
+guest threads are asleep on a per-worker semaphore array (0x600108D70-0x600108F80, stride 0x10);
+across ~450s of combined SHARPEMU_LOG_SYNCADDR captures this session, the only wakes targeting that
+range (26 total, all from ret=0x800A9FA82) happened at boot and never again. (3) (from the entry
+before this session) Loading.PreloadManager calls sceKernelSyncOnAddressWake(0x6080EE3D8) once
+(genuinely working, not a bug), then immediately blocks forever on 0x6080EE318
+(=queue_obj+0xA8, same struct as the ring-buffer worker's mutex/depth fields) waiting for a wake
+that never comes.
+
+Working theory, NOT yet confirmed: these three findings form one circular dependency - the
+primordial main thread's per-frame loop is itself responsible (a common Unity pattern) for
+re-arming the JobSystem dispatch (the ret=0x800A9FA82 call site) each frame, but that loop never
+runs because the primordial thread is still blocked on 0x6080EE3D8 waiting on PreloadManager, which
+is blocked on 0x6080EE318 waiting on a type==1 job completing, which needs a Job.Worker thread that
+needs ret=0x800A9FA82 to fire again. If this theory is right, real PS5 hardware must break this
+cycle via a mechanism not yet identified in this emulator - important to find what, since patching
+around it wrong could produce a fake-looking pass that doesn't reflect real hardware behavior.
+
+Next steps (not yet attempted): (1) find what guest code CALLS the ret=0x800A9FA82 site (the
+Job.Worker-wake function) - static disassembly around that return address, or
+SHARPEMU_LOG_REFSCAN_ADDRS on the function containing it, to identify its caller(s) and whether any
+caller is reachable from something other than the primordial thread's blocked main loop (if so, the
+circular-dependency theory is wrong and there's an independent re-arm path we're missing evidence
+for). (2) if the circular-dependency theory holds, investigate what real PS5 hardware/Unity would
+do differently - check whether the "AGC suspendPoint" watchdog thread (Thread-772FE4931F90, entry
+0x8014E9440, traced several sessions ago, still one of only ~3 threads shown Running in
+SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS output) has any code path that could independently re-arm the
+JobSystem or wake the primordial thread differently - it was cleared as "behaving normally" before
+but never checked specifically for this. (3) disassemble the plain guest call at 0x800B051EA (target
+0x800808c80, called with esi=group-id when the pop path IS taken) to understand what a successful
+group-complete notification would actually do, as a reference for confirming a fix later.
+
+Tooling recap: all tools remain valid, none new this entry
+(SHARPEMU_LOG_MEMSCAN_TEXT/REFSCAN_ADDRS/RET_ADDRS/SYNCADDR/NID_HISTOGRAM/NID_RET_SAMPLE/MEM_U64/
+GUEST_THREAD_SNAPSHOTS/GUEST_THREADS, guaranteed-AV-patch-at-paused-RIP technique,
+--debug-server + SharpEmu.DebugClient for paused memory reads - `mem <addr> <len>` works even for
+not-yet-executed code since it just reads mapped pages). capstone disassembly requires a venv
+(system Python is externally-managed): `python3 -m venv <scratchpad>/venv &&
+<scratchpad>/venv/bin/pip install capstone`, then `capstone.Cs(capstone.CS_ARCH_X86,
+capstone.CS_MODE_64).disasm(raw_bytes, base_addr)`. Remember debug-server's `pause`/breakpoints
+don't reliably interrupt an already-running thread; pause is only reliable at natural module
+EntryPoint/ModuleInitializer stops. Always confirm no stray SharpEmu process before starting a new
+one. Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session): the circular-dependency theory is REFUTED - the `ret=0x800A9FA82` wake site is a one-shot thread-pool bring-up handshake, not a per-frame JobSystem re-arm, and `Loading.PreloadManager` is one of its own callers
+
+Acted on this session's previous entry's next step (1): identify who calls the `ret=0x800A9FA82`
+site and whether it's reachable from anything other than the primordial thread's blocked
+per-frame loop. Took the cheap path first instead of disassembly/forced-crash REFSCAN: re-ran a
+75s capture with `SHARPEMU_LOG_SYNCADDR=1 SHARPEMU_LOG_GUEST_THREADS=1` and cross-referenced the
+`wake ... ret=0x800A9FA82` lines' `guest=` handles against the `Scheduled guest thread '<name>'
+handle=0x..` lines already logged by `SHARPEMU_LOG_GUEST_THREADS`.
+
+**Finding**: this capture caught 7 wakes to the `Job.Worker` semaphore array from `ret=0x800A9FA82`
+(fewer than the 26 seen in a longer 90s capture last session - same boot-time cluster, just a
+shorter window). Their `guest=` handles resolve to:
+- `guest=0x0` once (addr `0x600108D80`) - the host-thread-fallback path, most likely the
+  primordial thread itself, consistent with prior sessions' established meaning of `guest=0x0`.
+- `guest=0x0000755704C79710` once (addr `0x600108D90`) - **`Job.Worker 1`**.
+- `guest=0x0000755704A740D0` three times (addrs `0x600108EB0`/`EC0`/`ED0`) - **`Loading.PreloadManager`
+  itself**.
+- `guest=0x00007557048D6000` once (addr `0x600108EE0`) - **`Background Job.Worker 2`**.
+- `guest=0x00007557048D8AA0` once (addr `0x600108EF0`) - **`Background Job.Worker 3`**.
+
+This **directly refutes** last entry's working theory as stated: the caller of `ret=0x800A9FA82`
+is not the primordial main thread's per-frame loop - it's `PreloadManager` and several
+`Job.Worker`/`Background Job.Worker` threads waking each other (and being woken) as part of
+one-shot thread-pool bring-up, all within the first couple thousand lines of every capture
+(i.e. purely at thread-creation time). The primordial thread's real per-frame loop
+(`0x8042D88C0`, identified many sessions ago) never gets anywhere near running before the hang,
+so it cannot be "responsible" for a call site that only ever fires during boot regardless.
+
+**Bonus, unplanned but load-bearing finding**: `Loading.PreloadManager`'s own `Scheduled guest
+thread` log line reads `entry=0x0000000800BFACC0 arg=0x00000006080EE270` - and `0x6080EE270` is
+*exactly* `queue_obj`, the same ring-buffer-worker struct computed and disassembled across the
+last three entries (mutex at `+0x110`, depth at `+0x200`, PreloadManager's own eventual wait
+target at `+0xA8` = `0x6080EE318`). Every other worker thread (`Job.Worker 1` arg=`0x6013F9868`,
+`Background Job.Worker 2` arg=`0x601498610`, `Background Job.Worker 3` arg=`0x601498678`) gets a
+*different* per-thread struct pointer as its `arg`, confirming `entry=0x800BFACC0` is a shared
+generic thread-bootstrap trampoline (role determined by the per-thread arg struct, not by the
+entry address), and that `PreloadManager` is architecturally *the owner/manager thread of the
+exact queue object* investigated all this session - not a coincidentally-adjacent bystander.
+This was suspected in spirit but not nailed down with hard evidence until this correlation.
+
+**Reframed open question**: since the wake site is confirmed one-shot/by-design and not the
+missing link, the actual gap is still exactly where the entry before this one left it -
+something is supposed to enqueue a real, completable (`type==1`) job into `queue_obj`
+(`0x6080EE270`) and ultimately wake `queue_obj+0xA8` (`0x6080EE318`), and nothing currently does.
+Given `PreloadManager` itself is blocked (parked, not spinning) while the `0x800B04E00` ring-buffer
+loop keeps cycling against the *same* `queue_obj` at ~4,400/sec, the loop's execution must belong
+to some *other* thread than `PreloadManager` (which cannot be simultaneously blocked and
+spinning) - most likely one of the generic `Job.Worker N`/`Background Job.Worker N` pool threads
+picking up `queue_obj` as one of potentially several queues it services. Which thread actually
+executes that loop, and what would need to enqueue a real job into `queue_obj` for it to ever
+observe `type==1`, is still unidentified and is now the most direct remaining lead - more direct
+than the AGC suspend-point watchdog tangent, which remains a fallback if this doesn't pan out.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), one 75s instrumented capture via
+`SHARPEMU_LOG_SYNCADDR=1 SHARPEMU_LOG_GUEST_THREADS=1` (both pre-existing, no new diagnostics).
+No code changes - diagnostics-only. `dotnet build SharpEmu.slnx -c Debug` clean (0 errors, 0
+warnings) before the capture; no test run needed (no production code touched).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session): the circular-dependency
+theory is REFUTED - the ret=0x800A9FA82 wake site is a one-shot thread-pool bring-up handshake,
+not a per-frame JobSystem re-arm, and Loading.PreloadManager is one of its own callers" section
+(and the section above it, the three-entry circular-dependency chain) for full background.
+Status: metal_slug boots, presents ONE frame, hangs forever. Two real synchronization bugs
+already fixed and verified in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs
+(spurious-wake predicate + Monitor.PulseAll lost-wakeup race) - keep both.
+
+BIG reframe this entry: the previous entry's working theory (primordial thread's per-frame loop
+responsible for re-arming JobSystem dispatch via the ret=0x800A9FA82 call site, forming a
+circular deadlock) is REFUTED by direct evidence, not disassembly - a 75s
+SHARPEMU_LOG_SYNCADDR=1 SHARPEMU_LOG_GUEST_THREADS=1 capture showed the 7 (of an eventual ~26)
+boot-time wakes to the Job.Worker semaphore array all come from ordinary thread-pool bring-up:
+guest=0x0 (likely primordial, once), Job.Worker 1 (once), Background Job.Worker 2 and 3 (once
+each), and Loading.PreloadManager ITSELF (three times). This is a one-shot startup handshake
+across pool threads, not a per-frame dispatch re-arm - it was never going to fire again
+regardless of whether the primordial thread's per-frame loop ever runs. The circular-dependency
+theory as stated is dead; do not pursue it further.
+
+New load-bearing fact: Loading.PreloadManager's own `Scheduled guest thread` line shows
+entry=0x0000000800BFACC0 arg=0x00000006080EE270 - arg is EXACTLY queue_obj, the ring-buffer
+worker struct examined across the three entries before this one (mutex at queue_obj+0x110,
+depth at +0x200, PreloadManager's eventual permanent-block target at +0xA8 = 0x6080EE318). Other
+worker threads (Job.Worker 1, Background Job.Worker 2/3) each get a DIFFERENT per-thread arg
+struct at the same shared entry point 0x800BFACC0, confirming entry=0x800BFACC0 is a generic
+thread-bootstrap trampoline whose role is determined by the arg struct, not the entry address -
+and confirming PreloadManager is the actual owner/manager of queue_obj, not a coincidental
+neighbor.
+
+Next step (not yet attempted): PreloadManager itself is confirmed BLOCKED (parked in
+sceKernelSyncOnAddressWait, not spinning) while the 0x800B04E00-0x800B051FF ring-buffer loop
+keeps cycling against the SAME queue_obj at ~4,400/sec (established two entries ago via
+SHARPEMU_LOG_MEM_U64 + SHARPEMU_LOG_RET_ADDRS). Since PreloadManager cannot be both blocked and
+the one spinning, some OTHER thread - most likely one of the ~29 Job.Worker N / Background
+Job.Worker N pool threads - must be the one actually executing that loop against queue_obj,
+presumably servicing it as one of several queues it round-robins. Concretely: (1) find which
+guest thread is executing the 0x800B04E00 loop - e.g. correlate SHARPEMU_LOG_RET_ADDRS hits at
+0x800B04E90/0x800B05B4A against SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS output taken in the SAME
+capture window (snapshots include a `ret=` field per thread - look for whichever thread's
+snapshot `ret=` lands inside 0x800B04E00-0x800B051FF, or whichever thread's `state` is
+Running/Runnable rather than Blocked during steady state). (2) once that thread is identified,
+determine what would need to happen for queue_obj to ever receive a real type==1 job - check
+whether that thread also independently services OTHER queues that DO get real work (to compare
+"working queue" behavior against this "stuck queue" and spot what's different/missing), or
+whether nothing in the entire guest binary ever calls whatever enqueue function targets
+queue_obj specifically (a SHARPEMU_LOG_REFSCAN_ADDRS pass targeting queue_obj=0x6080EE270 or its
+mutex/depth field addresses directly, via the guaranteed-AV-patch-at-paused-RIP forced-crash
+technique - REFSCAN only runs from the crash-dump handler, confirmed this session, and only
+catches direct E8/E9 references, not indirect ones, so a null result is inconclusive, not
+proof). (3) the AGC suspend-point watchdog thread (entry 0x8014E9440) lead is now a lower-
+priority fallback, not the leading candidate, since this entry found a more direct, evidence-
+backed thread to keep chasing (the queue_obj's actual worker) - but keep the watchdog lead in
+reserve in case this new lead dead-ends too.
+
+Tooling recap: all tools remain valid, none new this entry (SHARPEMU_LOG_MEMSCAN_TEXT/
+REFSCAN_ADDRS/RET_ADDRS/SYNCADDR/NID_HISTOGRAM/NID_RET_SAMPLE/MEM_U64/GUEST_THREAD_SNAPSHOTS/
+GUEST_THREADS, guaranteed-AV-patch-at-paused-RIP technique, --debug-server + SharpEmu.DebugClient
+for paused memory reads). New understanding this entry (not a new tool, a clarified constraint):
+SHARPEMU_LOG_REFSCAN_ADDRS (DirectExecutionBackend.Exceptions.cs) only runs from the unhandled-
+guest-exception crash-dump handler - it is NOT a live/streaming diagnostic, so using it requires
+deliberately forcing a crash via the guaranteed-AV-patch-at-paused-RIP technique (pause at a
+natural module EntryPoint/ModuleInitializer stop, write 8B042500001000 at the current RIP, then
+continue); its call-site pass only catches direct E8/E9 calls, never indirect/vtable calls, so a
+null result must be read as inconclusive rather than "no caller exists". SharpEmu.DebugClient has
+exactly one paused frame at a time (no per-thread register/selection support), but its `mem <addr>
+<len>` command reads any committed guest address regardless of pause point or execution history.
+capstone disassembly requires a venv (system Python is externally-managed): `python3 -m venv
+<scratchpad>/venv && <scratchpad>/venv/bin/pip install capstone`, then
+`capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64).disasm(raw_bytes, base_addr)`. Always
+confirm no stray SharpEmu process before starting a new one. Repro: `dotnet build SharpEmu.slnx
+-c Debug`, run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add
+--debug-server for live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session, continued): the primordial thread itself runs the ring-buffer loop, the peeked job is a REAL static job (not a rotating heartbeat), gate 1 is satisfied in steady state, and gate 2's dependency (`[job+0x30]`) is permanently NULL
+
+Continued straight from the previous entry's next step, but pivoted from "which pool thread runs
+the loop" (a `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS` correlation, which came back empty - see below)
+to a more direct register-level correlation, and it paid off immediately.
+
+**Finding 1 - the primordial thread itself executes the `0x800B04E00` ring-buffer loop.**
+`SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS` alone couldn't answer this: across a 40s/1689-snapshot
+capture, every snapshot's `ret=` fell into one of only 9 buckets, none inside
+`0x800B04E00`-`0x800B051FF` - the snapshotter apparently only captures each thread's *last
+blocking-related* call site, not literally "current RIP," so a thread spinning through rapid
+non-blocking mutex lock/unlock calls never shows up there. Switched approach: added `guest=`
+(`GuestThreadExecution.CurrentGuestThreadHandle`, `[ThreadStatic]`) and `managed=`
+(`Environment.CurrentManagedThreadId`) to the existing `SHARPEMU_LOG_RET_ADDRS` "RetAddrHit" log
+line in `DirectExecutionBackend.Imports.cs` (previously only `NidRetSample` had `guest=`) - this
+required editing **two separate** import-dispatch log call sites in that file (there are two
+independent dispatch code paths; `scePthreadMutexUnlock` goes through one, `sceKernelSyncOnAddressWait`'s
+`ORBIS_GEN2_ERROR_TIMED_OUT` result-log goes through the other - each needed its own edit to see
+`guest=`/`managed=`). Result, same 20s capture: **every one of 24,616 ring-buffer-loop hits
+(`ret=0x800B04E90`/`0x800B05B4A`) shows `guest=0x0 managed=4`, and every one of 5,470
+`sceKernelSyncOnAddressWait` timeout hits (`rdi=0x6080EE3D8`) ALSO shows `guest=0x0 managed=4`** -
+the exact same single host OS thread runs both. Since `guest=0x0` means "this OS thread never
+called `EnterGuestThread`" (a `[ThreadStatic]`, so this is a hard, non-probabilistic signal, not
+guesswork), and this is the same thread previously established to be polling the primordial
+thread's own wait address, **the primordial thread is the one pumping/servicing `queue_obj`'s ring
+buffer on every poll-retry cycle** - a legitimate "help drain the queue while waiting" pattern,
+not a bug by itself.
+
+**Finding 2 - the peeked job pointer is CONSTANT, not rotating - overturning two entries ago's
+"perpetual allocator heartbeat" read.** Added `rax`/`r15` to the same RetAddrHit line (disassembly
+two entries ago named `r15` as the job pointer at the `execute()` vtable call). Across every
+sample at `ret=0x800B04E90` (the peek/unlock return site, before `execute()` runs): **`r15` is
+bit-for-bit identical every single time (`0x00000006080ECC10`)**, while the previously-noted `rsi`
+ring-buffer cursor keeps incrementing normally in the same samples. This means the loop peeks the
+*same job* every iteration, not a rotating sequence of ring-buffer slots as the "bump
+allocator/self-recycling heartbeat" theory (two entries ago) concluded - that theory is now
+itself superseded. (The earlier wraparound evidence for `rsi` was real and is not in question;
+it just wasn't evidence about *which job* gets peeked, which is what actually mattered.)
+
+**Finding 3 - gate 1 (`[job+0x48]==1`) is satisfied throughout steady state; the job is real, not
+a placeholder.** Since `r15` is now known to be a fixed address, its fields could be read directly
+with the *existing* `SHARPEMU_LOG_MEM_U64` tool (no new diagnostic needed) at
+`r15+0x48 = 0x6080ECC58`. Result: **starts at low-dword `0` for the first 121 samples (early
+boot), then flips to `1` and stays `1` for the remaining 1,503 samples of a ~15s capture** -
+i.e. gate 1 passes for effectively the entire steady-state stall. This is real, ready job state,
+not an ever-`0` heartbeat/non-job entry.
+
+**Finding 4 - gate 2's likely dependency, `[job+0x30]`, is permanently NULL.** Read
+`r15+0x30 = 0x6080ECC40` the same way over a 22s capture: **`0x0000000000000000` in all 16,544
+samples, no exceptions.** Given the earlier disassembly's description of gate 2 as "`cl` built
+from pre-`execute()` state plus the return value of a second vtable call, `[r15+0x30]`", a
+permanently-null `[job+0x30]` is the leading candidate for **the actual root cause**: this looks
+like an unset completion-callback/continuation pointer (or similar per-job vtable/delegate slot)
+that something is supposed to populate and never does, most plausibly causing `cl` to never
+resolve to the `0` value gate 2 requires.
+
+**Read on this, combined**: gate 1 (`[job+0x48]==1`) is satisfied; the real, remaining, addressed
+blocker is gate 2, and its likely direct cause is `[job+0x30]` never being written. This is a
+much sharper, more falsifiable target than "some secondary flag condition" - the next step is
+disassembling exactly what `[job+0x30]` is used for at `0x800B04F35` (is it dereferenced/called
+directly, or null-checked first?) and, separately, finding whatever guest code is supposed to
+write a non-null value there (most likely something PreloadManager or its job-creation path
+should have done at job-construction time, before ever enqueuing it).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), five short instrumented captures (12-22s
+each) via `SHARPEMU_LOG_RET_ADDRS`/`SHARPEMU_LOG_MEM_U64`/`SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`
+(all pre-existing). **Code changed this entry**: `guest=`/`managed=`/`rax=`/`r15=` fields added to
+three existing trace log lines in `DirectExecutionBackend.Imports.cs` (two `RetAddrHit`-adjacent
+sites plus the `ORBIS_GEN2_ERROR_TIMED_OUT` result-log site) - diagnostics-only, no behavior
+change. `dotnet build SharpEmu.slnx -c Debug` and `-c Release` both clean (0 errors; 1
+pre-existing unrelated warning in `BmiInstructionEmulator.cs`, not touched this entry).
+`dotnet test SharpEmu.slnx -c Release`: 499/499 (plus 27/27 and 33/33 in other test projects),
+unaffected.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session, continued): the primordial
+thread itself runs the ring-buffer loop, the peeked job is a REAL static job (not a rotating
+heartbeat), gate 1 is satisfied in steady state, and gate 2's dependency ([job+0x30]) is
+permanently NULL" section (and the section above it, the ret=0x800A9FA82 refutation) for full
+background. Status: metal_slug boots, presents ONE frame, hangs forever. Two real synchronization
+bugs already fixed and verified in src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs
+(spurious-wake predicate + Monitor.PulseAll lost-wakeup race) - keep both.
+
+Chain established across today's five entries, most-recent-first: (1) the ring-buffer worker loop
+at guest 0x800B04E00-0x800B051FF (executed by the PRIMORDIAL thread itself, confirmed via
+guest=0x0 managed=4 matching exactly its own known sceKernelSyncOnAddressWait timeout polling)
+always peeks the exact SAME job pointer (r15=0x6080ECC10, verified constant across 1600+ samples -
+NOT a rotating allocator heartbeat as previously believed). (2) That job's [job+0x48] field
+(gate 1, "ebx==1" check at 0x800B04F2D) is 1 throughout steady state (only 0 briefly at boot) -
+real, ready job state. (3) That job's [job+0x30] field is permanently NULL (0x0) across 16,544
+samples - the leading suspect for why gate 2 ("cl==0" check at 0x800B04F35, built partly from a
+vtable call through/related to [r15+0x30]) never passes, meaning the pop/notify path
+(-> eventual wake of Loading.PreloadManager's queue_obj+0xA8 = 0x6080EE318) never fires. (4) The
+ret=0x800A9FA82 Job.Worker-pool wake site (chased hard in earlier entries today) is CONFIRMED a
+one-shot boot-time thread-bringup handshake (called by PreloadManager itself among others), not a
+per-frame re-arm mechanism - that lead is closed, don't reopen it without new evidence.
+
+Next step (not yet attempted): (1) disassemble exactly how [r15+0x30] is used at/around
+0x800B04F35 - is it null-checked before being treated as a callable/vtable, or does something
+crash-guard around a null call? This determines whether "permanently null" is itself sufficient
+explanation, or whether there's a different specific comparison happening. Use --debug-server +
+SharpEmu.DebugClient `mem` + capstone (venv at <scratchpad>/venv), paused at a natural
+EntryPoint/ModuleInitializer stop - mem reads work on any committed address regardless of
+execution history. (2) once the exact use of [r15+0x30] is understood, find what guest code is
+SUPPOSED to write a non-null value there - most likely something in PreloadManager's own
+job-construction/enqueue path (arg=0x6080EE270 was PreloadManager's own thread-creation arg,
+matching queue_obj) that should set a completion-callback/continuation pointer on the job at
+creation time and apparently never does. Consider SHARPEMU_LOG_REFSCAN_ADDRS (crash-dump-only,
+needs the guaranteed-AV-patch-at-paused-RIP technique to force a scan) targeting the job's fixed
+address 0x6080ECC10 or the field address 0x6080ECC40 directly - remember it only catches direct
+E8/E9 references, not indirect ones, so a null result is inconclusive. (3) once a real root cause
+is identified (a specific missing HLE call, a wrong constant somewhere, or similar), confirm
+whether it's a genuine SharpEmu HLE gap (something the emulator should be doing but isn't) before
+writing any fix, per the standing caution against patching around symptoms in a way that produces
+a fake-looking pass not reflecting real hardware behavior.
+
+Tooling recap: all previous tools remain valid. New this session (permanent): `guest=`/`managed=`
+fields added to the `RetAddrHit` log line and to the `ORBIS_GEN2_ERROR_TIMED_OUT`-result log line
+in `DirectExecutionBackend.Imports.cs` (there are two separate import-dispatch log sites in that
+file - `scePthreadMutexUnlock`-style calls hit one, `sceKernelSyncOnAddressWait`-style
+error-result logging hits the other; both were edited to add these fields). `rax=`/`r15=` also
+added to the `RetAddrHit` line specifically. All are plain diagnostic string-interpolation
+additions, no behavior change. Reminder: `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`'s `ret=` field
+reflects each thread's last *blocking-related* call site, not literally "current RIP" - it will
+not show hot/spinning-but-non-blocking loops; use `SHARPEMU_LOG_RET_ADDRS` + `guest=`/`managed=`
+correlation instead for that. `SHARPEMU_LOG_MEM_U64` can read fields of a *fixed* address derived
+from a previously-observed-constant register value (e.g. `r15+0x48`) once you know the register
+is stable across iterations - no new register-relative-read tooling was needed or added this
+session, since the job pointer turned out to be constant; if a future lead needs to dereference a
+register that varies per-iteration, that would require a genuinely new diagnostic (not yet
+built). Always confirm no stray SharpEmu process before starting a new one. Repro: `dotnet build
+SharpEmu.slnx -c Debug`, run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug
+eboot.bin>` (add --debug-server for live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session): fixed three real, independently-confirmed bugs prompted by a colleague's fixes for a different Unity/IL2CPP PS5 title in a different emulator fork - not directly the metal_slug hang, but real, systemic correctness gaps
+
+The user relayed four fixes a colleague made elsewhere: (1) `sceKernelMprotect` failing across
+multiple adjacent host reservations, (2) missing `/dev/urandom` causing Unity to spin forever on
+a misread `ENOENT`, (3) `TryRead`/`TryWrite`/`TryCompare`/`TryCopy` failing the same way across
+adjacent reservations (stale-data bugs post-boot), (4) an unbounded flip queue causing input lag.
+Investigated each directly against SharpEmu's actual code (not assumed) before touching anything.
+
+**(4) already mitigated** - `VulkanVideoPresenter.cs:361` already has a hardcoded
+`MaxPendingGuestFlipVersions = 4` bounded queue with a drain loop (`:1557-1560`). Not touched.
+
+**(1) and (3) are the same root bug pattern, confirmed real, now fixed in two places:**
+- `sceKernelMprotect`'s real path is `HostMemory.cs`'s `Posix.Protect` (**not**
+  `PhysicalVirtualMemory.TryProtect`, which turned out to be dead code with respect to the
+  mprotect syscall - no callers besides its own interface declaration). `Posix.Protect` required
+  the *entire* requested range to fall inside one single tracked `Region` (one per host
+  `mmap()`/`Alloc()` call, keyed in a `SortedList<ulong, Region>`, never coalesced even when
+  adjacent) - spanning two adjacent-but-separately-allocated regions returned `false` before ever
+  calling the real `mprotect(2)`. Fixed by walking forward through back-to-back regions (no gap)
+  to validate the whole range is actually mapped, then calling the real `mprotect(2)` once over
+  the combined range (unchanged single syscall) and looping only the *bookkeeping* step
+  (`SetProtectRangeLocked`) once per covering region. New tests in
+  `tests/SharpEmu.Libs.Tests/Memory/HostMemoryProtectTests.cs` (real `mmap`-backed, not faked)
+  confirm both the fix (spans two real adjacent regions, succeeds) and that a genuine gap still
+  correctly fails - verified by reverting the fix and confirming the success test (only) fails.
+- `PhysicalVirtualMemory.cs`'s `TryRead`/`TryWrite`/`TryCompare`/`TryCopy` (plus their
+  `TryReadExclusive`/`TryWriteExclusive` write-lock fallbacks) had the identical pattern one layer
+  up, via a private `FindRegion(address, size)` requiring one single covering region. Highest-risk
+  real trigger: the libc `memcpy`/`memmove` HLE shims (`KernelMemoryCompatExports.cs:1100,1128`),
+  called with fully guest-controlled address/length by IL2CPP/Mono GC and any native code copying
+  between `sceKernelMmap`-backed buffers - which never coalesce into one region. Since this system
+  is purely identity-mapped (region lookup exists only for bounds/commit/protection validation,
+  never address translation), the fix adds one new fallback helper,
+  `FindContiguousRegionSpan`, that walks back-to-back regions covering the requested range
+  (returning null on any gap), and each of the six methods now runs its *existing* per-region
+  commit/protection logic once per covering segment before doing **one** combined
+  `Buffer.MemoryCopy`/`SequenceEqual`/`Span.CopyTo` over the full original range - no bounce buffer
+  needed, and the single-region hot path is completely untouched (verified: all 8 pre-existing
+  tests in `PhysicalVirtualMemoryTests.cs` pass byte-for-byte unmodified). The two write-lock
+  exclusive fallbacks fully recompute their own segment list from scratch (never reuse one
+  computed under the read lock - TOCTOU: another thread could free/reallocate a region between
+  lock acquisitions) and correctly roll back partially-elevated protection across segments on a
+  later segment's failure. 10 new tests added covering cross-boundary read/write/compare/copy
+  (including a three-region case and a `TryCopy` case with independently-misaligned source/dest
+  splits), genuine-gap failures (asserting no partial mutation), and a protection-elevation case
+  across two regions (one made read-only via the ELF-loader `Map` path) - all 10 verified to fail
+  against the pre-fix code (only the cross-boundary *success* cases fail pre-fix, as expected; the
+  gap-failure cases correctly pass either way, since that failure mode was already correct).
+
+**(2) is a real, confirmed gap - but no evidence it's involved in metal_slug's current hang.**
+`ResolveGuestPath`/`KernelOpenUnderscore` had no `/dev/` handling at all; an unrecognized path
+fell through to a real filesystem open attempt and came back `ENOENT`. Grepped a full ~20,151-line
+metal_slug capture (`mslug.log`) for `urandom`/`/dev/`/`ENOENT`/`open` activity anywhere near the
+hang: nothing - the hang is entirely the already-tracked `SyncOnAddressWait` timeout loop. This is
+general robustness work, not a metal_slug fix. Also checked, and ruled out as a non-issue, a
+suspected related bug ("`sceKernelOpen` never sets guest `Rax` on its file-not-found path,
+unlike `PosixOpenCore`/`open()`") - turned out to be a non-issue: `DirectExecutionBackend.
+Imports.cs:560-565` has a `ClearRaxWriteFlag`/`WasRaxWritten` fallback that auto-propagates an
+export's C# return value into guest `Rax` whenever the export doesn't set it explicitly, so this
+was already handled correctly - no fix needed, and none made (verified by reading the fallback
+before writing unnecessary code).
+Fixed `/dev/urandom`/`/dev/random`/`/dev/srandom` as virtual devices: widened `_openFiles` from
+`Dictionary<int, FileStream>` to `Dictionary<int, Stream>` (a **partial class** shared with
+`KernelFileExtendedExports.cs`, which required parallel fixes there for `pread`/`pwrite`/`fsync`/
+`sync`'s `FileStream`-specific `.SafeFileHandle`/`Flush(flushToDisk:)` usage - each now branches
+on `stream is FileStream` and falls back to the generic `Stream` read/write/flush for synthetic
+device fds), added a small `RandomDeviceStream : Stream` (reads fill with
+`RandomNumberGenerator.Fill`, writes are accepted and discarded, `Seek`/`SetLength`/`Position`
+throw `IOException` - not `NotSupportedException` - matching what every existing `_openFiles` call
+site already catches), and wired detection into `KernelOpenUnderscore` before the real-filesystem
+path. New tests in `KernelMemoryCompatExportsTests.cs` cover open/read/close and independent-fd
+reuse. **Important caveat found while verifying the tests against pre-fix code**: on this Linux
+dev machine, `/dev/urandom` and `/dev/random` tests *passed even without the fix*, because
+`ResolveGuestPath` doesn't sandbox `/dev/` paths at all - the old code was accidentally falling
+through to the **real host device file** (which genuinely exists at that path on Linux). Only
+`/dev/srandom` (no such conventional host device) actually caught the pre-fix regression. This
+means the fix's real value on Linux is arguably less about closing an ENOENT-spin gap (which may
+not have been reachable there) and more about **closing an unintended, unfiltered guest-to-real-
+host-device pass-through** - portability (Windows/macOS/sandboxed CI lack `/dev/urandom` entirely)
+and isolation both benefit regardless.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug) - confirmed still boots and presents the first
+frame after all three fixes combined, hang unchanged (expected; none of these fixes target the
+hang investigation directly). `dotnet build` (Debug + Release) clean throughout (one pre-existing,
+unrelated warning: `Ngs2Exports.cs:530` CA2014 stackalloc-in-loop, not touched this entry).
+`dotnet test SharpEmu.slnx -c Release`: 27+516+33 = 576, all passing (65 new tests added this
+entry: 2 in `HostMemoryProtectTests.cs`, 10 in `PhysicalVirtualMemoryTests.cs`, 5 in
+`KernelMemoryCompatExportsTests.cs` - the arithmetic works out to 516 = 499 baseline + 17 new,
+matches). Every new test was verified against the pre-fix code specifically (via `git stash` on
+just the relevant file) to confirm it actually catches the regression, not just passes vacuously.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session): fixed three real,
+independently-confirmed bugs prompted by a colleague's fixes for a different Unity/IL2CPP PS5
+title in a different emulator fork" section for what changed, then the "Follow-up (2026-07-21,
+later session, continued): the primordial thread itself runs the ring-buffer loop..." section (and
+the one above it) for the still-open metal_slug hang investigation, which this entry did NOT
+advance - it was a deliberate detour into real, unrelated correctness bugs the user surfaced from
+external prior art. Status: metal_slug boots, presents ONE frame, hangs forever, unchanged by this
+entry. Two real synchronization bugs already fixed and verified in
+src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake predicate +
+Monitor.PulseAll lost-wakeup race) - keep both.
+
+This entry fixed, verified, and tested three unrelated real bugs: (1) sceKernelMprotect failing
+across multiple adjacent host memory reservations (HostMemory.cs's Posix.Protect - NOT
+PhysicalVirtualMemory.TryProtect, which is dead code for this path), (2) TryRead/TryWrite/
+TryCompare/TryCopy in PhysicalVirtualMemory.cs having the identical bug one layer up (new
+FindContiguousRegionSpan fallback, highest real risk via the memcpy/memmove HLE shims), and (3)
+/dev/urandom/random/srandom virtual device support (RandomDeviceStream, wired into
+KernelOpenUnderscore, required widening _openFiles from FileStream to Stream with matching
+fallback branches in KernelFileExtendedExports.cs's pread/pwrite/fsync/sync). All three were
+independently confirmed as real via direct code reading (not assumed from the colleague's
+description), and all have new regression tests verified to actually fail against the pre-fix
+code. None of these were shown to be involved in metal_slug's hang - functional check after all
+three confirmed metal_slug still boots and presents frame 1, hang unchanged.
+
+Next step for the metal_slug hang specifically (carried over, not attempted this entry):
+disassemble exactly how the ring-buffer worker loop's gate-2 vtable call
+(guest ~0x800B04F09, `call qword ptr [rax+0x30]` where rax is the peeked job's vtable pointer)
+behaves - does it ever return true, and what does the "pre-execute() state" byte (loaded from
+[rbp-0x40], tested via bits 0/1 at guest ~0x800B04F18-F24) actually contain across iterations? The
+job pointer is confirmed constant (0x6080ECC10) and its [+0x48] flag is confirmed 1 in steady
+state, so gate 1 passes - gate 2's exact failure mode (via the vtable call's return value, not a
+raw memory field as an earlier entry this session initially misread it) is the last unresolved
+piece. See the "primordial thread itself runs the ring-buffer loop" entry's tooling notes for
+exactly how r15/rax were captured live via SHARPEMU_LOG_RET_ADDRS's guest=/managed=/rax=/r15=
+fields (all still permanent/valid) - the same technique (adding a register field to an existing
+RetAddrHit-style log line) could be extended to capture al/dl at a suitable import-adjacent point,
+though note this session found the debug-server's `break`/`add-breakpoint` command does NOT
+reliably fire on hot-loop addresses either (same limitation as `pause`) - stick to the
+RET_ADDRS+register-field technique or the guaranteed-AV-patch-at-paused-RIP crash-dump technique,
+not live breakpoints, for capturing state at a specific guest code address.
+
+Tooling recap: all previous tools remain valid. New this entry: none (diagnostics same as before);
+this was a code-fix entry, not an investigation entry. Confirmed working precisely this entry:
+`SharpEmu.DebugClient`'s `write <addr> <hex-bytes>` command for the guaranteed-AV-patch technique,
+and that `break`/`add-breakpoint` reliably installs but does NOT reliably fire on an
+already-executing hot loop (tested directly this entry: a breakpoint set on
+0x800B04F33 before ever resuming from the initial EntryPoint pause still never fired after 15+
+seconds of the loop running at ~4,400/sec - do not rely on it for hot addresses in future
+sessions). Always confirm no stray SharpEmu process before starting a new one (note: other games'
+SharpEmu processes, e.g. a concurrent subnautica run, may legitimately be running alongside a
+metal_slug session started by someone else - check the command line, not just process existence,
+before assuming it's stray). Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session): the planned gate-2 register capture is blocked by a real, reproducible crash that only manifests under --debug-server - and the crash's own diagnostics reveal the ring-buffer function is bigger than previously mapped, plus strong evidence of reentrancy into the same queue-locking logic
+
+Picked up the previous entry's plan: capture `al` (the vtable-call return at guest `0x800B04F09`)
+and `dl` (the "pre-execute() state" byte) via the guaranteed-AV-patch technique, patching
+`0x800B04F16` (right after both are set, before either matters) with `mov eax,[0x00100000]` -
+chosen specifically because a faulting load leaves its destination register unmodified, so `EAX`
+should survive into the crash dump holding the vtable call's real return value.
+
+**The patch never fired.** After the loop reached steady state (~837,000 imports, matching prior
+sessions' timing), no crash occurred - meaning the code path containing `0x800B04F16` (which is
+only reached if the *first* vtable call, `execute()` at `0x800B04EE7` `[rax+0x58]`, returns
+non-zero) is never entered at all. This is a stronger, more precise version of an earlier
+suspicion: **gate 2 isn't just failing, it's dead code** - `execute()` itself must always be
+returning false for the perpetually-stuck job, which is the actual, more fundamental blocker
+(gate 1's `cmp ebx,1` check at `0x800B04F2A` is *also* unreached for the same reason - it sits
+inside the same `execute()==true` branch - so last session's "gate 1 satisfied" finding, while an
+accurate reading of the raw memory value, was never actually load-bearing).
+
+**Redirected the patch one level earlier**, to `0x800B04EEA` (`mov r14d, eax`, unconditionally
+reached right after `execute()` returns, regardless of its result) using `mov ecx,[0x00100000]`
+(a different destination register, so as not to clobber `EAX` before the crash dump could read
+it). **This is where things went sideways**: instead of firing on this address, the process hit a
+completely unrelated, genuine SIGSEGV (null-pointer write, `AV target: 0x0`) at guest
+`0x800B04EB0` - reproducible byte-for-byte across three separate fresh runs, at almost exactly the
+same import count (~721,500-723,000) every time.
+
+**Ruled out my own patches as the cause**: confirmed via `mem` readback that a routing patch
+(overwriting the `je` at `0x800B04E92` with an unconditional `jmp`, specifically to skip over the
+block containing `0x800B04EB0`) was correctly applied before continuing - the exact same crash
+still happened at the exact same address regardless. Confirmed via a 30-second plain run (no
+`--debug-server` at all) that this crash does **not** occur in normal operation within the same
+time window past this point. This means either the crash is a genuine, timing-dependent bug that
+`--debug-server`'s overhead happens to expose (most likely, see below), or my mental model of
+which code executes when is still incomplete.
+
+**Disassembling the crash's full context revealed the loop function is bigger than mapped**: read
+`0x800B04D80` onward fresh via `--debug-server` `mem` + capstone (this function is entered via a
+call, its start is somewhere before `0x800B04D80`, not yet found). The portion from
+`0x800B04DAB` to `0x800B04E39` - never previously disassembled - **constructs/recycles a job
+object into a pool** (setting several fields including two self-referential/list-linkage pointers)
+and calls an allocator/pool function at `0x8014ed000`, *before* the previously-known
+lock-queue-mutex/peek-head logic (`0x800B04E39` `lea r13,[rbx+0x110]` onward, matching the
+already-established mutex-at-`+0x110`/depth-at-`+0x200` struct layout) runs. So this single
+function both creates new job entries *and* pumps the existing queue head every call - not purely
+"peek and process an existing job" as framed in earlier sessions.
+
+**The crash's own diagnostics (stack dump, frame-chain walk, and recent-import history that
+`DirectExecutionBackend.Exceptions.cs`'s crash handler already prints) are themselves valuable
+evidence, independent of my original patch plan**:
+- The stack at the fault contains both `queue_obj` (`0x6080EE270`) and the long-known stuck job
+  pointer (`0x6080ECC10`) as live values.
+- The RBP frame-chain walk shows a return address (`0x800B05B8D`) landing inside the previously
+  identified pop-path address region (near `0x800B05B4A`/`0x800B05B08`, from a much earlier
+  session's `SHARPEMU_LOG_RET_ADDRS` target list).
+- The 64-entry recent-import trace shows the **same mutex NID (`9UK1vLZQft4`) being called from
+  two alternating return sites on the same thread**: `0x800B04E48` (this entry's newly-mapped
+  "lock the queue's own mutex" call) and an unfamiliar `0x800B05B08` (not yet disassembled, but
+  numerically close to the known pop-path region).
+
+**Working theory, not yet confirmed**: this alternating pattern is consistent with **reentrancy** -
+a job's `execute()` call itself scheduling child jobs, which recursively re-enters this same
+queue-construct-and-lock function from a nested call frame. If true, this would mean `execute()`
+*does* sometimes return true and proceed into deeper job-scheduling logic (for freshly-constructed
+jobs, not necessarily the one perpetually-stuck job) - and something in that nested path hits a
+real null-pointer bug. This would reframe the investigation again: the perpetual hang and this
+crash could be two symptoms of the same underlying gap (something SharpEmu provides subtly wrong
+to the job's `execute()`/scheduling logic), or they could be unrelated. Not yet distinguished.
+
+**Read on `--debug-server`'s role**: most likely explanation for why this only manifests under the
+debugger is that its overhead changes scheduling/timing enough to let a code path execute that
+normal timing never reaches (or reaches so rarely it hasn't been observed in ~15+ non-debug-server
+capture sessions this investigation). This does **not** necessarily mean the underlying bug is
+irrelevant to the hang - if it's a genuine SharpEmu-caused divergence from real hardware (not a
+real Unity/IL2CPP/game bug, which would be surprising for a shipped title), it could plausibly be
+the same class of gap that prevents the job from ever completing normally, just currently
+unreachable via the exact timing of a non-debugged run.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), multiple `--debug-server` sessions this entry
+(reproducible crash confirmed across 3 fresh runs) plus one plain 30s run to rule out the crash
+being present in normal operation. No code changes - diagnostics/investigation only. Build/test
+suite unaffected (no production code touched this entry).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session): the planned gate-2
+register capture is blocked by a real, reproducible crash that only manifests under
+--debug-server - and the crash's own diagnostics reveal the ring-buffer function is bigger than
+previously mapped, plus strong evidence of reentrancy into the same queue-locking logic" section
+for full background. Status: metal_slug boots, presents ONE frame, hangs forever, unchanged. Two
+real synchronization bugs already fixed and verified in
+src/SharpEmu.Libs/Kernel/KernelSyncOnAddressCompatExports.cs (spurious-wake predicate +
+Monitor.PulseAll lost-wakeup race) - keep both. Three unrelated real bugs (mprotect/TryRead-Write-
+Compare-Copy across multi-region spans, /dev/urandom support) were fixed and merged in the entry
+before this one - confirmed unrelated to this hang, don't revisit unless new evidence ties them in.
+
+BIG reframe this entry: the previous plan (capture al/dl at gate 2 via a guaranteed-AV patch at
+guest 0x800B04F16) is now known to be moot - that code path is unreached because gate 1 AND gate 2
+are BOTH inside a branch gated on execute() (the job's [rax+0x58] vtable call) returning true,
+and a patch placed there confirmed via a full steady-state run that it never fires. execute()
+itself always returning false for the stuck job is the more fundamental blocker, one level
+upstream of both previously-analyzed gates.
+
+While trying to redirect the capture one level earlier (0x800B04EEA, unconditionally reached right
+after execute() returns), hit a DIFFERENT, real, 100%-reproducible SIGSEGV (null-pointer write) at
+guest 0x800B04EB0 - confirmed NOT caused by any patch (a routing patch verified via mem readback to
+correctly skip over that address did not prevent the crash), confirmed NOT present in a 30s plain
+(non-debug-server) run past the same point. This crash's own diagnostic dump revealed:
+(1) the loop function is bigger than mapped - 0x800B04DAB-0x800B04E39 (never disassembled before
+this entry) constructs/recycles a job object into a pool via a call to 0x8014ed000, BEFORE the
+already-known lock-mutex/peek-head logic at 0x800B04E39 onward runs - this single function both
+creates new job entries AND pumps the existing queue head every call.
+(2) the crash's stack contains both queue_obj (0x6080EE270) and the long-stuck job pointer
+(0x6080ECC10) as live values, and its RBP frame-chain walk includes a return address (0x800B05B8D)
+landing inside the previously-known pop-path region.
+(3) the crash's 64-entry recent-import trace shows the SAME mutex NID (9UK1vLZQft4) called from
+TWO alternating return sites on the same thread: 0x800B04E48 (this entry's newly-mapped "lock the
+queue's own mutex") and an unfamiliar 0x800B05B08 - suggestive of REENTRANCY (a job's execute()
+scheduling child jobs that recursively re-enter this same queue-locking function).
+
+Next steps (not yet attempted): (1) disassemble 0x800B05B00-0x800B05C00 (the unfamiliar
+alternating call site 0x800B05B08 and the frame-chain return address 0x800B05B8D) to confirm or
+refute the reentrancy theory - if this region turns out to be a nested/recursive call into the
+same enqueue-and-peek function (or a sibling function with the same shape), that confirms
+execute() DOES sometimes proceed past gate 1/2 for freshly-constructed jobs (not the one
+perpetually-stuck job), just never for the one job everyone's been tracking. (2) disassemble
+0x8014ed000 (the pool/allocator call inside job construction) and 0x8019b0940/0x80095b460 (the two
+other calls in the newly-mapped construction block) to understand what's actually being built/
+recycled each iteration - this may explain why the SAME job pointer (0x6080ECC10) keeps getting
+peeked despite a NEW job apparently being constructed every single iteration (working theory: the
+depth check at 0x800B04E70 gates whether the freshly-constructed job or a pre-existing one gets
+processed - if depth is always non-zero per 2-sessions-ago's finding, the newly-built job might go
+somewhere OTHER than the head slot, explaining why the same stuck head entry keeps getting
+reprocessed while new jobs pile up elsewhere or get recycled without ever being touched). (3) once
+the reentrancy question is resolved, determine whether the 0x800B04EB0 null-pointer crash is a
+genuine SharpEmu-caused divergence from real hardware (likely, given it's a shipped, presumably
+working title) vs research further before concluding - do NOT patch around it blindly per the
+standing caution against producing a fake-looking pass that doesn't reflect real hardware behavior.
+(4) if reentrancy is confirmed and the crash is a real bug, consider whether FIXING the crash
+(rather than working around the hang) is the more direct path forward - a job that successfully
+completes execute() then immediately crashes while scheduling child work would look, from the
+primordial thread's perspective, exactly like "the pop path never gets reached" for the ORIGINAL
+job (since the crash likely terminates that whole call chain before ever returning to pop/notify
+logic) - this could directly explain the permanent hang if it happens on literally every attempt,
+just currently invisible without --debug-server's altered timing to surface it.
+
+Tooling recap: all previous tools remain valid. Reconfirmed this entry: the guaranteed-AV-patch
+technique (pause at EntryPoint, write, continue) reliably fires - both times it was tried this
+session with a genuinely-reachable address, it worked (once producing the target capture, once
+instead surfacing the unrelated 0x800B04EB0 crash) - the earlier session's finding that
+"break/add-breakpoint doesn't fire on hot loops" remains true and separate from this technique,
+which does not use breakpoints. Always verify a `write` patch actually took effect via a `mem`
+readback before relying on it (confirmed necessary this entry - do not assume a write-memory
+"ok" reply alone proves correctness of subsequent behavior). Always confirm no stray SharpEmu
+process before starting a new one - multiple unrelated SharpEmu processes for other games/other
+invocations (metal_slug_tactics, subnautica) were observed running concurrently this session,
+started by someone/something else - check the full command line, not just process existence.
+Repro: `dotnet build SharpEmu.slnx -c Debug`, run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu
+<metal_slug eboot.bin>` (add --debug-server for live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session, immediate correction to the entry above): the "reentrancy" theory is RESOLVED - it's two cooperating functions (an outer JobHandle.Complete-style wait loop calling an inner pump function), NOT recursion; and the --debug-server crash is now believed to be partly an artifact of the AV-patch corrupting the instruction stream, so it should NOT be treated as a clean signal
+
+Continued straight from the previous entry by disassembling `0x800B05AA0` onward (the unfamiliar
+`0x800B05B08` region flagged as the "second mutex call site"). The reentrancy theory is **resolved,
+and it was simpler than recursion**:
+
+**`0x800B05AA0` is a distinct outer function** (own prologue `push rbp; mov rbp,rsp; push
+r15/r14/r13/r12/rbx; sub rsp,0x18` at `0x800B05AA0`-`0x800B05AB1`, own locals) - a
+`JobHandle.Complete()`-style **wait loop**: lock the queue mutex (`0x8019b1740` at `0x800B05B03`),
+check for pending work (`mov rax,[rbx+0x1e0]; or rax,[rbx+0x200]; setne r12b` at
+`0x800B05B30`-`0x800B05B41`), unlock (`0x8019b1750` at `0x800B05B45`), and if work is present
+(`r12b`) call the **pump function at `0x800B04930`** (at `0x800B05B88`, return site `0x800B05B8D` -
+exactly the crash's frame#0 return address). It repeats until a ~16ms time budget expires (the
+`vcvttsd2si`/`cmp eax,0x10` float-math block at `0x800B05BD7`-`0x800B05BF7`) or work drains.
+
+**The "two alternating mutex call sites" were these two cooperating functions, not a function
+calling itself** - the outer wait loop (`0x800B05AA0`) locks/unlocks the mutex itself AND calls the
+inner pump (`0x800B04930`) which independently locks/peeks the same queue. No recursion.
+
+**Load-bearing correction to MULTIPLE prior entries**: the return site `0x800B05B4A` - which
+sessions from a few days ago measured firing ~157,554 times in 90s and labeled as one of "the
+ring-buffer worker loop's two known call sites" - is actually the **unlock inside this OUTER wait
+loop** (`0x800B05AA0`), NOT inside the pump function. And `0x800B04E90` (the other ~157,551-hit
+site) is inside the **inner pump** (`0x800B04930`). They fire in lockstep at the same ~1,750/sec
+because the outer loop calls the inner pump every iteration. So what earlier sessions called "the
+JobSystem ring-buffer worker loop" was really this **two-function pair** the whole time: an outer
+`Complete()`-style spin-wait driving an inner enqueue-and-pump. This doesn't invalidate the core
+finding (the primordial thread spins here forever), but it corrects the mental model of the code
+shape - future disassembly should treat `0x800B04930` (pump) and `0x800B05AA0` (wait loop) as two
+separate functions with the pump called from the wait loop.
+
+**Downgraded confidence in the `0x800B04EB0` crash as a clean signal**: decoded that the reported
+fault RIP `0x800B04EB0` is **mid-instruction** - its bytes `00 31 C0 ...` (from the crash dump's
+"Code at RIP") decode as `add byte ptr [rcx], dh` with `rcx=0`, which is exactly what produces the
+"AV write to 0x0". A misaligned RIP landing inside the pump's error-print block
+(`0x800B04E94`-`0x800B04EB3`, the path taken only when a mutex lock returns nonzero) is the
+signature of a **corrupted instruction stream or a bad control transfer** - and critically, this
+session's own AV-patch at `0x800B04EEA` was a **7-byte write (`mov ecx,[0x00100000]` =
+`8B 0C 25 00 00 10 00`) that overwrote the 3-byte `mov r14d,eax` at `0x800B04EEA` PLUS the first 4
+bytes of the following `call 0x8019b0c80` at `0x800B04EED`** - i.e. the patch itself corrupted
+adjacent instructions. While the crash also reproduced in a run where only a routing patch (not the
+EEA patch) was applied, the mid-instruction fault address means I can no longer cleanly separate
+"real pre-existing bug" from "my patch corrupting execution." **The `0x800B04EB0` crash should NOT
+be treated as a confirmed real bug** until reproduced with a technique that doesn't overwrite
+multiple instructions (e.g. a 1-byte `0xCC`/int3-free approach, or an AV-patch placed at an
+instruction boundary with a same-length replacement). The previous entry's step (4) speculation
+("fixing the crash may directly fix the hang") is accordingly downgraded from a lead to an
+unproven guess.
+
+**What IS still solid after this correction**: metal_slug hangs with the primordial thread
+perpetually running the outer wait loop (`0x800B05AA0`) → inner pump (`0x800B04930`) pair against
+`queue_obj` (`0x6080EE270`), the same job (`0x6080ECC10`) staying at the head, and `execute()`
+(`[rax+0x58]` at `0x800B04EE7` inside the pump) apparently never returning true for that job (the
+gate-1/gate-2 pop/notify path stays dead code, per the entry above - that finding stands, it did
+not depend on the crash). The outer wait loop's own exit conditions (`0x800B05BF4` time budget,
+`0x800B05C11` `lock xadd [rbx+0x130]` refcount decrement, `0x800B05C2D` call to `0x8018a6300`) are
+newly visible now and not yet analyzed - one of them is what the primordial thread is really
+waiting to satisfy.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), continued --debug-server disassembly session
+(paused-memory reads via capstone) plus two short `SHARPEMU_LOG_RET_ADDRS` captures (both returned
+zero hits at `0x800B05AD8`/`0x800B05BA1`/`0x800B05BA1` - but those are `0x8019b0c80` clock-read
+sites, now understood to be non-HLE-dispatched internal calls that RET_ADDRS structurally cannot
+observe, so those zero results prove nothing - a methodology note for next time: only target
+sites whose call is a real HLE import, like the `0x8019b1740`/`0x8019b1750` mutex lock/unlock or
+`scePthreadMutexUnlock`, when using RET_ADDRS). No code changes.
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's two most recent "Follow-up (2026-07-21, later session)" entries -
+first "the planned gate-2 register capture is blocked by a real, reproducible crash..." then its
+"immediate correction" - for full background (the correction supersedes several framings in the
+one before it). Status: metal_slug boots, presents ONE frame, hangs forever, unchanged. Two real
+sync bugs already fixed in KernelSyncOnAddressCompatExports.cs (keep both); three unrelated real
+bugs (multi-region mprotect/TryRead-Write-Compare-Copy, /dev/urandom) fixed two entries ago
+(unrelated to this hang).
+
+Corrected code model (supersedes ALL earlier "ring-buffer worker loop" framings): the primordial
+thread spins in a PAIR of cooperating functions, not one loop:
+- OUTER wait loop 0x800B05AA0 (JobHandle.Complete-style): locks queue mutex (0x8019b1740 @
+  0x800B05B03), checks pending work ([rbx+0x1e0] OR [rbx+0x200], setne r12b @ 0x800B05B30-B41),
+  unlocks (0x8019b1750 @ 0x800B05B45, return site 0x800B05B4A = the ~157k-hits/90s site earlier
+  sessions MISLABELED as being in the worker loop), and if work present calls the pump at
+  0x800B04930 (@ 0x800B05B88). Loops until a ~16ms time budget (float math @ 0x800B05BD7-BF7) OR
+  work drains OR a refcount/wait condition (0x800B05C11 lock xadd [rbx+0x130]; 0x800B05C2D call
+  0x8018a6300) is satisfied.
+- INNER pump 0x800B04930 (contains the 0x800B04D80-0x800B051FF code all prior entries analyzed):
+  constructs/recycles a job (0x800B04DAB-E39, calls pool fn 0x8014ed000), locks mutex (0x800B04E43),
+  checks depth [rbx+0x200] @ 0x800B04E70, peeks head [rbx+0x1f0] @ 0x800B04E7E, calls execute()
+  [rax+0x58] @ 0x800B04EE7. The gate-1 ([job+0x48]==1 @ 0x800B04F2A) / gate-2 (cl==0 @ 0x800B04F35)
+  pop/notify path is confirmed DEAD CODE because execute() never returns true for the stuck job
+  (0x6080ECC10) - this finding is solid and independent of the crash below.
+
+DO NOT trust the 0x800B04EB0 "crash" as a real bug yet: its fault RIP is mid-instruction (bytes
+00 31 C0 decode as `add [rcx],dh`, rcx=0 → the AV write to 0x0), i.e. a corrupted instruction
+stream / bad control transfer - and this session's own 7-byte AV-patch at 0x800B04EEA overwrote
+adjacent instructions, so the crash may be self-inflicted. If revisiting it, reproduce with a
+patch that does NOT overwrite multiple instructions (same-length replacement at an instruction
+boundary), and confirm it still faults, before treating it as real.
+
+Next steps (not yet attempted): (1) the cleanest remaining question is still WHY execute()
+([rax+0x58] @ 0x800B04EE7 in the inner pump) never returns true for job 0x6080ECC10 - capture its
+return value with a SAFE, same-length AV-patch: the instruction right after it is 0x800B04EEA
+`mov r14d,eax` (3 bytes, 41 89 C6). Replace it in place with a 3-byte faulting sequence that reads
+eax first is impossible in 3 bytes, so instead patch the NEXT safe boundary that preserves eax:
+e.g. overwrite exactly the 5-byte `call 0x8019b0c80` at 0x800B04EED (E8 xx xx xx xx) with a 5-byte
+`mov eax,[0]`-style fault that DOESN'T clobber eax first - `A1`-form isn't 64-bit; simplest is a
+1-byte 0xCC-free trap won't carry eax. Cleanest is actually to add a NEW diagnostic: extend the
+existing RetAddrHit register-dump (already prints rax/r15/guest/managed) to ALSO fire on a chosen
+guest RIP via a lightweight single-address check in the execution loop, OR just read [job+0x48]
+and the vtable at [job] live via --debug-server `mem` (job pointer 0x6080ECC10 is constant) and
+disassemble the actual execute() implementation at [[0x6080ECC10]+0x58] to see what condition it
+checks and why it's never met. (2) analyze the outer wait loop's exit conditions - especially the
+0x8018a6300 call at 0x800B05C2D and the [rbx+0x130] refcount at 0x800B05C11 - one of these is the
+real "is the JobHandle complete yet" test the primordial thread is stuck failing. (3) disassemble
+the inner pump's job-construction block calls (0x8014ed000 pool alloc, 0x8019b0940, 0x80095b460)
+only if (1)/(2) don't crack it - lower priority.
+
+Tooling recap: guaranteed-AV-patch technique works but BEWARE patch length - a multi-byte write
+corrupts adjacent instructions and can cause misleading mid-instruction crashes (this session's
+lesson). Prefer live --debug-server `mem` reads of constant addresses + static capstone disasm of
+the resolved target over patching, when the pointer is known-constant (as job 0x6080ECC10 is).
+RET_ADDRS only observes real HLE-dispatched imports - internal libkernel calls like the
+0x8019b0c80 clock read are invisible to it, so a zero-hit result at such a site proves nothing;
+target mutex lock/unlock (0x8019b1740/0x8019b1750) or scePthreadMutexUnlock sites instead. break/
+add-breakpoint still does not fire on hot loops. Always verify a `write` took effect via `mem`
+readback. Confirm no stray SharpEmu process before starting (other games' SharpEmu processes -
+metal_slug_tactics, subnautica - may run concurrently; check the full command line). Repro:
+`dotnet build SharpEmu.slnx -c Debug`, run `artifacts/bin/Debug/net10.0/linux-x64/SharpEmu
+<metal_slug eboot.bin>` (add --debug-server for live inspection). metal_slug eboot.bin is at
+/home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+### Follow-up (2026-07-21, later session): ROOT-CAUSE MECHANISM fully traced end-to-end with hard memory reads - the hang is a frozen job-phase state machine (2 dependency items enqueued, read cursor stuck at 0, item[0] perpetually skipped because its phase tag equals the descriptor's current phase)
+
+Pushed the investigation from "execute() never returns true" all the way down to the exact frozen
+memory word, using constant-pointer chains read live via `SHARPEMU_LOG_MEM_U64` sampled at the
+outer wait-loop's unlock site (`0x800B05B4A`, ~1,750/sec) plus static capstone disassembly of the
+guest functions. Every link below is confirmed by direct reads, not inference.
+
+**The full call chain (all addresses confirmed):**
+- Primordial thread spins in outer wait loop `0x800B05AA0` (JobHandle.Complete-style) -> inner
+  pump `0x800B04930` -> peeks head job `0x6080ECC10` -> calls its vtable `execute()` at
+  `[[job]+0x58]`. The job's vtable is constant `0x801D64608`; `execute()` resolves to `0x800B02C80`.
+- `execute()` (`0x800B02C80`) returns nonzero (letting the pop/notify path run) **only if** its
+  inner call `0x800B00BB0` (passed `rdi=job+0x98`) returns nonzero. Confirmed by disassembly.
+- `0x800B00BB0` is a time-budgeted work-stealing wait. It returns **1 only when the job's
+  dependency queue is fully drained** (final dequeue attempt claims 0 items -> `je 0x800b00f3f` ->
+  `mov al,1`); it returns **0 while any item remains**.
+
+**The frozen state (all read live at steady-state hang, each stable across 30k+ samples):**
+- Dependency queue struct `r14 = [[job+0xA0]] = [0x6002A1240] = 0x6080EE180` (note: same
+  allocation region as `queue_obj` 0x6080EE270, `0x6080EE180 = queue_obj - 0xF0`).
+- Read cursor `[r14+0x00] = [0x6080EE180] = 0` (**frozen**).
+- Write cursor `[r14+0x40] = [0x6080EE1C0] = 2` (**frozen**) -> the queue permanently holds 2
+  items that are never consumed.
+- Element size `[r14+0x90] = [0x6080EE210] = 0x400`.
+- Items base `[r14+0x80] = [0x6080EE200] = 0x6088B4030`. item[0] = `0x6088B4030`.
+- item[0] descriptor `[item[0]] = [0x6088B4030] = 0x600116290`.
+- item[0] state/phase-tag `[item[0]+8] = [0x6088B4038] = 1`.
+- descriptor current phase `[desc+0x20] = [0x6001162B0] = 1`.
+
+**The exact stuck instruction**: in `0x800B00BB0`'s steal path at `0x800B00CCF`-`0x800B00CD6`:
+`mov rax,[r13]; mov eax,[rax+0x20]; cmp eax,[r13+8]; je 0x800b00ede` - i.e. `cmp [desc+0x20],
+[item+8]` = `cmp 1, 1` -> **equal -> je taken -> item[0] is skipped without being run and without
+advancing the read cursor**, and the function falls through to `return 0` ("not done"). Because
+the read cursor never advances past item[0], the queue never drains, `0x800B00BB0` always returns
+0, `execute()` always returns 0, the job never completes, the pop/notify path (which would wake
+`Loading.PreloadManager` on `queue_obj+0xA8` and ultimately the primordial thread on
+`queue_obj+0x168`) is never reached, and the process hangs forever. This is the complete, verified
+mechanism - it supersedes and subsumes every prior "gate 1 / gate 2 / dead pop path" framing
+(those were all downstream symptoms of this one frozen phase field).
+
+**Worker pool re-confirmed genuinely idle with nothing owed** (rules out a lost-wakeup delivery
+bug): all 17 Job.Worker/Background threads are `Blocked` on `sceKernelSyncOnAddressWait` on their
+individual slots `0x600108D70`-`0x600108F80`; each sleeps while its slot `== 0`; sampled slot
+value at steady state is `0` (read `0x600108D70` = 0 across 131 samples over 35s) -> the slot
+matches the sleep pattern, so no wake is owed to the workers. The work item is NOT stuck in a
+sleeping worker's local queue; it's in the shared stealable dependency queue the primordial thread
+itself reads - and the primordial thread skips it due to the phase guard above.
+
+**Why no fix landed this session (deliberate, not a stopping-short)**: the absolute defect is that
+`[desc+0x20]` (descriptor phase, `0x6001162B0`) is frozen at 1 - on real hardware some operation
+advances it (or item[0].state would differ), after which `1 != [item+8]` and item[0] would run,
+drain, and complete. The specific broken thing is one of: (a) a phase-increment that some guest
+thread should perform but never runs (cooperative-scheduler starvation - the owner of descriptor
+`0x600116290` never gets CPU), or (b) a field SharpEmu populates with the wrong value at
+enqueue/claim time. Determining which REQUIRES identifying what writes `[desc+0x20]` /
+`[item[0]+8]` / the read cursor `[0x6080EE180]`, which needs a write-watch that catches direct
+guest writes (the existing `SHARPEMU_TRACE_WRITE_ADDRS` only samples at import boundaries and will
+miss direct stores) or boot-time claim-tracing. Every candidate blind fix - force-advancing the
+read cursor, forcing `execute()`/`0x800B00BB0` to return 1, or force-waking all workers - would
+violate the queue's invariants and produce exactly the "fake-looking pass that doesn't reflect
+real hardware" this project's notes repeatedly warn against, so none was applied. The honest state
+is: root-cause MECHANISM fully proven; the one remaining unknown is which write to which of three
+now-identified addresses is missing/wrong.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), ~12 instrumented `SHARPEMU_LOG_MEM_U64` +
+`SHARPEMU_LOG_RET_ADDRS` captures (30-35s each to reach the ~721k-import steady state) chaining
+constant pointers, plus static capstone disassembly of `0x800B02C80` (execute), `0x800B00BB0`
+(work-steal wait), `0x800B00F50` (batch dequeue), and `0x800B05AA0` (outer wait loop) read live
+via `--debug-server`. No code changes this session (pure investigation).
+
+### Resume prompt for next session (copy-paste this)
+
+```
+Read testing_instructions.md's "Follow-up (2026-07-21, later session): ROOT-CAUSE MECHANISM fully
+traced end-to-end..." section for the complete, hard-data-confirmed mechanism. Status: metal_slug
+boots, presents ONE frame, hangs forever. Two real sync bugs already fixed in
+KernelSyncOnAddressCompatExports.cs (keep both); three unrelated real bugs (multi-region
+mprotect/TryRead-Write-Compare-Copy, /dev/urandom) fixed earlier (unrelated to this hang).
+
+THE HANG IS FULLY DIAGNOSED (mechanism), NOT YET FIXED (specific defect). Confirmed chain, every
+link read live from guest memory:
+- primordial thread: outer wait loop 0x800B05AA0 -> inner pump 0x800B04930 -> peeks job 0x6080ECC10
+  -> calls execute() = [[0x6080ECC10]+0x58] = 0x800B02C80.
+- execute() (0x800B02C80) returns nonzero only if 0x800B00BB0 (rdi=job+0x98) returns nonzero.
+- 0x800B00BB0 (work-steal wait) returns 1 only when the job's dependency queue is fully drained,
+  else 0.
+- dependency queue at 0x6080EE180 (= [ [0x6080ECC10+0xA0]=[0x6002A1240] ]): read cursor
+  [0x6080EE180]=0 FROZEN, write cursor [0x6080EE1C0]=2 FROZEN -> 2 items never consumed.
+- item[0]=[0x6080EE200]=0x6088B4030; item[0].desc=[0x6088B4030]=0x600116290; item[0] phase-tag
+  [0x6088B4038]=1; descriptor phase [0x6001162B0]=1.
+- STUCK INSTRUCTION: 0x800B00CD2 `cmp eax,[r13+8]` = cmp [desc+0x20](1), [item+8](1) -> equal ->
+  je 0x800b00ede SKIPS item[0] without running it or advancing the read cursor -> queue never
+  drains -> execute() never returns 1 -> job never completes -> PreloadManager (waiting on
+  queue_obj+0xA8=0x6080EE318) and primordial thread (queue_obj+0x168=0x6080EE3D8) never woken.
+- workers all Blocked on their slots 0x600108D70-F80 with slot value 0 (== sleep pattern) so NO
+  wake is owed to them - the item is NOT in a sleeping worker's queue, it's in the shared queue the
+  primordial thread reads and skips.
+
+THE ONE REMAINING UNKNOWN: why is [desc+0x20] (descriptor phase at 0x6001162B0) frozen at 1? On
+real HW it should advance (or item[0].phase-tag would differ), after which item[0] runs & drains.
+Either (a) a phase-increment some guest thread should do never runs (cooperative-scheduler
+starvation - find who OWNS descriptor 0x600116290 and why it never gets CPU), or (b) SharpEmu
+writes a wrong value at enqueue/claim time.
+
+Next step: build a diagnostic that catches DIRECT GUEST WRITES (not just import-boundary samples -
+the existing SHARPEMU_TRACE_WRITE_ADDRS in DirectExecutionBackend.Imports.cs only checks at import
+dispatch and will MISS direct stores) to these three addresses: 0x6001162B0 (desc phase),
+0x6088B4038 (item[0] phase-tag), 0x6080EE180 (read cursor). Options: (1) a hardware write-watch /
+page-protection trap on those pages that logs the faulting guest RIP (the backend already handles
+guest AVs via signals - a write-protect on the page + log-and-restore in the handler would catch
+every writer); (2) capture the boot-time moment these were last written (they're frozen NOW, so
+whoever wrote them last did so at/before steady state - a write-watch armed from launch would catch
+it). Once the writer (or the code that SHOULD write but doesn't) is found, THAT is the defect to
+fix. DO NOT blindly force the cursor/execute()/worker-wake - that produces a fake pass violating
+the project's no-fake-hardware-behavior principle (the whole point of this multi-session
+investigation).
+
+Tooling recap: SHARPEMU_LOG_MEM_U64=<addr> + SHARPEMU_LOG_RET_ADDRS=0x800B05B4A (the outer wait
+loop's unlock, fires ~1750/sec, reliable HLE-dispatched site) chains constant guest pointers at
+steady state - runs need >=30s to reach the ~721k-import steady state. Static disasm: --debug-server
+pauses at initial EntryPoint; `mem <addr> <len>` reads any committed guest address (code is readable
+at entry even for not-yet-run functions; heap objects are NOT populated until steady state so read
+those via MEM_U64 instead). capstone in venv at <scratchpad>/venv. break/add-breakpoint does NOT
+fire on hot loops; guaranteed-AV-patch works but multi-byte patches corrupt adjacent instructions
+(prefer reads over patches when the pointer is constant, as all of these are). Confirm no stray
+metal_slug SharpEmu process before starting (other games' SharpEmu processes may run concurrently -
+match the full command line). Repro: `dotnet build SharpEmu.slnx -c Debug`, run
+`artifacts/bin/Debug/net10.0/linux-x64/SharpEmu <metal_slug eboot.bin>` (add --debug-server for
+live inspection). metal_slug eboot.bin is at /home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin.
+```
+
+### Follow-up (2026-07-21, later session): built a RIP-capturing write-watch diagnostic (approach a) and used it to CONFIRM the root cause via convergent evidence - a new permanent tool, GuestWriteRipWatch (SHARPEMU_WATCH_WRITE_RIP)
+
+Per the user's directive to pursue only the correct approach, built the diagnostic the previous
+entry called for: a page-protection write-watch that captures the guest RIP of whatever writes a
+target address (for DIRECT guest stores the import-boundary poller cannot attribute).
+
+**New permanent diagnostic**: `SHARPEMU_WATCH_WRITE_RIP=<addr[,addr...]>` -
+`src/SharpEmu.HLE/GuestWriteRipWatch.cs` (modeled on `GuestImageWriteTracker`'s signal-safe
+pattern), wired into `DirectExecutionBackend.PosixSignals.cs` (signal handler reads RIP from the
+last `PosixRegisterOffsets` entry) and re-armed/flushed from `DirectExecutionBackend.Imports.cs`'s
+`DispatchImport`. Each watched address' page is protected read-only; a guest store faults, the
+handler records (RIP, fault addr, pre-write value) into a preallocated ring, restores write access
+so the store completes, and the managed pass prints records + re-protects to catch the next
+writer. Linux-only; fully env-gated no-op otherwise. Build clean (Debug+Release), all 576 tests
+pass. Note: it can only arm a page once the backing memory is mapped (logs `arm FAILED errno=12`
+while unmapped, then `armed watch`), so writes that happen in the narrow window between a page
+being mapped and the next import-dispatch re-arm are missed - this is why boot-time INIT writes to
+freshly-allocated heap objects are not caught (a known limitation; the fix would be to arm
+synchronously at map time via `GuestWriteWatch.OnDirectMapping`).
+
+**What the tool confirmed (convergent with prior evidence):**
+1. Watched `0x6001162B0` (descriptor phase) and `0x6088B4038` (item[0] phase-tag): armed
+   successfully, **zero writes captured** across a full run to steady state (Import#1M+). These
+   fields are written once at object creation (before the page can be armed) and **never again** -
+   hard confirmation they are frozen, not merely observed-constant.
+2. Watched `0x600108D70` (worker wake-slot page): armed, **zero writes captured** in steady state.
+   Consistent with the multi-session-old `SHARPEMU_LOG_SYNCADDR` finding that zero
+   `sceKernelSyncOnAddressWake` calls target the worker slots after boot. Two independent tools now
+   agree: **nothing tries to wake a worker after boot.**
+3. Full thread census (`SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`): the only three `Running` guest
+   threads (`UnityEOPThread` ret=0x8014DDE93, `Thread-78EE...` = the AGC watchdog ret=0x8014E9571,
+   `GfxFlipThread` ret=0x8014BB82F) are each pinned in their own steady poll loop at a constant
+   `ret=` - **none is processing item[0]**. Every other thread (17 workers, PreloadManager,
+   AssetGC, BatchDelete, AsyncRead, UnityGfxDeviceWorker, Gfx Task Executor) is `Blocked` on
+   `sceKernelSyncOnAddressWait`.
+
+**Root cause, now confirmed by convergent evidence (mechanism complete):** the job's 2 dependency
+items sit in the queue permanently; item[0] is epoch-tagged as in-progress
+(`[desc+0x20]==[item+8]==1`), so the primordial thread's `Complete()` work-steal loop CORRECTLY
+refuses to re-run it (that guard is right - on real hardware a *worker* runs it); but no worker is
+ever woken to run it (zero wake calls, zero slot writes after boot), and no running thread is
+processing it. So the job's dependency never completes -> `execute()` never returns done -> the
+job never completes -> `Loading.PreloadManager` (blocked on `queue_obj+0xA8`) and the primordial
+thread (blocked on `queue_obj+0x168`) are never woken -> permanent hang. This is a cooperative-
+scheduler vs. Unity-preemptive-parallel-JobSystem divergence: the enqueue-side worker-wake that
+real hardware relies on does not fire in SharpEmu's steady state.
+
+**No fix landed - and deliberately so.** The remaining unknown is the exact reason the enqueue-side
+worker-wake never fires (a guest decision made at enqueue time, which happens during boot in the
+window the write-watch currently can't arm through). Every blind fix - force-waking workers,
+force-advancing the read cursor, forcing `execute()`/the steal guard to run item[0] - would
+violate the job queue's invariants and produce a fake pass, which the user explicitly ruled out.
+The correct next step is to extend `GuestWriteRipWatch` (or a sibling) to arm synchronously at
+map time (`GuestWriteWatch.OnDirectMapping` already fires on direct mappings) so the boot-time
+enqueue of the 2 items - and its missing worker-wake decision - can finally be caught and
+attributed to a specific guest call site, which will reveal whether SharpEmu feeds that decision a
+wrong value (an HLE bug to fix) or whether the wake genuinely never happens on this path (a
+scheduler-model gap to close).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), multiple `SHARPEMU_WATCH_WRITE_RIP` runs
+(30-60s each) plus `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`. Code added: `GuestWriteRipWatch.cs` +
+two wire-in points (diagnostic-only, env-gated). `dotnet build` Debug+Release clean;
+`dotnet test SharpEmu.slnx -c Release` 576/576 pass.
+
+### Follow-up (2026-07-21, later session): extended the write-watch with synchronous map-time arming; definitively confirmed CASE (A) - the guest never calls worker-wake post-boot (not a SharpEmu delivery/timeout/lost-wakeup bug) - so the remaining defect is an enqueue-time decision that current tooling cannot yet attribute
+
+Continued the correct-approach fix hunt. Added synchronous map-time arming to `GuestWriteRipWatch`
+(new signal-safe `Arm()` called from `HostMemory.Posix.Alloc`'s fresh-mmap and commit-in-existing
+branches, so a watched page is protected the instant its host mapping appears, before the guest
+resumes) plus per-watch fault counting. All env-gated, no-op when `SHARPEMU_WATCH_WRITE_RIP` unset.
+`dotnet build` Debug+Release clean; `dotnet test -c Release` 576/576 (one flaky load-sensitive
+failure that passed on rerun - not related to these changes).
+
+**Result of the extended watch**: even armed at map time, the write cursor page `0x6080EE000` sees
+ZERO faults after arming (fault counter stayed 0). The enqueue (write cursor 0->2) and the
+descriptor/item init writes all happen in early boot through a mapping path the arming hooks don't
+intercept, before the watch can protect the page - so the specific enqueue/claim instruction still
+can't be attributed with the current tooling. (The pre-existing `SHARPEMU_TRACE_WRITE_ADDRS` poller
+is worse here: it dereferences the target unconditionally at each import boundary and SIGABRTs when
+the address isn't mapped yet - confirmed, exit 134 - so it can't watch not-yet-mapped addresses at
+all, which is why `GuestWriteRipWatch` was built.)
+
+**Decisive negative results this entry (each rules out a candidate SharpEmu-side fix):**
+- Fresh `SHARPEMU_LOG_SYNCADDR` (88,050 lines): exactly 6 wake calls to worker slots
+  (`0x600108D70`-`F80`), ALL at boot (lines ~1970-1988); in the last 5,000 lines (steady-state
+  hang) there is ZERO sync activity of any kind on the worker slots - no wakes, no re-waits. =>
+  **CASE (A) confirmed: the guest never CALLS `sceKernelSyncOnAddressWake` on a worker after boot.**
+  This is not a SharpEmu wake-delivery bug (there's nothing to deliver).
+- Worker `wait-block` lines all show `timeout=infinite` (guest passed a NULL timeout pointer): the
+  guest DELIBERATELY sleeps workers until woken. So it is NOT a SharpEmu timeout-misread (workers
+  are not supposed to re-poll; they are supposed to be woken, and the wake never comes). Rules out
+  the "give workers a finite re-poll" fix.
+- The two already-fixed lost-wakeup bugs remain correct; this is a different failure (no wake is
+  ever issued, so there is no wake to lose).
+
+**Where this leaves the fix**: the defect is now pinned to a single unanswered question - *why does
+the guest's job-enqueue path not wake a worker (or advance the descriptor phase) after boot, when
+on real hardware it must* (the game ships and runs). This decision is made during early boot, in
+the enqueue/claim code, at a point the page-granularity write-watch cannot arm through (the write
+races the mapping). Confirming it requires either (1) identifying the specific enqueue function
+statically and instrumenting IT directly (RET_ADDRS on its call sites once found) rather than
+watching the data, or (2) real-hardware/known-good reference behavior to compare the enqueue-time
+worker-count/wake state against. Both are beyond what this session's data could obtain.
+
+**No fix landed, deliberately.** Under the explicit "only the correct approach is acceptable"
+constraint: every applicable blind fix - force-waking a worker at steady state, force-advancing the
+read cursor, or bypassing the steal-loop epoch guard - would compensate for the missing wake
+WITHOUT establishing why it's missing, i.e. exactly the fake-hardware-behavior outcome ruled out.
+The root-cause MECHANISM is fully and rigorously established (instruction+memory level, convergent
+across four independent diagnostics); the remaining gap is the *why* of the enqueue-time decision,
+which is a genuine next-investigation, not a patch that can be responsibly written now.
+
+**Permanent tooling added this session** (real contributions, kept): `GuestWriteRipWatch`
+(`SHARPEMU_WATCH_WRITE_RIP`) with map-time arming - the first SharpEmu diagnostic that can attribute
+a *direct guest store* to a guest RIP for addresses that may not be mapped at launch (the existing
+poller cannot). Wired into `DirectExecutionBackend.PosixSignals.cs` (RIP from the signal context)
+and `DirectExecutionBackend.Imports.cs` (managed re-arm/flush) and `HostMemory.cs` (map-time arm).
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), numerous `SHARPEMU_WATCH_WRITE_RIP` and
+`SHARPEMU_LOG_SYNCADDR`/`GUEST_THREAD_SNAPSHOTS` runs. Build Debug+Release clean; test 576/576.
+
+### Follow-up (2026-07-21, later session): disassembled the worker-wake decision (a counting semaphore) - REFRAMES case (A): the 6 boot wakes ARE enqueue-driven semaphore signals, so workers WERE woken at boot for the enqueued work; the defect is that a woken worker does not complete item[0], not that no wake is ever issued
+
+Disassembled the function around the worker-wake site (`ret=0x800A9FA82`), guest
+`0x800A9F980`-`0x800A9FAA6`. The wake is a standard counting-semaphore signal:
+`0x800A9FA34 lock xadd dword ptr [cb+0x48], 1` (increment the per-worker-control-block semaphore
+counter, fetch old value) then `0x800A9FA3D js 0x800a9fa6a` - **wake a worker only if the old
+counter value was negative** (sign set = |value| waiters parked). The wake target is
+`[cb+0x40]` (the worker's futex wait word, e.g. `0x600108D70`), woken via `call 0x8018a9110`
+(= `sceKernelSyncOnAddressWake`, hence `ret=0x800A9FA82`). Standard semaphore: counter >= 0 =
+tokens/no waiters; counter < 0 = parked waiters.
+
+**This reframes the previous entry's "case (A)"**: the 6 boot wakes are exactly this
+enqueue-driven signal firing when the counter was negative (workers parked). So at boot, work WAS
+enqueued AND workers WERE woken to process it. The reason there are no wakes post-boot is simply
+that no NEW work is enqueued post-boot (write cursor frozen at 2 = the 2 items were enqueued once,
+at boot, and the boot wakes correspond to that). So the earlier "the guest never wakes workers" is
+technically true post-boot but MISLEADING - the correct framing is: **the workers were woken at
+boot for these very items, ran, and yet item[0] was never completed (read cursor never advanced).**
+
+**The defect is therefore downstream of the wake**: a worker (or the primordial thread) that was
+given the chance to process item[0] did not drive it to completion. This aligns with the
+reproducible `0x800B04EB0` crash seen earlier (only under --debug-server), which was the job-pump's
+error path (a mutex-lock call returning nonzero) with item[0] and the queue live on the stack -
+under normal execution that lock presumably succeeds, but SOMETHING in the normal processing of
+item[0] leaves it claimed-but-incomplete (epoch-tagged, so the primordial thread's later
+Complete() steal loop correctly refuses to re-run it - the confirmed steady-state deadlock).
+
+**Still not a verified fix.** The precise reason a woken worker fails to complete item[0] at boot
+is the remaining unknown, and it happens during the boot window that the page-granularity
+write-watch cannot arm through in time. Confirming it needs either instrumenting the worker's
+job-processing path directly at boot (e.g. RET_ADDRS on the pump's `execute()`/completion call
+sites, watching whether a worker ever reaches item[0]'s completion for the FIRST time at boot and
+what it returns) or catching the boot-time claim. A blind fix remains ruled out per the
+correct-approach-only constraint.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), --debug-server disassembly of the wake
+function. No code changes this entry (disassembly only). Prior tooling (`GuestWriteRipWatch`)
+retained; build Debug+Release clean, tests 576/576.
+
+### Follow-up (2026-07-21, later session): instrumented the worker's boot-time attempt at item[0] - result: NO worker ever runs the job-pump/steal code, even at boot; only the primordial thread does, and it epoch-skips item[0] forever
+
+Directly instrumented the question "does a worker process item[0] at boot?" Captured, FROM LAUNCH
+(40s), the HLE-return sites in both the job-pump (`0x800B04930`) and the dependency-queue steal
+loop, attributed by thread via the `guest=` field:
+- `0x800B04E90` (pump peek-unlock): 53,481 hits, **all guest=0 (primordial)**.
+- `0x800B05B4A` (outer wait-loop unlock): 53,483 hits, **all guest=0 (primordial)**.
+- `0x800B04F4B` (pump pop/complete path): **0 hits** (never taken by anyone).
+- `0x800B00D04` (steal-loop unlock, only reached if an item is actually run): **0 hits**.
+
+**Conclusion**: only the primordial thread ever executes this job-processing code - **no worker
+touches it even during the boot window**. The completion/pop path and the steal-loop's item-run
+path are never reached by any thread (both consistent with item[0] being epoch-skipped at
+`0x800B00CD2` before any HLE call). Also added fault-handler-driven early arming to
+`GuestWriteRipWatch` (signal-safe `Arm()` after a handled fault, to protect freshly-committed
+pages before the guest's retried store) - it caught the descriptor page arming but still zero
+writes: item[0]'s init/enqueue writes happen before the object's page is armable, confirming the
+init is a boot-time event upstream of any watch we can place.
+
+**What this establishes for the fix**: item[0] is a dependency the primordial thread's Complete()
+wait is blocked on; on real hardware it runs on a worker; in SharpEmu it is **never dispatched to
+a worker at all** (workers were woken at boot only for other work - the 6 semaphore signals - and
+never for this job). So the defect is in job *dispatch to workers*, upstream of everything traced:
+this specific job's "schedule + wake a worker" either never fires, or fires against state that
+routes it away from the workers. The 6 boot wakes are unrelated to this job.
+
+**Next concrete step** (not yet done): disassemble the worker thread's own job loop (reached via
+the generic bootstrap `0x800BFACC0` + the per-worker arg struct) to learn how a worker is assigned
+a job, then find where THIS job (descriptor `0x600116290`, in the dep queue `0x6080EE180`) should
+be handed to a worker and why it isn't - i.e., the scheduler-side dispatch path, distinct from the
+already-understood primordial Complete()/steal path. That is where the correct fix will be.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), one 40s from-launch RET_ADDRS capture with
+thread attribution + one `GuestWriteRipWatch` run with fault-driven arming. Code: fault-handler
+`GuestWriteRipWatch.Arm()` hook added (env-gated). Build Debug+Release clean; tests 576/576.
+
+### Follow-up (2026-07-21, later session): disassembled the worker job loop - workers use a SEPARATE per-worker Chase-Lev deque path (0x800A9E140), distinct from the dep queue where item[0] lives; item[0]/item[1] confirmed as PER-JOB descriptors
+
+Continued into the worker job-loop disassembly (the step the previous entry named). Chain:
+- Worker threads start at generic bootstrap `0x800BFACC0`; it sets up profiler/thread-name state
+  then calls the thread's real entry via `call qword ptr [arg+0x28]` with `rdi=[arg+0x20]`
+  (`0x800BFAEDA`). For Job.Worker 1 (arg `0x6013F9868`), `[arg+0x28]` = **`0x800AA0550`** (read
+  live at steady state).
+- `0x800AA0550` is the worker main loop: computes this worker's control block
+  `r15 = [scheduler] + idx*0x8140 + 0x8140`, `lock inc [sched+0x40]` (active-worker count), then
+  loops calling **`0x800A9E140`** (the job-pull-and-run) until the shutdown flag `[sched+0x3c]`
+  is set.
+- `0x800A9E140` is a lock-free **per-worker Chase-Lev work-stealing deque pop**: indices at
+  `[cb+0x100]`/`[cb+0x108]`/`[cb+0xc0]`, job array at `[cb+0x140 + i*8]`, epoch/version checks via
+  the high dword of each entry, claimed via `lock cmpxchg`. **This pulls from the worker's OWN
+  local deque, NOT from the dependency queue `0x6080EE180` where item[0] lives.**
+
+**Key structural conclusion**: the workers service per-worker Chase-Lev deques; the dependency
+queue that gates the primordial thread's `Complete()` is a DIFFERENT structure serviced by the
+primordial steal loop (`0x800B00BB0`), which epoch-skips item[0]. So item[0]'s job
+(descriptor `0x600116290`) is reachable for execution only if either (a) it is PUSHED onto a
+worker's local deque (so a worker runs it) - which apparently never happens for this job - or
+(b) the primordial steal loop's epoch guard passes (`[desc+0x20] != item.tag`), which it never
+does. item[0] and item[1] have DISTINCT descriptors (`0x600116290` vs `0x600116210`), confirming
+per-job descriptors (so `[desc+0x20]` is a per-job state field, not a shared type constant).
+
+**Honest assessment of the road to a fix**: this is now ~9 Unity-JobSystem functions deep (outer
+Complete() wait, pump, steal-wait, execute, work-steal, dep-dequeue, worker bootstrap, worker main
+loop, worker deque-pop, wake/semaphore). The remaining linchpin - what SHOULD make item[0]'s job
+runnable (push it to a worker deque, or advance `[desc+0x20]`) and why SharpEmu doesn't - lives in
+the boot-time job-scheduling code, which every available diagnostic has been unable to observe
+(page-watch can't arm before the boot writes; value-poller aborts on unmapped addrs; breakpoints
+don't fire on hot loops; the enqueue/push happens in the pre-arm window). Fully reversing Unity's
+scheduler to pin it is realistically a multi-session effort, not a next-single-step.
+
+**Recommended strategic pivot (for next session)**: DIFFERENTIAL analysis instead of continued
+blind RE. metal_slug is Unity/IL2CPP; other Unity titles run on SharpEmu. Bring up a Unity title
+that boots into gameplay, capture the same job-scheduler state/behavior (does its dep queue drain?
+do workers get jobs pushed? what are the `[desc+0x20]`/tag values on a job that RUNS vs
+metal_slug's stuck one?), and diff. A job that successfully runs elsewhere vs metal_slug's stuck
+job will isolate the specific diverging value/HLE call far faster than pinning it by RE alone.
+Alternatively, treat the full JobSystem RE as a dedicated multi-session project.
+
+**Game(s) tested**: Metal Slug Tactics (metal_slug), several --debug-server disassembly reads +
+steady-state MEM_U64 pointer-chain reads. No code changes this entry (disassembly/reads only).
+Build clean; tests 576/576 (unchanged from prior entry).
+
+### Follow-up (2026-07-21, later session): differential-vs-subnautica setup - subnautica can't be the control (fails earlier), but it exposed and I FIXED a real static-TLS-sizing bug that blocked all large IL2CPP titles; subnautica now runs 17x further
+
+Attempted to set up the requested differential comparison against subnautica (a working Unity
+title would let us diff a job that RUNS vs metal_slug's stuck one). Findings:
+
+**No available IL2CPP title reaches gameplay** - each fails at a different early point:
+- subnautica: crashed at IL2CPP init with a static-TLS sizing error (see fix below).
+- powerwash_sim: IL2CPP, bus error at ~2,400 lines, 0 frames.
+- metal_slug_tactics: the SAME game as metal_slug (Metal Slug Tactics) - identical 1-frame +
+  `0x6080EE3D8` SyncWait hang. Not a control.
+So metal_slug is actually the furthest-progressing IL2CPP title we have (reaches frame 1); there is
+no working IL2CPP control to diff against right now. The single-frame-then-hang is very likely a
+GENERAL Unity/IL2CPP issue, with different titles tripping different earlier blockers.
+
+**REAL FIX landed (static TLS reservation)**: subnautica died at
+`GuestTlsTemplate.cs`'s check "Static TLS requires 0x187630 bytes, but startup maps only 0x10000"
+- its `Il2CppUserAssemblies.prx` needs ~1.5 MiB of Variant II static TLS below the thread pointer,
+but the hardcoded `StartupStaticTlsReservation` was only 0x10000 (64 KiB). Raised it to
+**0x20_0000 (2 MiB)** in `src/SharpEmu.HLE/GuestTlsTemplate.cs` (the single shared constant used by
+BOTH the main-thread mapper `CpuDispatcher.TryMapTlsRegion`/`TlsPrefixSize` and the worker-thread
+mapper `DirectExecutionBackend`'s `GuestThreadTlsPrefixSize`). Safe: the per-thread TLS region
+stride is 0x0100_0000 (16 MiB) in both mappers, so a 2 MiB prefix + 0x10000 TLS body per thread
+(0x210000) sits comfortably inside the stride with no adjacent-thread collision; the TLS layout
+self-checks (`RunTlsLayoutSelfChecks`) use tiny offsets and are unaffected.
+
+**Result of the fix**: subnautica now passes IL2CPP init entirely (0 `Static TLS requires`, 0
+`il2cpp_api_lookup_symbol failed`) and runs ~17x further (Import#70,401 vs ~4,088 before). It then
+hits a NEW, later blocker - "unable to initialize il2cpp" followed by a null-pointer deref
+(`movzx eax, byte ptr [rdi+0x4A]` with rdi≈null, fault target 0x4A) - a DIFFERENT subsystem
+(IL2CPP runtime init) than metal_slug's JobSystem hang. So subnautica still isn't a JobSystem/
+gameplay control; using it as one would require fixing that il2cpp-init failure next.
+
+**Regression check**: metal_slug still reaches frame 1 with the larger TLS reservation (no
+change to its behavior); `dotnet build` Debug+Release clean; `dotnet test -c Release` 576/576 pass.
+
+**Game(s) tested**: Subnautica (PPSA02453) - advanced from IL2CPP-init TLS crash to a later
+il2cpp-init failure via the TLS fix; Metal Slug Tactics (metal_slug) - regression-checked, still
+reaches frame 1; powerwash_sim/metal_slug_tactics - probed as potential controls (neither viable).
+Code changed: `GuestTlsTemplate.StartupStaticTlsReservation` 0x10000 -> 0x200000 (one constant,
+affects both TLS mappers).
+
+---
+
+## 2026-07-21 - ROOT CAUSE CONFIRMED: subnautica/metal_slug hang = missing guest signal delivery (stop-the-world)
+
+After clearing subnautica's IL2CPP-init blockers (centralized `IExternalHostMemoryAccessor`
+malloc-safe `ctx.Memory` fallback + TLS reservation), subnautica hangs on the SAME primitive as
+metal_slug's frame-2 hang. Fully reverse-engineered the decrypted `Il2CppUserAssemblies` code at the
+stall (via `SHARPEMU_STALL_DUMP_RANGE` + capstone). It is a **Unity/Mono/IL2CPP stop-the-world
+thread-suspension coordinator**:
+
+- Coordinator function `0x804010C70` (called by the app-lifecycle handler thread, entry
+  `0x805FA4AC0`, at `ret=0x804004FBF`): resets a counter to 0, walks the 256-bucket guest thread
+  table (`r15=[rip+0x2f6a15e]`), and for **each other eligible thread** (skips self, and threads
+  flagged at `[node+0xf8]&1`, `[node+0x10]==global`, `[node+0xf9]!=0`) calls `0x8060005A0`.
+- `0x8060005A0` (guest PLT, GOT `0x806B30D08`) resolves to guest wrapper `0x81B24D240` in another
+  module = `mov esi, 0x1e; jmp <pthread_kill PLT>`. **`0x1e` = 30 = SIGUSR1** on FreeBSD/PS5. So the
+  call is `pthread_kill(target_thread, SIGUSR1)`.
+- If pthread_kill returns success (not `0x80020003`/`0x80020016`), it increments the success counter
+  `0x806F7B7C8`. Then it tail-calls `WaitSema(SuspendSemaphore, count)` (sema handle read from
+  `0x806F7B7B0`) - waits for exactly `count` acknowledgements.
+- Contract: each SIGUSR1'd thread runs its installed SIGUSR1 handler, reaches a GC/JIT safepoint,
+  and `SignalSema(SuspendSemaphore)` to acknowledge it has suspended.
+
+**Hard evidence at the stall**: `[0x806F7B7B0] = 0x1D` (SuspendSemaphore handle), counter
+`[0x806F7B7C8] = 1`. So exactly one `pthread_kill` "succeeded" and the coordinator blocks in
+`WaitSema(0x1D, 1)` forever. Blocked-thread snapshot confirms:
+`block=sceKernelWaitSema rdi=0x1D rsi=1 ret=0x804004FBF`. Meanwhile another guest thread spins
+(steady-state histogram: ~10k `libc:memcpy`/2s) - it is the target that should have been
+interrupted by SIGUSR1 but never is.
+
+**Why it hangs**: SharpEmu implements **no guest signal delivery**. There is no `sigaction`/`signal`
+export (only `_sigprocmask`) and no `pthread_kill`/`thr_kill`/`kill` handler in `SharpEmu.Libs`.
+`pthread_kill` is dispatched as a no-op stub that returns 0 (success) - hence counter=1 - but no
+signal is ever delivered to the target thread, so the target never runs a handler, never reaches a
+safepoint, never `SignalSema(SuspendSemaphore)`. The wait never completes; the app hangs after
+presenting its first frame. This is a **general Unity/IL2CPP blocker** (both subnautica and
+metal_slug trip it), not game-specific.
+
+**Fix direction (universal, no name-matching)**: implement guest POSIX signal delivery -
+(1) `sigaction`/`signal` to register per-signal guest handler pointers; (2) `pthread_kill`/`thr_kill`
+to asynchronously deliver a signal to a target guest thread, i.e. interrupt the host thread running
+that guest thread and redirect its guest RIP into the registered handler (build a guest signal frame
++ handle sigreturn), reusing the existing POSIX fault infrastructure in
+`DirectExecutionBackend.PosixSignals.cs`. Must be truly async because the target can be executing
+native guest code (the memcpy spin) and will not cooperatively poll. Design/approval pending before
+implementation (large threading-model subsystem).
+
+**Diagnostics added this session**: `SHARPEMU_STALL_DUMP_RANGE` ("addr,len[;addr,len]" hex; dumps
+guest ranges as hex at a detected stall - the key tool for reading decrypted SELF code without a
+working debug-server breakpoint) in `DirectExecutionBackend.cs`.
+
+---
+
+## 2026-07-21 - FIX (part 1) landed: POSIX signal exports; part 2 = deliver to parked primary thread
+
+Implemented the universal POSIX signal surface that IL2CPP's stop-the-world uses, wiring it into
+SharpEmu's EXISTING async signal-delivery machinery (`sceKernelInstallExceptionHandler` /
+`sceKernelRaiseException` / `IGuestThreadScheduler.TryRaiseGuestException`), which was already built
+"for IL2CPP's stop-the-world collector" but was unreachable because the POSIX registration/delivery
+entry points didn't exist:
+
+- New `src/SharpEmu.Libs/Kernel/KernelExceptionCompatExports.Posix.cs` (partial class sharing the
+  existing `_installedHandlers` registry): `sigaction`/`_sigaction`/`signal` register the guest
+  handler pointer; `pthread_kill`/`_pthread_kill`/`thr_kill`/`_thr_kill` route into
+  `TryRaiseGuestException`. Returns real SCE codes (0 success, 0x80020003 ESRCH) so the guest's
+  coordinator counts only genuinely-delivered signals (a send it cannot deliver must NOT return
+  success or the coordinator waits forever for an acknowledgement). NIDs computed via Ps5Nid and
+  verified against known-good exports.
+- Made `KernelExceptionCompatExports` a `partial class`.
+
+**Result**: subnautica now DOES deliver a SIGUSR1 (type=0x1E=30) to the target
+(`guest_exception.queued`/`.raise` now fire, handler=0x81B24D210 - previously there was no handler
+because `sigaction` was a no-op that dropped the registration). Confirmed the registered handler
+`0x81B24D210` is the Unity/Mono SIGUSR1 suspend handler: `cmp edi,0x1e; ... mov rax,[rsi+0xf8];
+jmp <mono handler>` - it reads signum from edi (our rdi=exceptionType=30) and the context from rsi
+(our arg1=exceptionContextAddress), exactly the ABI `TryRaiseGuestException` provides.
+
+**Remaining blocker (part 2)**: the coordinator is a *scheduled* (`_guestThreads`) thread; the
+suspend target is the *primary/external* thread (in `_externalGuestThreads`), which is parked in
+`pthread_cond_wait`. `TryRaiseGuestException`'s external path only QUEUES the exception for the
+target to consume at its next HLE import boundary (`DeliverPendingGuestExceptionAtSafePoint`, called
+at import dispatch) - but a thread parked in a wait never reaches a boundary, so it never runs its
+handler, never acks `SignalSema(SuspendSemaphore)`, and the coordinator's `WaitSema(0x1D,1)` still
+hangs. `guest_exception` log shows exactly one `queued`/`raise` and zero `delivery_enter`/
+`delivery_exit`. `RegisterBlockedGuestThreadContinuation` early-returns for non-`_guestThreads`
+threads, so the parked-immediate-delivery path that exists for cooperative threads does not apply to
+the primary thread. Need: when a signal is raised on a parked external/primary thread, wake it (or
+deliver on its execution context) so it runs the handler. Since delivery at the import boundary
+(line 1424) precedes block-consume (line 1447), a force-wake that makes it re-enter an import
+suffices. Investigating the primary-thread block/wake path for the minimal, universal hook.
+
+---
+
+## 2026-07-21 - FIX COMPLETE: IL2CPP stop-the-world unblocked; subnautica + metal_slug now run their game loops
+
+Part 2 landed. The suspend target was the primary/EXTERNAL thread, which parks SYNCHRONOUSLY inside
+the HLE `pthread_cond_wait` (on `Monitor.Wait(PthreadCondState.SyncRoot)`) and never returns to a run
+loop, so the queued signal (delivered at import boundaries) was never observed. Fix, all in
+SharpEmu.Libs plus one small scheduler seam:
+
+- `IGuestThreadScheduler.HasPendingGuestException(ulong)` (default false; overridden in
+  `DirectExecutionBackend` to check `_pendingGuestExceptions`) - lets a host-parked HLE wait learn a
+  signal is queued for it.
+- `KernelPthreadCompatExports`: registers each non-cooperative (host-parked) cond waiter in
+  `_hostParkedCondWaiters` keyed by guest thread handle (== `scePthreadSelf`/pthread_t, so it matches
+  the handle `pthread_kill`/`sceKernelRaiseException` target). New
+  `InterruptHostParkedThreadForSignal(handle)` wakes it by treating the signal as a spurious cond
+  wakeup - it calls the existing vetted `CompleteCondWaiter` (which atomically queues FIFO mutex
+  reacquisition), so the thread reacquires its mutex, returns from the wait, and runs the queued
+  handler at the next import boundary. The park loop also does a pre-sleep
+  `HasPendingGuestException` check to close the queue-before-park race (no lock-ordering risk - the
+  check runs outside `state.SyncRoot`).
+- `sceKernelRaiseException` and `pthread_kill`/`thr_kill` both call
+  `InterruptHostParkedThreadForSignal` after successfully queuing the delivery.
+
+**RESULT - both games clear the multi-session-open blocker:**
+- **Subnautica**: 0 stalls on `WaitSema(SuspendSemaphore 0x1D)` (was hanging there); multiple
+  stop-the-world GC cycles complete (`guest_exception.delivery_exit success=True`, mode=parked);
+  runs its full game loop to 1.6M+ imports over 75s with no crash/hang; Vulkan initialized; issuing
+  frame flips (flip version climbed past 1300). New, SEPARATE blocker: `vk.flip_capture_failed
+  found=False initialized=False` (GPU presentation can't find the flip buffer) - a rendering issue,
+  not the suspension hang.
+- **Metal Slug Tactics**: 0 "No import progress" stalls (was a frame-2 hang); handler deliveries
+  succeed; runs to 1.27M imports. New steady state: repeated `ORBIS_GEN2_ERROR_TIMED_OUT` on a timed
+  wait (Hc4CaR6JBL0) - a separate, later issue.
+
+**Universal, not game-specific**: no semaphore-name matching; implements the generic POSIX signal
+delivery (sigaction/signal + pthread_kill/thr_kill) and the generic "signal interrupts an
+interruptible wait" behavior, reusing the emulator's existing async guest-exception machinery. Any
+Unity/IL2CPP title's stop-the-world benefits.
+
+**Tests**: 6 new `KernelSignalCompatExportsTests`; all 585 solution tests pass (525 Libs + 27 Metal
++ 33 SourceGen), verified green across 5 consecutive Libs runs (also hardened a pre-existing flaky
+`HostMemoryProtectTests` host-mmap-adjacency race with a retry, and serialized the
+`GuestThreadExecution.Scheduler`-mutating test classes into one non-parallel collection).
+
+**Known follow-ups**: (1) interrupt currently covers cond_wait parks only - extend to mutex/sema
+host-parks if a title needs a target suspended while blocked on those; (2) handler runs after the
+cond mutex is reacquired (POSIX runs it before) - fine when the mutex is free (observed case), revisit
+if a contended-mutex suspension deadlocks; (3) subnautica `vk.flip_capture_failed`; (4) metal_slug
+timed-wait timeout loop.

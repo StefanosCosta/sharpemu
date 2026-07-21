@@ -4276,6 +4276,19 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return true;
 	}
 
+	public bool HasPendingGuestException(ulong threadHandle)
+	{
+		if (threadHandle == 0 || Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		lock (_guestThreadGate)
+		{
+			return _pendingGuestExceptions.ContainsKey(threadHandle);
+		}
+	}
+
 	private static ulong FindGuestExceptionThreadRecord(
 		CpuContext context,
 		ulong callback,
@@ -6157,6 +6170,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			if (rsp != 0 && cpuContext.TryReadUInt64(rsp, out var value) && cpuContext.TryReadUInt64(rsp + 8, out var value2))
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
+			}
+
+			// Diagnostic: SHARPEMU_STALL_DUMP_RANGE="addr,len[;addr,len...]" (hex) dumps guest
+			// memory ranges as hex when a stall is detected - useful for reading decrypted guest
+			// code (SELF modules) that is only mapped at runtime and cannot be paused after load.
+			var stallDumpSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_DUMP_RANGE");
+			if (!string.IsNullOrEmpty(stallDumpSpec))
+			{
+				foreach (var rangeSpec in stallDumpSpec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+				{
+					var parts = rangeSpec.Split(',', ':');
+					if (parts.Length != 2 ||
+						!ulong.TryParse(parts[0].Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var dumpAddr) ||
+						!ulong.TryParse(parts[1].Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var dumpLen))
+					{
+						continue;
+					}
+
+					dumpLen = Math.Min(dumpLen, 0x2000UL);
+					var dumpBuffer = new byte[dumpLen];
+					Console.Error.WriteLine(cpuContext.Memory.TryRead(dumpAddr, dumpBuffer)
+						? $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: {Convert.ToHexString(dumpBuffer)}"
+						: $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: <unreadable>");
+				}
 			}
 
 			var threads = SnapshotGuestThreads();

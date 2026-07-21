@@ -15,9 +15,14 @@ namespace SharpEmu.HLE;
 public static class GuestTlsTemplate
 {
     // Must match CpuDispatcher/DirectExecutionBackend's mapped prefix. PS5
-    // modules can require more than one host page of Variant II static TLS;
-    // Dreaming Sarah's startup image, for example, reaches 0x1870 bytes.
-    public const ulong StartupStaticTlsReservation = 0x10000UL;
+    // modules can require far more than one host page of Variant II static TLS:
+    // Dreaming Sarah's startup image reaches 0x1870 bytes, but large IL2CPP
+    // titles are much bigger - Subnautica's Il2CppUserAssemblies alone needs
+    // 0x187630 bytes of static TLS below the thread pointer. Reserve 2 MiB so
+    // those titles load; this sits comfortably inside the 0x0100_0000 (16 MiB)
+    // per-thread TLS region stride used by both the main and worker TLS mappers,
+    // so it cannot collide with an adjacent thread's block.
+    public const ulong StartupStaticTlsReservation = 0x20_0000UL;
     private static readonly object _gate = new();
     private static readonly SortedDictionary<ulong, ModuleTemplate> _modules = new();
     private static readonly Dictionary<ulong, ThreadDtv> _threadDtvs = new();

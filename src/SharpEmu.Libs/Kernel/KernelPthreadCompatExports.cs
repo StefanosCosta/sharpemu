@@ -28,6 +28,14 @@ public static class KernelPthreadCompatExports
     private static readonly ConcurrentDictionary<ulong, PthreadMutexState> _mutexStates = new();
     private static readonly Dictionary<ulong, PthreadMutexAttrState> _mutexAttrStates = new();
     private static readonly Dictionary<ulong, PthreadCondState> _condStates = new();
+
+    // Non-cooperative (host-parked) cond waiters, keyed by guest thread handle.
+    // A thread parked inside Monitor.Wait here never reaches an import boundary,
+    // so an asynchronously-delivered signal (pthread_kill / sceKernelRaiseException)
+    // would otherwise never run its handler. The signal path looks a target up
+    // here and wakes it via the ordinary spurious-wakeup completion path.
+    private static readonly ConcurrentDictionary<ulong, (PthreadCondState State, PthreadCondWaiter Waiter)> _hostParkedCondWaiters = new();
+
     private static readonly Dictionary<ulong, object> _onceGates = new();
     private static readonly HashSet<ulong> _condAttrStates = new();
     private static readonly bool _tracePthreads =
@@ -1524,27 +1532,47 @@ public static class KernelPthreadCompatExports
 
         // Non-guest callers have no resumable CPU continuation. Park only
         // those host-side compatibility callers, preserving the same FIFO
-        // mutex reacquisition rules as cooperative guest waiters.
-        lock (state.SyncRoot)
+        // mutex reacquisition rules as cooperative guest waiters. Register the
+        // park so an asynchronously-delivered signal can interrupt it.
+        _hostParkedCondWaiters[waiter.ThreadId] = (state, waiter);
+        try
         {
-            var deadline = timed
-                ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
-                : long.MaxValue;
-            while (waiter.CompletionState == 0)
+            // Close the race where a signal is queued for this thread between
+            // registration and the first sleep: the interrupt's wake would be
+            // lost, so complete immediately if a delivery is already pending.
+            // (Registration happens-before this check, and the signal is queued
+            // before its registry lookup, so either the interrupt already found
+            // this waiter or this check observes the pending delivery.)
+            if (GuestThreadExecution.Scheduler?.HasPendingGuestException(waiter.ThreadId) == true)
             {
-                if (!timed)
-                {
-                    Monitor.Wait(state.SyncRoot);
-                    continue;
-                }
+                CompleteCondWaiter(state, waiter, timedOut: false);
+            }
 
-                var remaining = GetRemainingTimeout(deadline);
-                if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+            lock (state.SyncRoot)
+            {
+                var deadline = timed
+                    ? GuestThreadExecution.ComputeDeadlineTimestamp(GetCondWaitTimeout(timeoutUsec))
+                    : long.MaxValue;
+                while (waiter.CompletionState == 0)
                 {
-                    CompleteCondWaiterLocked(state, waiter, timedOut: true);
-                    break;
+                    if (!timed)
+                    {
+                        Monitor.Wait(state.SyncRoot);
+                        continue;
+                    }
+
+                    var remaining = GetRemainingTimeout(deadline);
+                    if (remaining <= TimeSpan.Zero || !Monitor.Wait(state.SyncRoot, remaining))
+                    {
+                        CompleteCondWaiterLocked(state, waiter, timedOut: true);
+                        break;
+                    }
                 }
             }
+        }
+        finally
+        {
+            _hostParkedCondWaiters.TryRemove(waiter.ThreadId, out _);
         }
 
         if (waiter.MutexWaiter is null)
@@ -1837,6 +1865,25 @@ public static class KernelPthreadCompatExports
         }
 
         Monitor.PulseAll(state.SyncRoot);
+        return true;
+    }
+
+    // Wakes a thread host-parked in pthread_cond_wait so a signal queued for it
+    // can be delivered. The signal is modeled as a spurious cond wakeup: reusing
+    // CompleteCondWaiter reuses the vetted FIFO mutex-reacquisition hand-off, so
+    // the thread reacquires its mutex and returns from the wait, then runs the
+    // queued handler at the following import boundary. A no-op if the target is
+    // not parked here (running, or blocked on a different primitive) or already
+    // completed. Returns true when an interruptible park was found.
+    internal static bool InterruptHostParkedThreadForSignal(ulong threadHandle)
+    {
+        if (threadHandle == 0 ||
+            !_hostParkedCondWaiters.TryGetValue(threadHandle, out var parked))
+        {
+            return false;
+        }
+
+        CompleteCondWaiter(parked.State, parked.Waiter, timedOut: false);
         return true;
     }
 

@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -37,6 +38,36 @@ public sealed partial class DirectExecutionBackend
 		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_WRITE_ADDRS"));
 	private static readonly ulong[] _debugWriteWatchLastValues =
 		Enumerable.Repeat(ulong.MaxValue, _debugWriteWatchAddresses.Count).ToArray();
+	private static readonly List<ulong> _debugRetAddrs =
+		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_LOG_RET_ADDRS"));
+
+	// Reads and logs one guest u64 (SHARPEMU_LOG_MEM_U64=<hex addr>) alongside every
+	// SHARPEMU_LOG_RET_ADDRS hit, so a counter/field at a known address (e.g. a queue depth)
+	// can be sampled at the natural cadence of a specific call site instead of needing a
+	// live debug-server pause (which is unreliable against an already-running thread).
+	private static readonly ulong _debugMemU64Address =
+		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEM_U64")) is { Count: > 0 } memU64Addrs
+			? memU64Addrs[0]
+			: 0UL;
+
+	// Samples the first few calls of a specific NID (SHARPEMU_LOG_NID_RET_SAMPLE=<nid>) so the
+	// caller's return address can be discovered without knowing it up front - the inverse of
+	// SHARPEMU_LOG_RET_ADDRS, useful once a NidHistogram capture identifies a hot NID but not
+	// which guest call site is driving it.
+	private static readonly string? _debugNidRetSampleTarget =
+		Environment.GetEnvironmentVariable("SHARPEMU_LOG_NID_RET_SAMPLE");
+	private static long _debugNidRetSampleCount;
+
+	// Per-window NID call-count breakdown (SHARPEMU_LOG_NID_HISTOGRAM=1), flushed and reset every
+	// ~2 real seconds rather than accumulated forever, so a dump shows what's actually firing
+	// *right now* during a steady-state stall instead of being dominated by whatever ran most
+	// during boot. Distinguishes "only one NID is ever called" (genuine starvation) from "other
+	// NIDs are interleaved at some rate" (some other guest thread is doing real work), which raw
+	// per-OS-thread CPU sampling cannot do under this scheduler's cooperative multiplexing.
+	private static readonly bool _nidHistogramEnabled =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_NID_HISTOGRAM"), "1", StringComparison.Ordinal);
+	private static readonly ConcurrentDictionary<string, long> _nidHistogram = new();
+	private static long _nidHistogramLastFlushTicks = Environment.TickCount64;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
@@ -159,6 +190,10 @@ public sealed partial class DirectExecutionBackend
 					$"[LOADER][WATCH] addr=0x{watchAddress:X16} changed 0x{_debugWriteWatchLastValues[watchIndex]:X16} -> 0x{currentValue:X16} before import#{num}");
 				_debugWriteWatchLastValues[watchIndex] = currentValue;
 			}
+		}
+		if (SharpEmu.HLE.GuestWriteRipWatch.Enabled)
+		{
+			SharpEmu.HLE.GuestWriteRipWatch.ArmAndFlush();
 		}
 		if ((num & 0x3F) == 0)
 		{
@@ -595,7 +630,8 @@ public sealed partial class DirectExecutionBackend
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16} " +
+						$"guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId}");
 				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
@@ -1313,6 +1349,47 @@ public sealed partial class DirectExecutionBackend
 				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 				$"ret=0x{returnRip:X16}");
 		}
+		if (_debugRetAddrs.Count != 0 && _debugRetAddrs.Contains(returnRip))
+		{
+			var memU64Suffix = "";
+			if (_debugMemU64Address != 0 && cpuContext.TryReadUInt64(_debugMemU64Address, out var memU64Value))
+			{
+				memU64Suffix = $" mem[0x{_debugMemU64Address:X16}]=0x{memU64Value:X16} ({memU64Value})";
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] RetAddrHit#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"rax=0x{cpuContext[CpuRegister.Rax]:X16} r15=0x{cpuContext[CpuRegister.R15]:X16} " +
+				$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+				$"managed={Environment.CurrentManagedThreadId}{memU64Suffix}");
+		}
+		if (_debugNidRetSampleTarget is { Length: > 0 } &&
+			string.Equals(importStubEntry.Nid, _debugNidRetSampleTarget, StringComparison.Ordinal) &&
+			Interlocked.Increment(ref _debugNidRetSampleCount) % 3000 == 1)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] NidRetSample#{_debugNidRetSampleCount}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16}");
+		}
+		if (_nidHistogramEnabled)
+		{
+			_nidHistogram.AddOrUpdate($"{export.LibraryName}:{export.Name} ({importStubEntry.Nid})", 1, static (_, count) => count + 1);
+			var now = Environment.TickCount64;
+			var last = Volatile.Read(ref _nidHistogramLastFlushTicks);
+			if (now - last >= 2000 && Interlocked.CompareExchange(ref _nidHistogramLastFlushTicks, now, last) == last)
+			{
+				var snapshot = _nidHistogram.ToArray();
+				_nidHistogram.Clear();
+				Console.Error.WriteLine($"[LOADER][INFO] NidHistogram window={now - last}ms distinct={snapshot.Length}:");
+				foreach (var entry in snapshot.OrderByDescending(static kv => kv.Value).Take(20))
+				{
+					Console.Error.WriteLine($"[LOADER][INFO]   {entry.Value,10} x {entry.Key}");
+				}
+			}
+		}
 
 		int returnValue;
 		if (importStubEntry.IsNoBlockLeaf)
@@ -1362,7 +1439,8 @@ public sealed partial class DirectExecutionBackend
 					$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
 					$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 					$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} " +
-					$"ret=0x{returnRip:X16}");
+					$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+					$"managed={Environment.CurrentManagedThreadId}");
 			}
 		}
 

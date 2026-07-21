@@ -24,6 +24,20 @@ public static class KernelSyncOnAddressCompatExports
 {
     private static readonly ConcurrentDictionary<ulong, object> _gates = new();
 
+    // Bumped by SyncOnAddressWake before it pulses the gate. WaitOnHostThread captures the
+    // generation before it can yield and rechecks it under the same lock instead of trusting
+    // Monitor.Wait's return value alone: a bare Monitor.PulseAll only reaches a thread that is
+    // *already* inside Monitor.Wait at that exact instant, so a wake landing in the window
+    // between a host-thread caller deciding to block and actually entering the wait (e.g.
+    // while it's still computing its own timeout) would otherwise vanish with no persisted
+    // effect - a classic missed-wakeup, empirically confirmed this session (a real Wake call
+    // observed for a contended address, but the waiting host thread kept timing out and
+    // retrying forever regardless).
+    private static readonly ConcurrentDictionary<ulong, long> _wakeGenerations = new();
+
+    private static long CurrentGeneration(ulong address) =>
+        _wakeGenerations.TryGetValue(address, out var generation) ? generation : 0;
+
     private static object GetGate(ulong address) => _gates.GetOrAdd(address, static _ => new object());
 
     private static string GetWakeKey(ulong address) => $"sceKernelSyncOnAddressWait:{address:X16}";
@@ -61,6 +75,10 @@ public static class KernelSyncOnAddressCompatExports
 
         if (_traceSyncAddr) TraceSyncAddr($"wait-block addr=0x{address:X16} pattern=0x{pattern:X8} timeout={(timeoutAddress == 0 ? "infinite" : "finite")} {FormatCallSite(ctx)}");
 
+        // Captured now, before anything below can yield, so WaitOnHostThread's generation
+        // recheck covers the entire window from here on - see _wakeGenerations' comment.
+        var observedGeneration = CurrentGeneration(address);
+
         uint timeoutUsec = 0;
         if (timeoutAddress != 0 && !KernelMemoryCompatExports.TryReadUInt32Compat(ctx, timeoutAddress, out timeoutUsec))
         {
@@ -72,11 +90,26 @@ public static class KernelSyncOnAddressCompatExports
             ? GuestThreadExecution.ComputeDeadlineTimestamp(TimeSpan.FromMicroseconds(timeoutUsec))
             : 0;
 
-        // A raw futex wake carries no condition to re-check (unlike a semaphore's
-        // token count): being invoked at all means a real Wake targeted this key.
+        // A raw futex wake carries no re-checkable condition (unlike a semaphore's token
+        // count or an event flag's bit pattern), but DirectExecutionBackend's cooperative
+        // scheduler (RunGuestThread / ResumeBlockedNestedGuestCallback) always makes one
+        // synchronous, speculative TryWake() call immediately after registering a block -
+        // a correct anti-lost-wakeup check for waiters with a real condition to re-test,
+        // but structurally guaranteed to be spurious here: single-threaded cooperative
+        // scheduling means no other guest thread can have run (and so no real
+        // SyncOnAddressWake could have fired) between this wait registering and that
+        // immediate recheck. Only WakeBlockedThreads's later, real, key-matched call
+        // constitutes an actual wake - ignore invocation #1 unconditionally.
+        var invocationCount = 0;
         var woken = false;
         bool WakePredicate()
         {
+            invocationCount++;
+            if (invocationCount == 1)
+            {
+                return false;
+            }
+
             woken = true;
             return true;
         }
@@ -100,10 +133,10 @@ public static class KernelSyncOnAddressCompatExports
 
         // Not a guest thread (or no scheduler): fall back to a host-thread wait so the
         // semantics still hold on non-cooperative callers.
-        return WaitOnHostThread(ctx, address, timeoutAddress, timeoutUsec);
+        return WaitOnHostThread(ctx, address, timeoutAddress, timeoutUsec, observedGeneration);
     }
 
-    private static int WaitOnHostThread(CpuContext ctx, ulong address, ulong timeoutAddress, uint timeoutUsec)
+    private static int WaitOnHostThread(CpuContext ctx, ulong address, ulong timeoutAddress, uint timeoutUsec, long observedGeneration)
     {
         var gate = GetGate(address);
         var deadlineMs = timeoutAddress != 0
@@ -111,18 +144,19 @@ public static class KernelSyncOnAddressCompatExports
             : long.MaxValue;
         lock (gate)
         {
-            var remaining = deadlineMs - Environment.TickCount64;
-            if (timeoutAddress != 0 && remaining <= 0)
+            // Rechecked every iteration under the same lock SyncOnAddressWake pulses under,
+            // instead of trusting Monitor.Wait's pulsed/timed-out return value alone - closes
+            // the lost-wakeup window described on _wakeGenerations.
+            while (CurrentGeneration(address) == observedGeneration)
             {
-                if (_traceSyncAddr) TraceSyncAddr($"wait-host-timeout-immediate addr=0x{address:X16}");
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
-            }
+                var remaining = deadlineMs - Environment.TickCount64;
+                if (timeoutAddress != 0 && remaining <= 0)
+                {
+                    if (_traceSyncAddr) TraceSyncAddr($"wait-host-timeout addr=0x{address:X16}");
+                    return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                }
 
-            var pulsed = Monitor.Wait(gate, remaining <= 0 ? Timeout.Infinite : (int)Math.Min(remaining, int.MaxValue));
-            if (!pulsed)
-            {
-                if (_traceSyncAddr) TraceSyncAddr($"wait-host-timeout addr=0x{address:X16}");
-                return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                Monitor.Wait(gate, remaining <= 0 ? Timeout.Infinite : (int)Math.Min(remaining, int.MaxValue));
             }
         }
 
@@ -150,6 +184,11 @@ public static class KernelSyncOnAddressCompatExports
         // sibling exports).
         var maxCount = count < 0 ? int.MaxValue : count;
         var woke = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(address), maxCount);
+
+        // Bumped before pulsing so a host-thread waiter's generation recheck (either already
+        // under the gate's lock, or about to enter it) always observes this wake, even if it
+        // isn't inside Monitor.Wait at this exact instant.
+        _wakeGenerations.AddOrUpdate(address, 1, static (_, current) => current + 1);
 
         if (_gates.TryGetValue(address, out var gate))
         {

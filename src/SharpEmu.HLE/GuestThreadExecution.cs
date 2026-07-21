@@ -116,6 +116,16 @@ public interface IGuestThreadScheduler
         ulong handler,
         int exceptionType,
         out string? error);
+
+    /// <summary>
+    /// Reports whether a guest exception (e.g. an asynchronously-delivered POSIX
+    /// signal) has been queued for the given thread but not yet run. A thread
+    /// host-parked in an HLE wait must consult this before and while it sleeps so
+    /// it can wake itself and return to an import boundary where the queued
+    /// handler is delivered; otherwise a signal raised on a parked thread is never
+    /// observed. Defaults to false for schedulers that never queue exceptions.
+    /// </summary>
+    bool HasPendingGuestException(ulong threadHandle) => false;
 }
 
 public readonly record struct GuestImportCallFrame(

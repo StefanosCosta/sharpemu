@@ -1,6 +1,7 @@
 // Copyright (C) 2026 SharpEmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+using System.Buffers;
 using System.Runtime.InteropServices;
 using SharpEmu.Core.Loader;
 using SharpEmu.HLE;
@@ -126,6 +127,15 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
     {
         _hostMemory = hostMemory ?? CrossPlatformHostMemory.Instance;
     }
+
+    /// <summary>
+    /// Optional fallback for accesses that miss every tracked region - notably
+    /// libc-<c>malloc</c>'d buffers, which live at host addresses outside the
+    /// region table. Consulted only after both the single-region and
+    /// contiguous-multi-region lookups fail, so mapped-memory behaviour and the
+    /// hot path are unchanged. See <see cref="IExternalHostMemoryAccessor"/>.
+    /// </summary>
+    public IExternalHostMemoryAccessor? ExternalHostMemory { get; set; }
 
     private sealed class CrossPlatformHostMemory : IHostMemory
     {
@@ -886,6 +896,42 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     return true;
                 }
             }
+            else if (!destination.IsEmpty &&
+                FindContiguousRegionSpan(virtualAddress, (ulong)destination.Length) is { } segments)
+            {
+                foreach (var segment in segments)
+                {
+                    if (segment.Region.IsReservedOnly &&
+                        !EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
+
+                var needsExclusive = false;
+                foreach (var segment in segments)
+                {
+                    if (!CanReadWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+                    {
+                        needsExclusive = true;
+                        break;
+                    }
+                }
+
+                if (needsExclusive)
+                {
+                    requiresExclusiveAccess = true;
+                }
+                else
+                {
+                    fixed (byte* destPtr = destination)
+                    {
+                        Buffer.MemoryCopy((void*)virtualAddress, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+                    }
+
+                    return true;
+                }
+            }
         }
         finally
         {
@@ -894,7 +940,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
         if (!requiresExclusiveAccess)
         {
-            return false;
+            // Genuine miss (no tracked region owns this range). Fall back to the
+            // external host accessor - libc-malloc'd buffers live at host
+            // addresses outside the region table - so a single ctx.Memory path
+            // serves them without every I/O syscall opting in.
+            return ExternalHostMemory is { } external &&
+                external.TryReadExternal(virtualAddress, destination);
         }
 
         _gate.EnterWriteLock();
@@ -914,38 +965,79 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         try
         {
             var region = FindRegion(virtualAddress, (ulong)expected.Length);
-            if (region is null ||
-                !TryResolveRegionOffset(
+            if (region is not null &&
+                TryResolveRegionOffset(
                     virtualAddress,
                     (ulong)expected.Length,
                     region,
                     out var offset))
             {
-                return false;
+                if (expected.IsEmpty)
+                {
+                    return true;
+                }
+
+                var srcPtr = (void*)(region.VirtualAddress + offset);
+                if (region.IsReservedOnly &&
+                    !EnsureRangeCommitted((ulong)srcPtr, (ulong)expected.Length, region))
+                {
+                    return false;
+                }
+
+                if (!CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)expected.Length, region))
+                {
+                    return false;
+                }
+
+                return new ReadOnlySpan<byte>(srcPtr, expected.Length).SequenceEqual(expected);
             }
 
-            if (expected.IsEmpty)
+            // No single region owns the whole range - see if a back-to-back run
+            // of separately-allocated regions does (same fallback as TryRead).
+            if (!expected.IsEmpty &&
+                FindContiguousRegionSpan(virtualAddress, (ulong)expected.Length) is { } segments)
             {
-                return true;
-            }
+                foreach (var segment in segments)
+                {
+                    if (segment.Region.IsReservedOnly &&
+                        !EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
 
-            var srcPtr = (void*)(region.VirtualAddress + offset);
-            if (region.IsReservedOnly &&
-                !EnsureRangeCommitted((ulong)srcPtr, (ulong)expected.Length, region))
-            {
-                return false;
-            }
+                foreach (var segment in segments)
+                {
+                    if (!CanReadWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
 
-            if (!CanReadWithoutProtectionChange((ulong)srcPtr, (ulong)expected.Length, region))
-            {
-                return false;
+                return new ReadOnlySpan<byte>((void*)virtualAddress, expected.Length).SequenceEqual(expected);
             }
-
-            return new ReadOnlySpan<byte>(srcPtr, expected.Length).SequenceEqual(expected);
         }
         finally
         {
             _gate.ExitReadLock();
+        }
+
+        // Genuine miss - fall back to the external host accessor (libc-heap
+        // buffers), outside the region lock. Read the range and compare.
+        if (expected.IsEmpty || ExternalHostMemory is not { } external)
+        {
+            return false;
+        }
+
+        var rented = ArrayPool<byte>.Shared.Rent(expected.Length);
+        try
+        {
+            var buffer = rented.AsSpan(0, expected.Length);
+            return external.TryReadExternal(virtualAddress, buffer) && buffer.SequenceEqual(expected);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
         }
     }
 
@@ -1001,6 +1093,43 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
                     return true;
                 }
             }
+            else if (!source.IsEmpty &&
+                FindContiguousRegionSpan(virtualAddress, (ulong)source.Length) is { } segments)
+            {
+                foreach (var segment in segments)
+                {
+                    if (segment.Region.IsReservedOnly &&
+                        !EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
+
+                var needsExclusive = false;
+                foreach (var segment in segments)
+                {
+                    if (!CanWriteWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+                    {
+                        needsExclusive = true;
+                        break;
+                    }
+                }
+
+                if (needsExclusive)
+                {
+                    requiresExclusiveAccess = true;
+                }
+                else
+                {
+                    fixed (byte* srcPtr = source)
+                    {
+                        Buffer.MemoryCopy(srcPtr, (void*)virtualAddress, (nuint)source.Length, (nuint)source.Length);
+                    }
+
+                    NotifyGuestWriteWatch(virtualAddress, source);
+                    return true;
+                }
+            }
         }
         finally
         {
@@ -1009,7 +1138,12 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
 
         if (!requiresExclusiveAccess)
         {
-            return false;
+            // Genuine miss - fall back to the external host accessor (libc-heap
+            // buffers). NotifyGuestWriteWatch is intentionally not invoked here:
+            // external host ranges are not guest-image/GPU-tracked, matching the
+            // pre-existing host-fallback write path.
+            return ExternalHostMemory is { } external &&
+                external.TryWriteExternal(virtualAddress, source);
         }
 
         _gate.EnterWriteLock();
@@ -1051,32 +1185,112 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
         {
             var sourceRegion = FindRegion(sourceAddress, length);
             var destinationRegion = FindRegion(destinationAddress, length);
-            if (sourceRegion is null || destinationRegion is null ||
-                !TryResolveRegionOffset(sourceAddress, length, sourceRegion, out var sourceOffset) ||
-                !TryResolveRegionOffset(destinationAddress, length, destinationRegion, out var destinationOffset))
+
+            // Source and destination are resolved fully independently: their
+            // region-boundary split points are unrelated, so either side may
+            // need the single-region fast path while the other needs the
+            // multi-segment fallback (or both may need it, at different splits).
+            List<RegionSegment>? sourceSegments = null;
+            if (sourceRegion is null &&
+                (sourceSegments = FindContiguousRegionSpan(sourceAddress, length)) is null)
             {
                 return false;
             }
 
-            var sourcePointer = sourceRegion.VirtualAddress + sourceOffset;
-            var destinationPointer = destinationRegion.VirtualAddress + destinationOffset;
-            if ((sourceRegion.IsReservedOnly &&
-                 !EnsureRangeCommitted(sourcePointer, length, sourceRegion)) ||
-                (destinationRegion.IsReservedOnly &&
-                 !EnsureRangeCommitted(destinationPointer, length, destinationRegion)) ||
-                !CanReadWithoutProtectionChange(sourcePointer, length, sourceRegion) ||
-                !CanWriteWithoutProtectionChange(destinationPointer, length, destinationRegion))
+            List<RegionSegment>? destinationSegments = null;
+            if (destinationRegion is null &&
+                (destinationSegments = FindContiguousRegionSpan(destinationAddress, length)) is null)
             {
                 return false;
+            }
+
+            // Preserve the original single-call ordering exactly: commit
+            // source, commit destination, check source readable, check
+            // destination writable - each step now covering every region the
+            // corresponding side spans before moving to the next step.
+            if (sourceRegion is not null)
+            {
+                if (sourceRegion.IsReservedOnly && !EnsureRangeCommitted(sourceAddress, length, sourceRegion))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                foreach (var segment in sourceSegments!)
+                {
+                    if (segment.Region.IsReservedOnly &&
+                        !EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (destinationRegion is not null)
+            {
+                if (destinationRegion.IsReservedOnly && !EnsureRangeCommitted(destinationAddress, length, destinationRegion))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                foreach (var segment in destinationSegments!)
+                {
+                    if (segment.Region.IsReservedOnly &&
+                        !EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (sourceRegion is not null)
+            {
+                if (!CanReadWithoutProtectionChange(sourceAddress, length, sourceRegion))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                foreach (var segment in sourceSegments!)
+                {
+                    if (!CanReadWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            if (destinationRegion is not null)
+            {
+                if (!CanWriteWithoutProtectionChange(destinationAddress, length, destinationRegion))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                foreach (var segment in destinationSegments!)
+                {
+                    if (!CanWriteWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+                    {
+                        return false;
+                    }
+                }
             }
 
             // Span.CopyTo has memmove overlap semantics, so this allocation-free
-            // path safely serves both libc memcpy and libc memmove.
-            new ReadOnlySpan<byte>((void*)sourcePointer, checked((int)length)).CopyTo(
-                new Span<byte>((void*)destinationPointer, checked((int)length)));
+            // path safely serves both libc memcpy and libc memmove, regardless
+            // of how many regions either side spans (identity-mapped, so the
+            // raw addresses are already the correct host pointers).
+            new ReadOnlySpan<byte>((void*)sourceAddress, checked((int)length)).CopyTo(
+                new Span<byte>((void*)destinationAddress, checked((int)length)));
             NotifyGuestWriteWatch(
                 destinationAddress,
-                new ReadOnlySpan<byte>((void*)destinationPointer, checked((int)length)));
+                new ReadOnlySpan<byte>((void*)destinationAddress, checked((int)length)));
             return true;
         }
         finally
@@ -1131,7 +1345,58 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return true;
         }
 
-        return false;
+        // No single region owns the whole range. This must fully recompute
+        // (not reuse anything TryRead computed under the read lock) since
+        // another thread could have freed/reallocated a region or changed
+        // page protections between releasing the read lock and acquiring
+        // this write lock.
+        if (destination.IsEmpty ||
+            FindContiguousRegionSpan(virtualAddress, (ulong)destination.Length) is not { } segments)
+        {
+            return false;
+        }
+
+        foreach (var segment in segments)
+        {
+            if (!EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+            {
+                return false;
+            }
+        }
+
+        var allTouchedPages = new List<(ulong Address, uint Protection)>();
+        foreach (var segment in segments)
+        {
+            if (CanReadWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+            {
+                continue;
+            }
+
+            if (!TryTemporarilyProtectForRead(segment.Start, segment.Length, segment.Region, out var segmentTouchedPages))
+            {
+                // Roll back every segment already elevated by an earlier
+                // iteration of this loop - TryTemporarilyProtectForRead only
+                // cleans up its own internal partial failure.
+                RestorePageProtections(allTouchedPages);
+                return false;
+            }
+
+            allTouchedPages.AddRange(segmentTouchedPages);
+        }
+
+        try
+        {
+            fixed (byte* destPtr = destination)
+            {
+                Buffer.MemoryCopy((void*)virtualAddress, destPtr, (nuint)destination.Length, (nuint)destination.Length);
+            }
+        }
+        finally
+        {
+            RestorePageProtections(allTouchedPages);
+        }
+
+        return true;
     }
 
     private bool TryWriteExclusive(ulong virtualAddress, ReadOnlySpan<byte> source)
@@ -1186,7 +1451,68 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             return true;
         }
 
-        return false;
+        // No single region owns the whole range - fully recompute (never
+        // reuse a segment list computed while only the read lock was held;
+        // see TryReadExclusive's identical TOCTOU note above).
+        if (source.IsEmpty ||
+            FindContiguousRegionSpan(virtualAddress, (ulong)source.Length) is not { } segments)
+        {
+            return false;
+        }
+
+        foreach (var segment in segments)
+        {
+            if (!EnsureRangeCommitted(segment.Start, segment.Length, segment.Region))
+            {
+                return false;
+            }
+        }
+
+        // Different segments can need different old-protection values to
+        // restore correctly, so each segment needing elevation gets its own
+        // Protect/ProtectRaw pair rather than one call over the combined range.
+        var protectedRanges = new List<(ulong Address, ulong Length, uint OldProtection)>();
+        foreach (var segment in segments)
+        {
+            if (CanWriteWithoutProtectionChange(segment.Start, segment.Length, segment.Region))
+            {
+                continue;
+            }
+
+            if (!_hostMemory.Protect(segment.Start, segment.Length, HostPageProtection.ReadWriteExecute, out var oldProtect))
+            {
+                foreach (var protectedRange in protectedRanges)
+                {
+                    _hostMemory.ProtectRaw(protectedRange.Address, protectedRange.Length, protectedRange.OldProtection, out _);
+                }
+
+                return false;
+            }
+
+            protectedRanges.Add((segment.Start, segment.Length, oldProtect));
+        }
+
+        try
+        {
+            fixed (byte* srcPtr = source)
+            {
+                Buffer.MemoryCopy(srcPtr, (void*)virtualAddress, (nuint)source.Length, (nuint)source.Length);
+            }
+        }
+        finally
+        {
+            foreach (var protectedRange in protectedRanges)
+            {
+                _hostMemory.ProtectRaw(protectedRange.Address, protectedRange.Length, protectedRange.OldProtection, out _);
+                if (IsExecutableProtection(protectedRange.OldProtection))
+                {
+                    _hostMemory.FlushInstructionCache(protectedRange.Address, protectedRange.Length);
+                }
+            }
+        }
+
+        NotifyGuestWriteWatch(virtualAddress, source);
+        return true;
     }
 
     public bool TryWriteUInt64(ulong virtualAddress, ulong value)
@@ -1253,6 +1579,77 @@ public sealed unsafe class PhysicalVirtualMemory : IVirtualMemory, IGuestMemoryA
             TryResolveRegionOffset(address, size, candidate, out _)
                 ? candidate
                 : null;
+    }
+
+    private readonly record struct RegionSegment(MemoryRegion Region, ulong Start, ulong Length);
+
+    // Only called after FindRegion(address, size) has already returned null for a
+    // non-zero size - i.e. no single region owns the whole requested range. Walks
+    // the sorted _regions list to determine whether [address, address+size) is
+    // covered by a back-to-back run of two or more separately-allocated regions
+    // with no gap (e.g. adjacent sceKernelMmap reservations that were never
+    // coalesced). This exists purely so the existing per-region helpers
+    // (EnsureRangeCommitted, CanReadWithoutProtectionChange, etc.) can be called
+    // once per covering region instead of requiring one region to own the whole
+    // range - since this system is identity-mapped, the actual data movement can
+    // still be a single combined copy over the raw address range regardless of
+    // how many regions it spans. Region sizes are always page-aligned, so a host
+    // page is never split across two regions - segment cut points landing exactly
+    // on region boundaries is therefore always safe.
+    private List<RegionSegment>? FindContiguousRegionSpan(ulong address, ulong size)
+    {
+        if (size == 0 || address > ulong.MaxValue - size)
+        {
+            return null;
+        }
+
+        var end = address + size;
+
+        var low = 0;
+        var high = _regions.Count - 1;
+        var index = -1;
+        while (low <= high)
+        {
+            var middle = low + ((high - low) >> 1);
+            if (_regions[middle].VirtualAddress <= address)
+            {
+                index = middle;
+                low = middle + 1;
+            }
+            else
+            {
+                high = middle - 1;
+            }
+        }
+
+        if (index < 0)
+        {
+            return null;
+        }
+
+        var segments = new List<RegionSegment>();
+        var cursor = address;
+        while (cursor < end)
+        {
+            if (index >= _regions.Count)
+            {
+                return null; // ran off the end of the region list: unmapped tail
+            }
+
+            var region = _regions[index];
+            var regionEnd = region.VirtualAddress + region.Size;
+            if (region.VirtualAddress > cursor || regionEnd <= cursor)
+            {
+                return null; // gap before this region, or cursor already past it
+            }
+
+            var segmentEnd = Math.Min(end, regionEnd);
+            segments.Add(new RegionSegment(region, cursor, segmentEnd - cursor));
+            cursor = segmentEnd;
+            index++;
+        }
+
+        return segments;
     }
 
     private void InsertRegionSorted(MemoryRegion region)

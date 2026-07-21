@@ -219,8 +219,34 @@ public sealed unsafe partial class DirectExecutionBackend
 				return;
 			}
 
+			// Diagnostic RIP write-watch (SHARPEMU_WATCH_WRITE_RIP): needs both
+			// the fault address and the faulting instruction pointer, so it reads
+			// RIP from the register context (last PosixRegisterOffsets entry).
+			if (SharpEmu.HLE.GuestWriteRipWatch.Enabled &&
+				signal != PosixSigIll &&
+				siginfo != 0)
+			{
+				var ripWatchRegisters = GetPosixRegisterBase(ucontext);
+				if (ripWatchRegisters != null &&
+					SharpEmu.HLE.GuestWriteRipWatch.TryHandleWriteFault(
+						*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset),
+						*(ulong*)(ripWatchRegisters + PosixRegisterOffsets[PosixRegisterOffsets.Length - 1])))
+				{
+					return;
+				}
+			}
+
 			if (TryHandlePosixFault(signal, siginfo, ucontext))
 			{
+				// A handled fault often just committed a lazily-reserved page.
+				// Re-attempt arming any pending RIP write-watch now (signal-safe:
+				// mprotect only, no allocation/Console) so a freshly-committed
+				// page is protected before the guest's retried store lands - the
+				// import-boundary re-arm alone races that first store.
+				if (SharpEmu.HLE.GuestWriteRipWatch.Enabled)
+				{
+					SharpEmu.HLE.GuestWriteRipWatch.Arm();
+				}
 				return;
 			}
 		}

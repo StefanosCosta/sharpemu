@@ -67,6 +67,107 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
+    public void KernelOpenUnderscore_RandomDeviceReturnsValidFd()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0; // O_RDONLY
+
+        var result = KernelMemoryCompatExports.KernelOpenUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(ulong.MaxValue, context[CpuRegister.Rax]);
+        Assert.True(context[CpuRegister.Rax] > 2); // past stdin/stdout/stderr
+
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Theory]
+    [InlineData("/dev/random")]
+    [InlineData("/dev/srandom")]
+    public void KernelOpenUnderscore_RandomDeviceAliasesReturnValidFd(string devicePath)
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, devicePath);
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+
+        var result = KernelMemoryCompatExports.KernelOpenUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(ulong.MaxValue, context[CpuRegister.Rax]);
+
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Fact]
+    public void KernelReadUnderscore_RandomDeviceReturnsNonZeroRandomBytes()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        const ulong bufferAddress = memoryBase + 0x200;
+        const int length = 64;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var fd = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = fd;
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = length;
+        var readResult = KernelMemoryCompatExports.KernelReadUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, readResult);
+        Assert.Equal((ulong)length, context[CpuRegister.Rax]);
+
+        Span<byte> buffer = stackalloc byte[length];
+        Assert.True(memory.TryRead(bufferAddress, buffer));
+        // Not a randomness test, just confirms real bytes came back rather
+        // than an untouched zero-filled buffer.
+        Assert.Contains(buffer.ToArray(), b => b != 0);
+
+        context[CpuRegister.Rdi] = fd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Fact]
+    public void KernelOpenUnderscore_RandomDeviceRepeatOpenGetsIndependentFds()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var firstFd = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var secondFd = context[CpuRegister.Rax];
+
+        Assert.NotEqual(firstFd, secondFd);
+
+        context[CpuRegister.Rdi] = firstFd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+        context[CpuRegister.Rdi] = secondFd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Fact]
     public void PosixFstatCore_InvalidDescriptorReturnsMinusOne()
     {
         const ulong memoryBase = 0x1_0000_0000;

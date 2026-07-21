@@ -70,7 +70,6 @@ public static partial class KernelMemoryCompatExports
     private const int Enomem = 12;
     private const int Eacces = 13;
     private const int Efault = 14;
-    private const int Ebadf = 9;
     private const int Einval = 22;
     private const int Erange = 34;
     private const int Struncate = 80;

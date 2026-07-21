@@ -779,6 +779,13 @@ public static class KernelPthreadCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_OK;
             }
 
+            if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
+                IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
+            {
+                TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
+                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
+            }
+
             if (state.Type == MutexTypeAdaptiveNp)
             {
                 var adaptiveResult = tryOnly
@@ -822,6 +829,13 @@ public static class KernelPthreadCompatExports
                     state.RecursionCount++;
                     TracePthreadMutex(ctx, tryOnly ? "trylock" : "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_OK);
                     return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+                }
+
+                if (!tryOnly && state.Type == MutexTypeAdaptiveNp &&
+                    IsGuestTrackedSelfLock(ctx, mutexAddress, currentThreadId))
+                {
+                    TracePthreadMutex(ctx, "lock", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK);
+                    return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_DEADLOCK;
                 }
 
                 if (state.Type == MutexTypeAdaptiveNp)
@@ -1839,6 +1853,10 @@ public static class KernelPthreadCompatExports
         TracePthreadMutex(ctx, "lock-resume-ungranted", mutexAddress, resolvedAddress, state, currentThreadId, (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY);
         return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_BUSY;
     }
+
+    private static bool IsGuestTrackedSelfLock(CpuContext ctx, ulong mutexAddress, ulong currentThreadId) =>
+        KernelMemoryCompatExports.TryReadUInt64Compat(ctx, mutexAddress + 8, out var guestOwner) &&
+        guestOwner == currentThreadId;
 
     private static bool CompleteCondWaiterLocked(
         PthreadCondState state,

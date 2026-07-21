@@ -43,7 +43,7 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
-    public void PosixOpenCore_MissingFileReturnsMinusOne()
+    public void PosixOpen_MissingFileReturnsMinusOne()
     {
         const ulong memoryBase = 0x1_0000_0000;
         const ulong pathAddress = memoryBase + 0x100;
@@ -53,15 +53,14 @@ public sealed class KernelMemoryCompatExportsTests
         context[CpuRegister.Rdi] = pathAddress;
         context[CpuRegister.Rsi] = 0; // O_RDONLY
 
-        var result = KernelMemoryCompatExports.PosixOpenCore(context);
+        var result = KernelMemoryCompatExports.PosixOpen(context);
 
-        // A missing file must come back as the POSIX open(2) failure sentinel
-        // (-1 in RAX). Guest libc's File::Open only compares the low 32 bits
-        // of the return against -1 (`cmp eax, -1`); the raw Orbis kernel
-        // result (e.g. ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002) never equals
-        // that, so a missing file used to be silently read back as success
-        // with a bogus "file descriptor" - this is what that regressed into
-        // deep in IL2CPP metadata symbol loading for a missing il2cpp.usym.
+        // A libc open() failure must be -1, not the raw 0x8002xxxx sentinel the
+        // guest would otherwise store as a valid fd and later dereference. Guest
+        // libc's File::Open only compares the low 32 bits against -1 (cmp eax,-1);
+        // the raw Orbis result (e.g. ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002) never
+        // equals that, so a missing file used to be read back as success with a
+        // bogus fd - which regressed deep in IL2CPP metadata symbol loading.
         Assert.Equal(-1, result);
         Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
     }
@@ -168,16 +167,65 @@ public sealed class KernelMemoryCompatExportsTests
     }
 
     [Fact]
-    public void PosixFstatCore_InvalidDescriptorReturnsMinusOne()
+    public void PosixFstat_BadDescriptorReturnsMinusOne()
     {
         const ulong memoryBase = 0x1_0000_0000;
         const ulong statAddress = memoryBase + 0x400;
         var memory = new FakeCpuMemory(memoryBase, 0x1000);
         var context = new CpuContext(memory, Generation.Gen5);
-        context[CpuRegister.Rdi] = 999_999; // never-opened fd
+        context[CpuRegister.Rdi] = 0x80020002; // the not-found sentinel misused as an fd
         context[CpuRegister.Rsi] = statAddress;
 
-        var result = KernelMemoryCompatExports.PosixFstatCore(context);
+        var result = KernelMemoryCompatExports.PosixFstat(context);
+
+        Assert.Equal(-1, result);
+        Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void PosixClose_BadDescriptorReturnsMinusOne()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 0x80020002; // never-opened / sentinel fd
+
+        var result = KernelMemoryCompatExports.PosixClose(context);
+
+        Assert.Equal(-1, result);
+        Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void PosixRead_BadDescriptorReturnsMinusOne()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong bufferAddress = memoryBase + 0x200;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 0x80020002; // never-opened / sentinel fd
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = 0x40;
+
+        var result = KernelMemoryCompatExports.PosixRead(context);
+
+        Assert.Equal(-1, result);
+        Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void PosixWrite_BadDescriptorReturnsMinusOne()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong bufferAddress = memoryBase + 0x200;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(bufferAddress, "payload");
+        context[CpuRegister.Rdi] = 0x80020002; // never-opened / sentinel fd
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = 0x7;
+
+        var result = KernelMemoryCompatExports.PosixWrite(context);
 
         Assert.Equal(-1, result);
         Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);

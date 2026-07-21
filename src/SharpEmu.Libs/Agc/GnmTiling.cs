@@ -194,6 +194,164 @@ internal static class GnmTiling
         }
     }
 
+    public static bool TryGetBlockElementDimensions(
+        uint swizzleMode,
+        int bytesPerElement,
+        out int blockWidth,
+        out int blockHeight)
+    {
+        blockWidth = 0;
+        blockHeight = 0;
+        if (bytesPerElement <= 0 ||
+            !TryGetSwizzleKind(swizzleMode, out _, out var blockBytes))
+        {
+            return false;
+        }
+
+        var bppLog2 = BitLog2((uint)bytesPerElement);
+        if (bppLog2 < 0)
+        {
+            return false;
+        }
+
+        (blockWidth, blockHeight) = SquareBlockDimensions(blockBytes >> bppLog2);
+        return blockWidth != 0 && blockHeight != 0;
+    }
+
+    /// <summary>
+    /// Locates mip 0 in a GFX10 mip chain, which AddrLib stores smallest-first
+    /// (Gfx10Lib::ComputeSurfaceInfoMacroTiled/MicroTiled).
+    /// </summary>
+    public static bool TryGetBaseMipPlacement(
+        uint swizzleMode,
+        int elementsWide,
+        int elementsHigh,
+        int bytesPerElement,
+        uint resourceMipLevels,
+        out ulong byteOffset,
+        out bool inMipTail,
+        out int tailElementX,
+        out int tailElementY,
+        out ulong chainSliceBytes)
+    {
+        byteOffset = 0;
+        inMipTail = false;
+        tailElementX = 0;
+        tailElementY = 0;
+        chainSliceBytes = 0;
+        if (resourceMipLevels <= 1 ||
+            !ShouldDetile(swizzleMode) ||
+            elementsWide <= 0 ||
+            elementsHigh <= 0 ||
+            bytesPerElement <= 0 ||
+            !TryGetSwizzleKind(swizzleMode, out _, out var blockBytes))
+        {
+            return false;
+        }
+
+        var bppLog2 = BitLog2((uint)bytesPerElement);
+        if (bppLog2 < 0)
+        {
+            return false;
+        }
+
+        var (blockWidth, blockHeight) = SquareBlockDimensions(blockBytes >> bppLog2);
+        var blockSizeLog2 = BitLog2((uint)blockBytes);
+        if (blockWidth == 0 || blockHeight == 0 || blockSizeLog2 < 8)
+        {
+            return false;
+        }
+
+        var mipLevels = (int)Math.Min(resourceMipLevels, 16u);
+        var maxMipsInTail = blockSizeLog2 <= 8 ? 0
+            : blockSizeLog2 <= 11
+                ? 1 + (1 << (blockSizeLog2 - 9))
+                : blockSizeLog2 - 4;
+        var tailWidth = (blockSizeLog2 & 1) != 0 ? blockWidth >> 1 : blockWidth;
+        var tailHeight = (blockSizeLog2 & 1) != 0 ? blockHeight : blockHeight >> 1;
+
+        var firstMipInTail = mipLevels;
+        var mipSizes = new ulong[mipLevels];
+        for (var i = 0; i < mipLevels; i++)
+        {
+            var mipWidth = Math.Max(elementsWide >> i, 1);
+            var mipHeight = Math.Max(elementsHigh >> i, 1);
+            if (maxMipsInTail > 0 &&
+                mipWidth <= tailWidth &&
+                mipHeight <= tailHeight &&
+                mipLevels - i <= maxMipsInTail)
+            {
+                firstMipInTail = i;
+                break;
+            }
+
+            var alignedWidth = (ulong)(mipWidth + blockWidth - 1) / (ulong)blockWidth * (ulong)blockWidth;
+            var alignedHeight = (ulong)(mipHeight + blockHeight - 1) / (ulong)blockHeight * (ulong)blockHeight;
+            mipSizes[i] = alignedWidth * alignedHeight * (ulong)bytesPerElement;
+        }
+
+        if (firstMipInTail == 0)
+        {
+            var m = maxMipsInTail - 1;
+            var mipOffset = m > 6 ? 16 << m : m << 8;
+            var mipX = ((mipOffset >> 9) & 1) |
+                       ((mipOffset >> 10) & 2) |
+                       ((mipOffset >> 11) & 4) |
+                       ((mipOffset >> 12) & 8) |
+                       ((mipOffset >> 13) & 16) |
+                       ((mipOffset >> 14) & 32);
+            var mipY = ((mipOffset >> 8) & 1) |
+                       ((mipOffset >> 9) & 2) |
+                       ((mipOffset >> 10) & 4) |
+                       ((mipOffset >> 11) & 8) |
+                       ((mipOffset >> 12) & 16) |
+                       ((mipOffset >> 13) & 32);
+            if ((blockSizeLog2 & 1) != 0)
+            {
+                (mipX, mipY) = (mipY, mipX);
+                if ((bppLog2 & 1) != 0)
+                {
+                    mipY = (mipY << 1) | (mipX & 1);
+                    mipX >>= 1;
+                }
+            }
+
+            var (microWidth, microHeight) = SquareBlockDimensions(256 >> bppLog2);
+            if (microWidth == 0 || microHeight == 0)
+            {
+                return false;
+            }
+
+            tailElementX = mipX * microWidth;
+            tailElementY = mipY * microHeight;
+            if (tailElementX + elementsWide > blockWidth ||
+                tailElementY + elementsHigh > blockHeight)
+            {
+                tailElementX = 0;
+                tailElementY = 0;
+                return false;
+            }
+
+            inMipTail = true;
+            chainSliceBytes = (ulong)blockBytes;
+            return true;
+        }
+
+        byteOffset = firstMipInTail < mipLevels ? (ulong)blockBytes : 0;
+        chainSliceBytes = byteOffset;
+        for (var i = firstMipInTail - 1; i >= 1; i--)
+        {
+            byteOffset += mipSizes[i];
+        }
+
+        for (var i = 0; i < firstMipInTail; i++)
+        {
+            chainSliceBytes += mipSizes[i];
+        }
+
+        return true;
+    }
+
     /// <summary>
     /// Deswizzles <paramref name="tiled"/> into linear row-major order.
     /// Elements are pixels for uncompressed formats and 4x4 blocks for
@@ -264,6 +422,18 @@ internal static class GnmTiling
             }
         }
 
+        // The XOR equation offset factors cleanly into independent X and Y
+        // fields — each output bit is parity(x & XMask) XOR parity(y & YMask),
+        // and parity distributes over XOR, so offset(x, y) == xTerm(x) ^ yTerm(y).
+        // Precompute the per-column X term once (reused across every row) so the
+        // inner loop drops from a 16-bit interleave with 32 PopCounts per element
+        // to a single array load and one XOR.
+        var xTermByColumn = hasExactXorPattern ? new int[elementsWide] : [];
+        for (var x = 0; hasExactXorPattern && x < elementsWide; x++)
+        {
+            xTermByColumn[x] = (int)PatternAxisTerm((uint)x, xorPattern, useX: true);
+        }
+
         for (var y = 0; y < elementsHigh; y++)
         {
             var blockY = y / blockHeight;
@@ -271,6 +441,8 @@ internal static class GnmTiling
             var rowBlockBase = (long)blockY * blocksPerRow;
             var tableRowBase = inBlockY * blockWidth;
             var destRowBase = (long)y * elementsWide * bytesPerElement;
+            // Y term is constant across the row; hoist it out of the inner loop.
+            var yTerm = hasExactXorPattern ? (int)PatternAxisTerm((uint)y, xorPattern, useX: false) : 0;
             for (var x = 0; x < elementsWide; x++)
             {
                 var blockX = x / blockWidth;
@@ -278,7 +450,7 @@ internal static class GnmTiling
 
                 var blockIndex = rowBlockBase + blockX;
                 var sourceByte = hasExactXorPattern
-                    ? blockIndex * blockBytes + ComputePatternOffset((uint)x, (uint)y, xorPattern)
+                    ? blockIndex * blockBytes + (xTermByColumn[x] ^ yTerm)
                     : (blockIndex * blockElements + blockTable[tableRowBase + inBlockX]) *
                       (long)bytesPerElement;
                 var destByte = destRowBase + (long)x * bytesPerElement;
@@ -335,14 +507,20 @@ internal static class GnmTiling
         return pattern.Length != 0;
     }
 
-    private static long ComputePatternOffset(uint x, uint y, AddressBit[] pattern)
+    // The AddrLib within-block byte offset is a per-bit XOR equation:
+    //   offset = OR over bits of ( parity(x & XMask) XOR parity(y & YMask) ) << bit
+    // Because parity distributes over XOR, that whole offset factors into two
+    // independent axis terms: PatternAxisTerm(x, useX: true) ^
+    // PatternAxisTerm(y, useX: false). Splitting the axes lets TryDetile cache
+    // the X term per column and hoist the Y term per row instead of recomputing
+    // the full 16-bit interleave (32 PopCounts) for every element.
+    private static uint PatternAxisTerm(uint coordinate, AddressBit[] pattern, bool useX)
     {
         uint offset = 0;
         for (var bit = 0; bit < pattern.Length; bit++)
         {
-            var equation = pattern[bit];
-            var parity = (System.Numerics.BitOperations.PopCount(x & equation.XMask) +
-                          System.Numerics.BitOperations.PopCount(y & equation.YMask)) & 1;
+            var mask = useX ? pattern[bit].XMask : pattern[bit].YMask;
+            var parity = System.Numerics.BitOperations.PopCount(coordinate & mask) & 1;
             offset |= (uint)parity << bit;
         }
 

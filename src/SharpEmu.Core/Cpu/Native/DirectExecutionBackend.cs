@@ -626,7 +626,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private void ThreadMain(ulong guestThreadHandle)
 		{
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
-			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			try
 			{
 				while (true)
@@ -881,10 +880,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe static int CallNativeEntry(void* entry)
 	{
-		// Every host thread that executes guest code funnels through here, so this is
-		// the one universal hook where a per-thread hardware watchpoint (perf breakpoints
-		// are per-task) can be armed to cover ALL guest threads. Idempotent per thread.
-		SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 		var nativeEntry = (delegate* unmanaged[Cdecl]<int>)entry;
 		return nativeEntry();
 	}
@@ -4542,7 +4537,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var continuationThread = new Thread(() =>
 		{
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
-			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			try
 			{
 				continuation();
@@ -5755,7 +5749,6 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
-			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			int num6 = -1;
 			try
 			{
@@ -6349,6 +6342,221 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					}
 				}
 			}
+			// Diagnostic: SHARPEMU_STALL_PROBE_ADDR="0xADDR" triangulates one guest address three
+			// ways so an untracked BSS/singleton slot can be classified: (1) tracked-region
+			// membership via IVirtualMemory.SnapshotRegions() [what the loader mapped], (2) host
+			// commit state via VirtualQuery [what the guest CPU can actually touch], (3) the 8-byte
+			// value. Also dumps the highest tracked regions so the true image end is visible.
+			var probeSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_PROBE_ADDR");
+			if (!string.IsNullOrEmpty(probeSpec)
+				&& ulong.TryParse(probeSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var probeAddr))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall probe for 0x{probeAddr:X16}");
+				if (TryGetVirtualMemory(cpuContext, out var probeVm))
+				{
+					var regions = probeVm.SnapshotRegions();
+					VirtualMemoryRegion? owner = null;
+					ulong nearestBelowEnd = 0;
+					foreach (var region in regions)
+					{
+						var end = region.VirtualAddress + region.MemorySize;
+						if (probeAddr >= region.VirtualAddress && probeAddr < end)
+						{
+							owner = region;
+						}
+						if (end <= probeAddr && end > nearestBelowEnd)
+						{
+							nearestBelowEnd = end;
+						}
+					}
+					if (owner is { } o)
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   tracked: IN region VA=0x{o.VirtualAddress:X16} end=0x{o.VirtualAddress + o.MemorySize:X16} size=0x{o.MemorySize:X} prot={o.Protection} fileSz=0x{o.FileSize:X}");
+					}
+					else
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   tracked: NOT in any region (past all segment memsz); nearest region below ends 0x{nearestBelowEnd:X16} (gap 0x{(nearestBelowEnd != 0 ? probeAddr - nearestBelowEnd : 0):X})");
+					}
+					foreach (var region in regions.OrderByDescending(r => r.VirtualAddress + r.MemorySize).Take(4))
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   top region VA=0x{region.VirtualAddress:X16} end=0x{region.VirtualAddress + region.MemorySize:X16} size=0x{region.MemorySize:X} prot={region.Protection} fileSz=0x{region.FileSize:X}");
+					}
+				}
+				else
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR]   tracked: <no IVirtualMemory>");
+				}
+				var probeCommitted = false;
+				unsafe
+				{
+					if (VirtualQuery((void*)probeAddr, out var probeMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
+					{
+						probeCommitted = probeMbi.State == MEM_COMMIT;
+						var stateName = probeMbi.State == MEM_COMMIT ? "COMMIT" : probeMbi.State == MEM_RESERVE ? "RESERVE" : probeMbi.State == MEM_FREE ? "FREE" : probeMbi.State.ToString();
+						Console.Error.WriteLine($"[LOADER][ERROR]   host: base=0x{probeMbi.BaseAddress:X16} size=0x{probeMbi.RegionSize:X} state={stateName} protect=0x{probeMbi.Protect:X}");
+					}
+					else
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   host: VirtualQuery failed");
+					}
+				}
+				var probeVal = new byte[8];
+				Console.Error.WriteLine(cpuContext.Memory.TryRead(probeAddr, probeVal)
+					? $"[LOADER][ERROR]   value (tracked TryRead): 0x{BitConverter.ToUInt64(probeVal, 0):X16}"
+					: $"[LOADER][ERROR]   value (tracked TryRead): <unreadable>");
+				if (probeCommitted)
+				{
+					unsafe
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   value (raw host read):     0x{*(ulong*)probeAddr:X16}");
+					}
+				}
+			}
+			
+			// Diagnostic: SHARPEMU_STALL_SCAN_RIPREL="0xTARGET" scans every executable image
+			// region for rip-relative instructions referencing TARGET, classifying store vs
+			// load vs lea. Finds the initializer (the STORE) of a BSS singleton like the async
+			// streaming manager. Single pass: a rip-relative disp32 field satisfies
+			// disp == TARGET - (regionVA + off + 4); on a byte match, the preceding modrm must
+			// have mod=00,rm=101 ((modrm & 0xC7)==0x05), then the opcode byte classifies it.
+			var ripRelSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_RIPREL");
+			if (!string.IsNullOrEmpty(ripRelSpec)
+				&& ulong.TryParse(ripRelSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var ripTarget)
+				&& TryGetVirtualMemory(cpuContext, out var ripVm))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall rip-rel scan for 0x{ripTarget:X16}");
+				var ripHits = 0;
+				foreach (var region in ripVm.SnapshotRegions())
+				{
+					if ((region.Protection & ProgramHeaderFlags.Execute) == 0 || region.MemorySize == 0 || region.MemorySize > 0x8000000UL)
+					{
+						continue;
+					}
+					var buf = new byte[(int)region.MemorySize];
+					if (!cpuContext.Memory.TryRead(region.VirtualAddress, buf))
+					{
+						continue;
+					}
+					for (var off = 1; off + 4 <= buf.Length; off++)
+					{
+						var disp = BitConverter.ToInt32(buf, off);
+						var tgt = region.VirtualAddress + (ulong)(off + 4) + (ulong)(long)disp;
+						if (tgt != ripTarget)
+						{
+							continue;
+						}
+						var modrm = buf[off - 1];
+						if ((modrm & 0xC7) != 0x05)
+						{
+							continue; // disp coincidence, not a rip-relative operand
+						}
+						// Walk back over opcode (1- or 2-byte) and optional REX/66 to find the start + class.
+						var op = off >= 2 ? buf[off - 2] : (byte)0;
+						var op2 = off >= 3 ? buf[off - 3] : (byte)0;
+						var twoByte = op2 == 0x0F;
+						var opcode = op; // primary opcode byte immediately before modrm
+						string cls;
+						if (!twoByte && (opcode == 0x89 || opcode == 0x88 || opcode == 0xC7)) cls = "STORE";
+						else if (!twoByte && (opcode == 0x8B || opcode == 0x8A || opcode == 0x63)) cls = "load";
+						else if (!twoByte && opcode == 0x8D) cls = "lea";
+						else if (!twoByte && (opcode == 0x01 || opcode == 0x09 || opcode == 0x0B || opcode == 0x31 || opcode == 0x33 || opcode == 0x39 || opcode == 0x3B)) cls = "arith";
+						else if (!twoByte && opcode == 0xFF) cls = "grp5(call/jmp/inc)";
+						else cls = twoByte ? $"0F{opcode:X2}" : $"op{opcode:X2}";
+						var instrStart = off - 2;
+						if (off >= 3 && buf[off - 3] >= 0x40 && buf[off - 3] <= 0x4F) instrStart = off - 3;
+						if (twoByte) instrStart = off - 3;
+						if (off >= 4 && buf[instrStart - 1] >= 0x40 && buf[instrStart - 1] <= 0x4F) instrStart -= 1;
+						var ctxStart = Math.Max(0, instrStart - 1);
+						var ctxLen = Math.Min(12, buf.Length - ctxStart);
+						var ctx = Convert.ToHexString(buf, ctxStart, ctxLen);
+						Console.Error.WriteLine($"[LOADER][ERROR]   {cls} @0x{region.VirtualAddress + (ulong)instrStart:X16} modrm=0x{modrm:X2} bytes[{ctxStart - instrStart}]={ctx}");
+						if (++ripHits >= 64)
+						{
+							break;
+						}
+					}
+					if (ripHits >= 64)
+					{
+						break;
+					}
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR]   rip-rel scan hits={ripHits}");
+			}
+			
+			// Diagnostic: SHARPEMU_STALL_SCAN_FIELDSTORE="0xDISP" scans every executable image
+			// region for instructions with a memory operand [reg+DISP] using a mod=10 disp32
+			// encoding, classifying store vs load. Finds who writes an object field at a known
+			// struct offset (e.g. an operation state field [op+0x3b8]) - the external driver a
+			// stuck state machine is waiting on. Offline-decode the STORE hits with capstone.
+			var fsSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_FIELDSTORE");
+			if (!string.IsNullOrEmpty(fsSpec)
+				&& uint.TryParse(fsSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var fsDisp)
+				&& TryGetVirtualMemory(cpuContext, out var fsVm))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall field-store scan for disp=0x{fsDisp:X}");
+				var fsHits = 0;
+				var fsDispBytes = BitConverter.GetBytes(fsDisp);
+				foreach (var region in fsVm.SnapshotRegions())
+				{
+					if ((region.Protection & ProgramHeaderFlags.Execute) == 0 || region.MemorySize == 0 || region.MemorySize > 0x8000000UL)
+					{
+						continue;
+					}
+					var buf = new byte[(int)region.MemorySize];
+					if (!cpuContext.Memory.TryRead(region.VirtualAddress, buf))
+					{
+						continue;
+					}
+					for (var off = 2; off + 4 <= buf.Length; off++)
+					{
+						if (buf[off] != fsDispBytes[0] || buf[off + 1] != fsDispBytes[1] || buf[off + 2] != fsDispBytes[2] || buf[off + 3] != fsDispBytes[3])
+						{
+							continue;
+						}
+						// The disp32 follows either modrm (mod=10, rm!=100) or modrm+SIB (rm==100).
+						var modrmOff = -1; var sib = false;
+						var m1 = buf[off - 1];
+						if ((m1 & 0xC0) == 0x80 && (m1 & 0x07) != 0x04)
+						{
+							modrmOff = off - 1;
+						}
+						else if (off >= 2 && (buf[off - 2] & 0xC0) == 0x80 && (buf[off - 2] & 0x07) == 0x04)
+						{
+							modrmOff = off - 2; sib = true;
+						}
+						if (modrmOff < 1)
+						{
+							continue;
+						}
+						var modrm = buf[modrmOff];
+						var opOff = modrmOff - 1;
+						var op = buf[opOff];
+						var rex = (opOff >= 1 && buf[opOff - 1] >= 0x40 && buf[opOff - 1] <= 0x4F) ? buf[opOff - 1] : (byte)0;
+						string cls;
+						if (op == 0x89 || op == 0x88 || op == 0xC7) cls = "STORE";
+						else if (op == 0x01 || op == 0x09 || op == 0x21 || op == 0x29 || op == 0x31) cls = "STORE-arith";
+						else if (op == 0xFF) cls = "grp5";
+						else if (op == 0x8B || op == 0x8A || op == 0x63) cls = "load";
+						else if (op == 0x39 || op == 0x3B || op == 0x83 || op == 0x81) cls = "cmp";
+						else cls = $"op{op:X2}";
+						var instrStart = rex != 0 ? opOff - 1 : opOff;
+						var ctxStart = Math.Max(0, instrStart - 1);
+						var ctxLen = Math.Min(16, buf.Length - ctxStart);
+						var ctx = Convert.ToHexString(buf, ctxStart, ctxLen);
+						Console.Error.WriteLine($"[LOADER][ERROR]   {cls} [+0x{fsDisp:X}] @0x{region.VirtualAddress + (ulong)instrStart:X16} modrm=0x{modrm:X2}{(sib ? " SIB" : "")} bytes={ctx}");
+						if (++fsHits >= 200)
+						{
+							break;
+						}
+					}
+					if (fsHits >= 200)
+					{
+						break;
+					}
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR]   field-store scan hits={fsHits}");
+			}
+			
 
 			var threads = SnapshotGuestThreads();
 			if (threads.Length != 0)

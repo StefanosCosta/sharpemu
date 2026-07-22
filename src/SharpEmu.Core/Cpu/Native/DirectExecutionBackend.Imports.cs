@@ -242,10 +242,6 @@ public sealed partial class DirectExecutionBackend
 		{
 			SharpEmu.HLE.GuestAddrWriteCatcher.ArmAndFlush();
 		}
-		if (SharpEmu.HLE.GuestHwWatchpoint.Enabled)
-		{
-			SharpEmu.HLE.GuestHwWatchpoint.ArmAndFlush();
-		}
 		if ((num & 0x3F) == 0)
 		{
 			MarkExecutionProgress();

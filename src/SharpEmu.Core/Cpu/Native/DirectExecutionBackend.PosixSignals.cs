@@ -118,7 +118,6 @@ public sealed unsafe partial class DirectExecutionBackend
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
 		SharpEmu.HLE.GuestSingleStepTracer.WarmUp();
 		SharpEmu.HLE.GuestAddrWriteCatcher.WarmUp();
-		SharpEmu.HLE.GuestHwWatchpoint.WarmUp();
 
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
@@ -127,11 +126,6 @@ public sealed unsafe partial class DirectExecutionBackend
 			!InstallPosixSignalHandler(PosixSigAbort))
 		{
 			throw new InvalidOperationException("Failed to install POSIX fault signal handlers");
-		}
-
-		if (SharpEmu.HLE.GuestHwWatchpoint.Enabled)
-		{
-			InstallPosixSignalHandlerNoChain(SharpEmu.HLE.GuestHwWatchpoint.OverflowSignal);
 		}
 
 		_posixSignalHandlersInstalled = true;
@@ -170,12 +164,6 @@ public sealed unsafe partial class DirectExecutionBackend
 			// has RIP=0, so GuestRipBreakpoint.TryHandleTrap finds no match and
 			// returns without touching guest memory.
 			((delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal)(PosixSigTrap, 0, (nint)fakeUcontext);
-
-			if (SharpEmu.HLE.GuestHwWatchpoint.Enabled)
-			{
-				((delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal)(
-					SharpEmu.HLE.GuestHwWatchpoint.OverflowSignal, 0, (nint)fakeUcontext);
-			}
 
 			// Warm the branches the fabricated fault above skips without
 			// spamming diagnostics: the benign-exception path through
@@ -229,47 +217,9 @@ public sealed unsafe partial class DirectExecutionBackend
 		return true;
 	}
 
-	// Install a handler for a fresh RT signal (perf overflow) WITHOUT recording a
-	// previous action: the signal number (>= 32) is outside _posixPreviousActions,
-	// it is unused so there is nothing to chain, and our handler returns before
-	// ChainPreviousPosixAction. SA_RESTART avoids wedging interrupted host syscalls;
-	// no SA_NODEFER so the signal is masked during its own handler.
-	private static bool InstallPosixSignalHandlerNoChain(int signal)
-	{
-		const int saRestart = 0x10000000;
-		byte* action = stackalloc byte[PosixSigactionSize];
-		new Span<byte>(action, PosixSigactionSize).Clear();
-		*(nint*)action = (nint)(delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal;
-		*(int*)(action + PosixSigactionFlagsOffset) = PosixSaSigInfo | saRestart;
-		if (sigaction(signal, action, null) != 0)
-		{
-			Console.Error.WriteLine($"[LOADER][ERROR] sigaction({signal}) [hw-watch] failed: errno={Marshal.GetLastPInvokeError()}");
-			return false;
-		}
-
-		Console.Error.WriteLine($"[LOADER][INFO] hw-watch perf overflow signal {signal} installed");
-		return true;
-	}
-
 	[UnmanagedCallersOnly]
 	private static void HandlePosixSignal(int signal, nint siginfo, nint ucontext)
 	{
-		// Hardware data watchpoint overflow (SHARPEMU_HW_WATCH): a perf breakpoint
-		// fired on a write to a watched address. Handle BEFORE the depth guard - a
-		// perf overflow can arrive while nested in another fault handler, and the
-		// guard's restore-default would be wrong for our fresh RT signal.
-		if (signal == SharpEmu.HLE.GuestHwWatchpoint.OverflowSignal &&
-			SharpEmu.HLE.GuestHwWatchpoint.Enabled)
-		{
-			var hwRegs = GetPosixRegisterBase(ucontext);
-			if (hwRegs != null)
-			{
-				SharpEmu.HLE.GuestHwWatchpoint.HandleOverflow((nint)hwRegs, siginfo);
-			}
-
-			return;
-		}
-
 		if (_posixSignalHandlerDepth > 0)
 		{
 			// A fault inside our own fault handler (diagnostics touched an

@@ -354,6 +354,22 @@ internal static unsafe class VulkanVideoPresenter
             out var pendingGuestWorkItems) && pendingGuestWorkItems > 0
             ? pendingGuestWorkItems
             : OperatingSystem.IsMacOS() ? 64 : 512;
+    // Upper bound on ordered guest flips allowed to sit in the queue before the
+    // submitting (guest) thread is made to wait for the presenter to drain one.
+    // The generic _maxPendingGuestWorkItems budget mixes draws/dispatches/flips,
+    // so a game that outruns the display accumulates whole frames of flips and
+    // the input it samples lags what is on screen. A dedicated in-flight-flip cap
+    // bounds that latency. <= 0 (the default) leaves flips unthrottled, so this is
+    // opt-in and changes nothing unless SHARPEMU_MAX_QUEUED_FLIPS is set.
+    private static readonly int _maxQueuedFlips =
+        int.TryParse(
+            Environment.GetEnvironmentVariable("SHARPEMU_MAX_QUEUED_FLIPS"),
+            out var maxQueuedFlips) && maxQueuedFlips > 0
+            ? maxQueuedFlips
+            : 0;
+    // Ordered guest flips currently queued but not yet dequeued for execution.
+    // Guarded by _gate, like _pendingGuestWorkCount.
+    private static int _pendingFlipCount;
     private const ulong MaximumCachedHostBufferBytes = 128UL * 1024 * 1024;
     // A captured 4K flip can consume tens of MiB of device-local memory.
     // Retain only a short presentation queue while always preserving the
@@ -812,6 +828,7 @@ internal static unsafe class VulkanVideoPresenter
         _pendingGuestQueueSchedule.Clear();
         _pendingGuestQueueCursor = 0;
         _pendingGuestWorkCount = 0;
+        _pendingFlipCount = 0;
         _pendingGuestWorkBytes = 0;
         _pendingGuestImagePresentations.Clear();
         _guestImageWorkSequences.Clear();
@@ -1595,9 +1612,30 @@ internal static unsafe class VulkanVideoPresenter
                 return false;
             }
 
+            // Throttle how far the guest can outrun the presenter: while too many
+            // flips are already queued, wait (releasing _gate) for the render loop
+            // to dequeue one and PulseAll. Never block a render-thread self-enqueue
+            // (see the EnqueueGuestWorkLocked deadlock note), and re-validate after
+            // waking since state can change while _gate is released.
+            while (_maxQueuedFlips > 0 &&
+                   _pendingFlipCount >= _maxQueuedFlips &&
+                   !_enqueueAsImmediateQueueFollowup &&
+                   !_closed &&
+                   _thread is not null)
+            {
+                System.Threading.Monitor.Wait(_gate);
+            }
+
+            if (_closed ||
+                _thread is null ||
+                !_availableGuestImages.ContainsKey(address))
+            {
+                return false;
+            }
+
             var version = ++_orderedGuestFlipVersionSequence;
             _lastOrderedGuestFlipVersions[(videoOutHandle, displayBufferIndex)] = version;
-            return EnqueueGuestWorkLocked(
+            var enqueued = EnqueueGuestWorkLocked(
                 new VulkanOrderedGuestFlip(
                     version,
                     videoOutHandle,
@@ -1606,6 +1644,12 @@ internal static unsafe class VulkanVideoPresenter
                     width,
                     height,
                     pitchInPixel)) > 0;
+            if (enqueued)
+            {
+                _pendingFlipCount++;
+            }
+
+            return enqueued;
         }
     }
 
@@ -2499,6 +2543,14 @@ internal static unsafe class VulkanVideoPresenter
 
                 queue.RemoveFirst();
                 _pendingGuestWorkCount--;
+                if (work.Work is VulkanOrderedGuestFlip)
+                {
+                    // A flip left the queue for execution; wake any guest thread
+                    // parked in TrySubmitOrderedGuestImageFlip on the flip cap.
+                    _pendingFlipCount--;
+                    System.Threading.Monitor.PulseAll(_gate);
+                }
+
                 if (queue.Count == 0)
                 {
                     _pendingGuestWorkByQueue.Remove(queueName);
@@ -2539,6 +2591,13 @@ internal static unsafe class VulkanVideoPresenter
             // the retained-byte total a second time.
             queue.AddFirst(work);
             _pendingGuestWorkCount++;
+            if (work.Work is VulkanOrderedGuestFlip)
+            {
+                // Mirror the decrement in TryTakeGuestWork so the flip cap stays
+                // balanced across a dequeue-then-requeue.
+                _pendingFlipCount++;
+            }
+
             System.Threading.Monitor.PulseAll(_gate);
             return true;
         }

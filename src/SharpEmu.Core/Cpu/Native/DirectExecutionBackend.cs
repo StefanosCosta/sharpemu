@@ -626,6 +626,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		private void ThreadMain(ulong guestThreadHandle)
 		{
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
+			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			try
 			{
 				while (true)
@@ -880,6 +881,10 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private unsafe static int CallNativeEntry(void* entry)
 	{
+		// Every host thread that executes guest code funnels through here, so this is
+		// the one universal hook where a per-thread hardware watchpoint (perf breakpoints
+		// are per-task) can be armed to cover ALL guest threads. Idempotent per thread.
+		SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 		var nativeEntry = (delegate* unmanaged[Cdecl]<int>)entry;
 		return nativeEntry();
 	}
@@ -4537,6 +4542,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		var continuationThread = new Thread(() =>
 		{
 			var previousGuestThreadHandle = GuestThreadExecution.EnterGuestThread(guestThreadHandle);
+			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			try
 			{
 				continuation();
@@ -5749,6 +5755,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			Console.Error.WriteLine("[LOADER][INFO] Calling guest entry...");
 			StartStallWatchdog();
 			StartReadyThreadDispatcher();
+			SharpEmu.HLE.GuestHwWatchpoint.AttachCurrentThread();
 			int num6 = -1;
 			try
 			{
@@ -6052,6 +6059,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 								$"[LOADER][TRACE] guest_thread.snapshot " +
 								$"handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 								$"state={thread.State} executor={thread.ExecutorActive} " +
+								$"deferrals={thread.ExecutorClaimDeferrals} " +
 								$"imports={Interlocked.Read(ref thread.ImportCount)} " +
 								$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
 								$"ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
@@ -6060,6 +6068,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 								$"host_managed={thread.HostThread?.ManagedThreadId ?? 0} " +
 								$"host_tid={Volatile.Read(ref thread.HostThreadId)}");
 						}
+
+						// Ready-queue census: distinguishes a scheduler-dispatch stall (a runnable
+						// thread stranded in the queue, or perpetually deferred) from a genuinely
+						// blocked pool waiting on a wake that never arrives.
+						var readyHandles = string.Join(
+							",",
+							_readyGuestThreads.Select(t => $"0x{t.ThreadHandle:X16}"));
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] guest_thread.ready_queue " +
+							$"count={_readyGuestThreadCount} handles=[{readyHandles}]");
 					}
 					nextSnapshotTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
 				}
@@ -6240,6 +6258,95 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 					Console.Error.WriteLine(cpuContext.Memory.TryRead(dumpAddr, dumpBuffer)
 						? $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: {Convert.ToHexString(dumpBuffer)}"
 						: $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: <unreadable>");
+				}
+			}
+
+			// Diagnostic: SHARPEMU_STALL_SCAN_STRING="<ascii>[;lo-hi]" scans the guest HEAP
+			// (default 0x600000000-0x610000000) for an ASCII literal (e.g. a runtime-built
+			// asset filename like "sharedassets0.assets.resS") and then finds every aligned
+			// 8-byte pointer TO it - the descriptor's filename field, so descriptor base =
+			// holder-0x28. This is the missing "find the unstable heap descriptor this run"
+			// tool: locate it here, then aim SHARPEMU_HW_WATCH at descriptor+0x20 (phase) etc.
+			var scanSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_STRING");
+			if (!string.IsNullOrEmpty(scanSpec))
+			{
+				ScanHeapForStringAndPointers(scanSpec);
+			}
+
+			// Diagnostic: SHARPEMU_STALL_CHASE="0xBASE:off1:off2:..." follows a pointer chain -
+			// a = BASE; for each hex offset: a = *(a + off). Prints every hop and dumps 0x40 bytes
+			// at the final address. Resolves per-run-shifting object graphs (e.g. control-block ->
+			// op -> vtable -> method) to a stable code address for offline disassembly.
+			// Diagnostic: SHARPEMU_STALL_SCAN_PTR="0xADDR" scans the guest heap for aligned
+			// 8-byte values == ADDR (e.g. a stable image vtable) and dumps 0x400 bytes at each
+			// holder - resolving a per-run-shifting object by its stable vtable pointer.
+			var scanPtrSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_PTR");
+			if (!string.IsNullOrEmpty(scanPtrSpec)
+				&& ulong.TryParse(scanPtrSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var wantPtr))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall ptr-scan for 0x{wantPtr:X16}");
+				var hits = 0;
+				ScanHeapRegions(0x0000000600000000UL, 0x0000000610000000UL, (regionBase, buf) =>
+				{
+					if (hits >= 8)
+					{
+						return;
+					}
+					var count = buf.Length / 8;
+					for (var i = 0; i < count; i++)
+					{
+						if (BitConverter.ToUInt64(buf, i * 8) != wantPtr)
+						{
+							continue;
+						}
+						var holder = regionBase + (ulong)(i * 8);
+						var obj = new byte[0x400];
+						if (_cpuContext!.Memory.TryRead(holder, obj))
+						{
+							Console.Error.WriteLine($"[LOADER][ERROR]   holder 0x{holder:X16} [+0x3a8]=0x{BitConverter.ToUInt64(obj, 0x3a8):X16} [+0x3b8]=0x{BitConverter.ToUInt32(obj, 0x3b8):X8} [+0x3bc]=0x{BitConverter.ToUInt32(obj, 0x3bc):X8}");
+							Console.Error.WriteLine($"[LOADER][ERROR]   obj 0x{holder:X16}: {Convert.ToHexString(obj)}");
+						}
+						if (++hits >= 8)
+						{
+							return;
+						}
+					}
+				});
+				Console.Error.WriteLine($"[LOADER][ERROR]   ptr-scan hits={hits}");
+			}
+
+			var chaseSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_CHASE");
+			if (!string.IsNullOrEmpty(chaseSpec))
+			{
+				foreach (var oneChase in chaseSpec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+				{
+					var toks = oneChase.Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+					if (toks.Length == 0 || !ulong.TryParse(toks[0].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var a))
+					{
+						continue;
+					}
+					Console.Error.WriteLine($"[LOADER][ERROR] Chase start 0x{a:X16}");
+					var ok = true;
+					for (var i = 1; i < toks.Length; i++)
+					{
+						if (!ulong.TryParse(toks[i].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var off))
+						{
+							ok = false; break;
+						}
+						if (!cpuContext.TryReadUInt64(a + off, out var next))
+						{
+							Console.Error.WriteLine($"[LOADER][ERROR]   +0x{off:X} @0x{a + off:X16} <unreadable>"); ok = false; break;
+						}
+						Console.Error.WriteLine($"[LOADER][ERROR]   [0x{a:X16}+0x{off:X}] = 0x{next:X16}");
+						a = next;
+					}
+					if (ok)
+					{
+						var cb = new byte[0x40];
+						Console.Error.WriteLine(cpuContext.Memory.TryRead(a, cb)
+							? $"[LOADER][ERROR] Chase final 0x{a:X16}: {Convert.ToHexString(cb)}"
+							: $"[LOADER][ERROR] Chase final 0x{a:X16}: <unreadable>");
+					}
 				}
 			}
 
@@ -6654,6 +6761,195 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_ = hProcess;
 		HostMemory.FlushInstructionCache(lpBaseAddress, dwSize);
 		return true;
+	}
+
+	// Stall-time heap string+pointer scanner (SHARPEMU_STALL_SCAN_STRING). Locates the
+	// current-run address of a runtime-built asset filename and every aligned pointer to
+	// it, exposing the (per-run-unstable) descriptor address so a hardware write-watch can
+	// be aimed at it. Walks committed readable heap regions via VirtualQuery.
+	private unsafe void ScanHeapForStringAndPointers(string spec)
+	{
+		try
+		{
+			if (_cpuContext == null)
+			{
+				return;
+			}
+
+			var needleText = spec;
+			ulong lo = 0x0000000600000000UL, hi = 0x0000000610000000UL;
+			var semi = spec.IndexOf(';');
+			if (semi >= 0)
+			{
+				needleText = spec.Substring(0, semi);
+				var rangePart = spec.Substring(semi + 1);
+				var dash = rangePart.IndexOf('-');
+				if (dash > 0
+					&& ulong.TryParse(rangePart.Substring(0, dash).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var plo)
+					&& ulong.TryParse(rangePart.Substring(dash + 1).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var phi))
+				{
+					lo = plo;
+					hi = phi;
+				}
+			}
+
+			var needle = System.Text.Encoding.ASCII.GetBytes(needleText);
+			if (needle.Length == 0)
+			{
+				return;
+			}
+
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall heap-scan \"{needleText}\" over 0x{lo:X}-0x{hi:X}");
+			var sw = System.Diagnostics.Stopwatch.StartNew();
+
+			var stringHits = new List<ulong>(8);
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				var from = 0;
+				while (from < buf.Length)
+				{
+					var idx = new ReadOnlySpan<byte>(buf, from, buf.Length - from).IndexOf(needle);
+					if (idx < 0)
+					{
+						break;
+					}
+					var hitAddr = regionBase + (ulong)(from + idx);
+					if (stringHits.Count < 16)
+					{
+						stringHits.Add(hitAddr);
+						Console.Error.WriteLine($"[LOADER][ERROR]   string @0x{hitAddr:X16}");
+					}
+					from += idx + 1;
+				}
+			});
+
+			if (stringHits.Count == 0)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR]   string: none (t={sw.Elapsed.TotalSeconds:F2}s)");
+				return;
+			}
+
+			// Pass 2: aligned 8-byte pointers to each string hit. A holder at H whose field is
+			// at [+0x28] means the SerializedFile descriptor base is H-0x28 (printed for use).
+			var pointerHits = 0;
+			var descBases = new List<ulong>(8);
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				if (pointerHits >= 64)
+				{
+					return;
+				}
+				var count = buf.Length / 8;
+				for (var i = 0; i < count; i++)
+				{
+					var v = BitConverter.ToUInt64(buf, i * 8);
+					for (var h = 0; h < stringHits.Count; h++)
+					{
+						if (v == stringHits[h])
+						{
+							var holder = regionBase + (ulong)(i * 8);
+							var descBase = holder - 0x28;
+							if (!descBases.Contains(descBase))
+							{
+								descBases.Add(descBase);
+							}
+							Console.Error.WriteLine($"[LOADER][ERROR]   ptr@0x{holder:X16} -> string 0x{v:X16}  (descriptor base if [+0x28]: 0x{descBase:X16})");
+							// Dump the presumed descriptor [base .. base+0x60) so the phase [+0x20],
+							// filename [+0x28] and size [+0x38] fields can be read directly.
+							var descDump = new byte[0x60];
+							if (_cpuContext!.Memory.TryRead(descBase, descDump))
+							{
+								Console.Error.WriteLine($"[LOADER][ERROR]     desc 0x{descBase:X16}: {Convert.ToHexString(descDump)}");
+								Console.Error.WriteLine($"[LOADER][ERROR]     desc fields: [+0x20]=0x{BitConverter.ToUInt64(descDump, 0x20):X16} [+0x28]=0x{BitConverter.ToUInt64(descDump, 0x28):X16} [+0x38]=0x{BitConverter.ToUInt64(descDump, 0x38):X16}");
+							}
+							if (++pointerHits >= 64)
+							{
+								return;
+							}
+						}
+					}
+				}
+			});
+
+			// Pass 3: find who REFERENCES each FileIdentifier descriptor (aligned pointers to the
+			// descriptor base). That referrer is the loader/job struct that should consume the
+			// FileIdentifier to issue the .resS data read - the chain up toward the never-dispatched
+			// deserialize job. Dump [ref-0x40 .. ref+0x40) so its fields are visible.
+			var referrerHits = 0;
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				if (referrerHits >= 64 || descBases.Count == 0)
+				{
+					return;
+				}
+				var count = buf.Length / 8;
+				for (var i = 0; i < count; i++)
+				{
+					var v = BitConverter.ToUInt64(buf, i * 8);
+					for (var d = 0; d < descBases.Count; d++)
+					{
+						if (v == descBases[d])
+						{
+							var refAt = regionBase + (ulong)(i * 8);
+							Console.Error.WriteLine($"[LOADER][ERROR]   ref@0x{refAt:X16} -> descriptor 0x{v:X16}");
+							var win = new byte[0x80];
+							if (refAt >= 0x40 && _cpuContext!.Memory.TryRead(refAt - 0x40, win))
+							{
+								Console.Error.WriteLine($"[LOADER][ERROR]     refwin 0x{refAt - 0x40:X16}: {Convert.ToHexString(win)}");
+							}
+							if (++referrerHits >= 64)
+							{
+								return;
+							}
+						}
+					}
+				}
+			});
+
+			Console.Error.WriteLine($"[LOADER][ERROR]   heap-scan done strings={stringHits.Count} ptrs={pointerHits} refs={referrerHits} t={sw.Elapsed.TotalSeconds:F2}s");
+		}
+		catch
+		{
+		}
+	}
+
+	private unsafe void ScanHeapRegions(ulong lo, ulong hi, Action<ulong, byte[]> onRegion)
+	{
+		var address = lo;
+		while (address < hi)
+		{
+			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				break;
+			}
+
+			var regionBase = mbi.BaseAddress;
+			var regionEnd = regionBase + mbi.RegionSize;
+			if (regionEnd <= address)
+			{
+				break;
+			}
+
+			if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect))
+			{
+				var start = Math.Max(regionBase, lo);
+				var clampedEnd = Math.Min(regionEnd, hi);
+				if (clampedEnd > start)
+				{
+					var len = clampedEnd - start;
+					if (len <= 0x10000000UL)
+					{
+						var buf = new byte[(int)len];
+						if (_cpuContext!.Memory.TryRead(start, buf))
+						{
+							onRegion(start, buf);
+						}
+					}
+				}
+			}
+
+			address = regionEnd;
+		}
 	}
 
 	private unsafe static nuint VirtualQuery(void* lpAddress, out MEMORY_BASIC_INFORMATION64 lpBuffer, nuint dwLength)

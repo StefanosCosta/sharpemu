@@ -52,7 +52,26 @@ public static unsafe class GuestWriteRipWatch
     private static readonly Watch[] _watches = ParseWatches(
         Environment.GetEnvironmentVariable("SHARPEMU_WATCH_WRITE_RIP"));
 
-    private static readonly bool _enabled = !OperatingSystem.IsWindows() && _watches.Length != 0;
+    // Runtime-armed watches (e.g. from GuestRipBreakpoint on a captured element's
+    // work-pointer). Fixed slots so ArmDynamic is signal/alloc-safe. Enabled the
+    // moment the first one is armed, even if no static SHARPEMU_WATCH_WRITE_RIP.
+    private const int DynamicCapacity = 32;
+    private static readonly Watch[] _dynamicWatches = CreateDynamicSlots();
+    private static int _dynamicCount;
+
+    private static Watch[] CreateDynamicSlots()
+    {
+        var slots = new Watch[DynamicCapacity];
+        for (var i = 0; i < slots.Length; i++)
+        {
+            slots[i] = new Watch();
+        }
+
+        return slots;
+    }
+
+    private static readonly bool _writeWatchCapable = !OperatingSystem.IsWindows();
+    private static readonly bool _enabled = _writeWatchCapable && _watches.Length != 0;
 
     // Preallocated ring; the signal handler only writes scalar fields + a
     // published index, never allocates or locks.
@@ -61,7 +80,55 @@ public static unsafe class GuestWriteRipWatch
     private static int _recordWriteIndex;
     private static int _recordFlushIndex;
 
-    public static bool Enabled => _enabled;
+    public static bool Enabled => _enabled || Volatile.Read(ref _dynamicCount) > 0;
+
+    /// <summary>
+    /// Arm a watch on <paramref name="address"/> discovered at runtime (from a
+    /// breakpoint capture). Signal/alloc-safe: fixed slots, mprotect only, no
+    /// locks. De-dupes by page so watching many objects on one page costs one
+    /// slot. Returns false if the table is full or the page is not yet mapped.
+    /// </summary>
+    public static bool ArmDynamic(ulong address)
+    {
+        if (!_writeWatchCapable || address == 0)
+        {
+            return false;
+        }
+
+        var pageStart = address & ~PageMask;
+        var existing = Volatile.Read(ref _dynamicCount);
+        for (var i = 0; i < existing; i++)
+        {
+            var w = _dynamicWatches[i];
+            if (w != null && w.PageStart == pageStart)
+            {
+                return true; // already watching this page
+            }
+        }
+
+        if (existing >= DynamicCapacity)
+        {
+            return false;
+        }
+
+        if (Mprotect((nint)pageStart, 0x1000, ProtRead) != 0)
+        {
+            return false; // page not mapped yet
+        }
+
+        var slot = Interlocked.Increment(ref _dynamicCount) - 1;
+        if (slot >= DynamicCapacity)
+        {
+            return false;
+        }
+
+        var watch = _dynamicWatches[slot];
+        watch.Address = address;
+        watch.PageStart = pageStart;
+        watch.PageEnd = pageStart + 0x1000UL;
+        Volatile.Write(ref watch.Armed, 1);
+        return true;
+    }
 
     /// <summary>
     /// Managed-context pass (call from the import dispatch loop): protect any
@@ -71,7 +138,7 @@ public static unsafe class GuestWriteRipWatch
     /// </summary>
     public static void ArmAndFlush()
     {
-        if (!_enabled)
+        if (!Enabled)
         {
             return;
         }
@@ -114,6 +181,20 @@ public static unsafe class GuestWriteRipWatch
                     $"faults_seen={Volatile.Read(ref watch.FaultCount)}");
             }
         }
+
+        // Re-protect dynamic watches that a caught fault unprotected, so the next
+        // write to that page is sampled too (persistent sampling of the producer).
+        var dynamicCount = Volatile.Read(ref _dynamicCount);
+        for (var index = 0; index < dynamicCount && index < DynamicCapacity; index++)
+        {
+            var watch = _dynamicWatches[index];
+            if (watch.PageStart != 0 &&
+                Volatile.Read(ref watch.Armed) == 0 &&
+                Mprotect((nint)watch.PageStart, 0x1000, ProtRead) == 0)
+            {
+                Volatile.Write(ref watch.Armed, 1);
+            }
+        }
     }
 
     /// <summary>
@@ -149,48 +230,63 @@ public static unsafe class GuestWriteRipWatch
     /// </summary>
     public static bool TryHandleWriteFault(ulong faultAddress, ulong rip)
     {
-        if (!_enabled || faultAddress == 0)
+        if (!Enabled || faultAddress == 0)
         {
             return false;
         }
 
         for (var index = 0; index < _watches.Length; index++)
         {
-            var watch = _watches[index];
-            if (faultAddress < watch.PageStart || faultAddress >= watch.PageEnd)
+            if (TryHandleForWatch(_watches[index], faultAddress, rip))
             {
-                continue;
-            }
-
-            Interlocked.Increment(ref watch.FaultCount);
-            if (Volatile.Read(ref watch.Armed) == 0)
-            {
-                // Another watch on the same page already unprotected it; nothing
-                // to do but let the store proceed.
                 return true;
             }
+        }
 
-            // Reserve a ring slot. Racing signal deliveries on different host
-            // threads are serialised by the per-thread handler depth guard in
-            // practice, but Interlocked keeps the index publication safe.
-            var slot = Interlocked.Increment(ref _recordWriteIndex) - 1;
-            ref var record = ref _records[slot % RecordCapacity];
-            record.Rip = rip;
-            record.FaultAddress = faultAddress;
-            record.ValueBefore = *(ulong*)watch.Address;
-            record.Sequence = Interlocked.Increment(ref _writeSequence);
-
-            // Restore write access so the faulting store completes. The managed
-            // ArmAndFlush pass re-protects to catch the next writer.
-            Volatile.Write(ref watch.Armed, 0);
-            _ = Mprotect(
-                (nint)watch.PageStart,
-                (nuint)(watch.PageEnd - watch.PageStart),
-                ProtRead | ProtWrite);
-            return true;
+        var dynamicCount = Volatile.Read(ref _dynamicCount);
+        for (var index = 0; index < dynamicCount && index < DynamicCapacity; index++)
+        {
+            if (TryHandleForWatch(_dynamicWatches[index], faultAddress, rip))
+            {
+                return true;
+            }
         }
 
         return false;
+    }
+
+    private static bool TryHandleForWatch(Watch watch, ulong faultAddress, ulong rip)
+    {
+        if (watch.PageStart == 0 || faultAddress < watch.PageStart || faultAddress >= watch.PageEnd)
+        {
+            return false;
+        }
+
+        Interlocked.Increment(ref watch.FaultCount);
+        if (Volatile.Read(ref watch.Armed) == 0)
+        {
+            // Another watch on the same page already unprotected it; nothing to
+            // do but let the store proceed.
+            return true;
+        }
+
+        var slot = Interlocked.Increment(ref _recordWriteIndex) - 1;
+        ref var record = ref _records[slot % RecordCapacity];
+        record.Rip = rip;
+        record.FaultAddress = faultAddress;
+        // Aligned read stays inside the watched page (never crosses into a
+        // possibly-unmapped next page from a signal frame).
+        record.ValueBefore = *(ulong*)(faultAddress & ~7UL);
+        record.Sequence = Interlocked.Increment(ref _writeSequence);
+
+        // Restore write access so the faulting store completes. The managed
+        // ArmAndFlush pass re-protects to catch the next writer.
+        Volatile.Write(ref watch.Armed, 0);
+        _ = Mprotect(
+            (nint)watch.PageStart,
+            (nuint)(watch.PageEnd - watch.PageStart),
+            ProtRead | ProtWrite);
+        return true;
     }
 
     private static Watch[] ParseWatches(string? value)

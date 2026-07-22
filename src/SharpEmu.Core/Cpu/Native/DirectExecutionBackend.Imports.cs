@@ -58,6 +58,41 @@ public sealed partial class DirectExecutionBackend
 		Environment.GetEnvironmentVariable("SHARPEMU_LOG_NID_RET_SAMPLE");
 	private static long _debugNidRetSampleCount;
 
+	// Logs every import made by one or more named guest threads
+	// (SHARPEMU_TRACE_IMPORTS_THREAD=<name>[,<name>...]) as nid + return-rip + first args, so the
+	// call sequence a specific thread runs right up to the point it parks can be reconstructed from
+	// the log tail; tracing several threads at once shows their interleaving. Cheap when unset.
+	// The special name __BARE__ matches imports made with NO cooperative guest-thread state.
+	private static readonly string[] _traceImportsThreads =
+		(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_IMPORTS_THREAD") ?? string.Empty)
+			.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+	// A trace name ending in '*' matches by prefix (e.g. "Thread-*" matches the
+	// run-specific handle-named threads); otherwise it is an exact match.
+	private static bool TraceImportsMatches(string? name)
+	{
+		if (name == null)
+		{
+			return false;
+		}
+
+		foreach (var pattern in _traceImportsThreads)
+		{
+			if (pattern.EndsWith('*'))
+			{
+				if (name.AsSpan().StartsWith(pattern.AsSpan(0, pattern.Length - 1), StringComparison.Ordinal))
+				{
+					return true;
+				}
+			}
+			else if (string.Equals(name, pattern, StringComparison.Ordinal))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
 	// Per-window NID call-count breakdown (SHARPEMU_LOG_NID_HISTOGRAM=1), flushed and reset every
 	// ~2 real seconds rather than accumulated forever, so a dump shows what's actually firing
 	// *right now* during a steady-state stall instead of being dominated by whatever ran most
@@ -195,6 +230,22 @@ public sealed partial class DirectExecutionBackend
 		{
 			SharpEmu.HLE.GuestWriteRipWatch.ArmAndFlush();
 		}
+		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled)
+		{
+			SharpEmu.HLE.GuestRipBreakpoint.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestSingleStepTracer.Enabled)
+		{
+			SharpEmu.HLE.GuestSingleStepTracer.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestAddrWriteCatcher.Enabled)
+		{
+			SharpEmu.HLE.GuestAddrWriteCatcher.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestHwWatchpoint.Enabled)
+		{
+			SharpEmu.HLE.GuestHwWatchpoint.ArmAndFlush();
+		}
 		if ((num & 0x3F) == 0)
 		{
 			MarkExecutionProgress();
@@ -317,6 +368,15 @@ public sealed partial class DirectExecutionBackend
 				return 0;
 			}
 		}
+		// SHARPEMU_TRACE_IMPORTS_THREAD=__BARE__ traces imports made with NO active
+		// cooperative guest-thread state (guest=0 in the syncaddr log) - e.g. the
+		// primordial thread running outside the cooperative scheduler.
+		if (_activeGuestThreadState is null && TraceImportsMatches("__BARE__"))
+		{
+			Console.Error.WriteLine(
+				$"[IMPTRACE] __BARE__ {importStubEntry.Export?.LibraryName}:{importStubEntry.Export?.Name ?? importStubEntry.Nid} ({importStubEntry.Nid}) " +
+				$"ret=0x{num7:X16} rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
@@ -337,6 +397,13 @@ public sealed partial class DirectExecutionBackend
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			if (TraceImportsMatches(activeGuestThreadState.Name))
+			{
+				Console.Error.WriteLine(
+					$"[IMPTRACE] {activeGuestThreadState.Name} #{Interlocked.Read(ref activeGuestThreadState.ImportCount)} " +
+					$"{importStubEntry.Export?.LibraryName}:{importStubEntry.Export?.Name ?? importStubEntry.Nid} ({importStubEntry.Nid}) " +
+					$"ret=0x{num7:X16} rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+			}
 		}
 		if (_logStrlenBursts)
 		{
@@ -568,6 +635,21 @@ public sealed partial class DirectExecutionBackend
 						cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
 					}
 					orbisGen2Result = (OrbisGen2Result)returnValue;
+					// Return-value differential (SHARPEMU_TRACE_IMPORTS_THREAD): log the HLE
+					// result + read-back of the likely out-param pointers (*rsi, *rdx), so a
+					// capability/size query that returns a wrong value (which could flip the
+					// guest into a disabled/synchronous-fallback path) is visible.
+					if (_traceImportsThreads.Length != 0 &&
+						TraceImportsMatches(_activeGuestThreadState?.Name ?? "__BARE__"))
+					{
+						var outRsi = cpuContext.TryReadUInt64(value2, out var outRsiValue) ? outRsiValue : 0UL;
+						var outRdx = cpuContext.TryReadUInt64(num3, out var outRdxValue) ? outRdxValue : 0UL;
+						Console.Error.WriteLine(
+							$"[IMPRET] {_activeGuestThreadState?.Name ?? "__BARE__"} " +
+							$"{cachedExport.LibraryName}:{cachedExport.Name} ({importStubEntry.Nid}) " +
+							$"rax=0x{cpuContext[CpuRegister.Rax]:X16} ret={returnValue} " +
+							$"rsi=0x{value2:X} *rsi=0x{outRsi:X16} rdx=0x{num3:X} *rdx=0x{outRdx:X16}");
+					}
 				}
 				else
 				{
@@ -1361,6 +1443,9 @@ public sealed partial class DirectExecutionBackend
 				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
 				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 				$"rax=0x{cpuContext[CpuRegister.Rax]:X16} r15=0x{cpuContext[CpuRegister.R15]:X16} " +
+				$"r12=0x{cpuContext[CpuRegister.R12]:X16} r13=0x{cpuContext[CpuRegister.R13]:X16} " +
+				$"r14=0x{cpuContext[CpuRegister.R14]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} " +
+				$"rbp=0x{cpuContext[CpuRegister.Rbp]:X16} " +
 				$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
 				$"managed={Environment.CurrentManagedThreadId}{memU64Suffix}");
 		}

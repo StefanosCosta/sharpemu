@@ -6432,12 +6432,73 @@ public static partial class KernelMemoryCompatExports
         }
 
         var hostProtection = ResolveHostProtection(orbisProtection);
-        if (!VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        if (VirtualProtect((nint)address, (nuint)length, hostProtection, out _))
+        {
+            return true;
+        }
+
+        // A single host protect over the whole range fails when [address,+length)
+        // spans several separately-reserved host regions rather than one. The
+        // POSIX backend already walks back-to-back regions, but the Windows
+        // backend's one VirtualProtect cannot cross VirtualAlloc reservations, so
+        // an IL2CPP startup mprotect spanning two adjacent guest reservations
+        // failed as ORBIS NOT_FOUND and crashed the guest. Protect each covering
+        // mapped region's slice separately. Semantics stay all-or-nothing: a real
+        // unmapped gap still fails, matching real mprotect and HostMemory.Protect.
+        return TryProtectCoveringRegions(address, length, hostProtection);
+    }
+
+    // Protect each tracked mapped region covering [address, address+length) one
+    // region at a time (the case a single host VirtualProtect cannot express
+    // across separate reservations). All-or-nothing: returns false if the range
+    // is not fully covered by contiguous mapped regions, or if any slice's host
+    // protect fails. Mirrors the region walk in TryApplyMappedRegionProtectionLocked.
+    private static bool TryProtectCoveringRegions(ulong address, ulong length, uint hostProtection)
+    {
+        if (!TryAddU64(address, length, out var endAddress))
         {
             return false;
         }
 
-        return true;
+        var cursor = address;
+        lock (_memoryGate)
+        {
+            // _mappedRegions is a SortedList keyed by address, so Values enumerate
+            // in ascending address order.
+            foreach (var region in _mappedRegions.Values)
+            {
+                if (!TryAddU64(region.Address, region.Length, out var regionEnd) ||
+                    regionEnd <= cursor)
+                {
+                    continue;
+                }
+
+                if (region.Address > cursor)
+                {
+                    // Unmapped gap between cursor and the next region.
+                    return false;
+                }
+
+                var sliceEnd = Math.Min(regionEnd, endAddress);
+                if (!VirtualProtect(
+                        (nint)cursor,
+                        (nuint)(sliceEnd - cursor),
+                        hostProtection,
+                        out _))
+                {
+                    return false;
+                }
+
+                cursor = sliceEnd;
+                if (cursor >= endAddress)
+                {
+                    return true;
+                }
+            }
+        }
+
+        // Ran out of regions before covering the whole range.
+        return false;
     }
 
     private static uint ResolveHostProtection(int orbisProtection)

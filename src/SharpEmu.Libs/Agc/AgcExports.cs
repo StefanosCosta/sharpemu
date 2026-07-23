@@ -164,7 +164,10 @@ public static partial class AgcExports
     private const ulong VideoOutPixelFormat2B10G10R10A2Bt2100Pq = 0x8100070400000000;
     private const uint RegisterDefaultsVersion7 = 7;
     private const uint RegisterDefaultsVersion8 = 8;
+    private const uint RegisterDefaultsVersion9 = 9;
     private const uint RegisterDefaultsVersion10 = 10;
+    private const uint RegisterDefaultsVersion11 = 11;
+    private const uint RegisterDefaultsVersion12 = 12;
     private const uint RegisterDefaultsVersion13 = 13;
     private const int RegisterDefaultsSize = 0x40;
     private const int RegisterDefaultBlockSize = 16 * 8;
@@ -11194,7 +11197,10 @@ public static partial class AgcExports
         return version is
             RegisterDefaultsVersion7 or
             RegisterDefaultsVersion8 or
+            RegisterDefaultsVersion9 or
             RegisterDefaultsVersion10 or
+            RegisterDefaultsVersion11 or
+            RegisterDefaultsVersion12 or
             RegisterDefaultsVersion13;
     }
 

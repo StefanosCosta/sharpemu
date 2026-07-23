@@ -2220,6 +2220,10 @@ public static partial class KernelMemoryCompatExports
             var parentDirectory = Path.GetDirectoryName(hostPath);
             if (string.IsNullOrWhiteSpace(parentDirectory) || !Directory.Exists(parentDirectory))
             {
+                // Real PS5 mkdir is not recursive, so a missing parent is a legitimate ENOENT.
+                // Trace the requested path so an unprovisioned guest mount point can be
+                // identified and pre-created at startup rather than papered over here.
+                LogOpenTrace($"mkdir parent-missing path='{guestPath}' host='{hostPath}' parent='{parentDirectory}'");
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
@@ -5494,24 +5498,32 @@ public static partial class KernelMemoryCompatExports
     {
         const string temp0VariableName = "SHARPEMU_TEMP0_DIR";
         var configuredRoot = Environment.GetEnvironmentVariable(temp0VariableName);
+        string root;
         if (!string.IsNullOrWhiteSpace(configuredRoot))
         {
-            return Path.GetFullPath(configuredRoot);
+            root = Path.GetFullPath(configuredRoot);
         }
-
-        var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
-        var appName = string.IsNullOrWhiteSpace(app0Root)
-            ? "default"
-            : Path.GetFileName(Path.TrimEndingDirectorySeparator(app0Root));
-        if (string.IsNullOrWhiteSpace(appName))
+        else
         {
-            appName = "default";
+            var app0Root = Environment.GetEnvironmentVariable("SHARPEMU_APP0_DIR");
+            var appName = string.IsNullOrWhiteSpace(app0Root)
+                ? "default"
+                : Path.GetFileName(Path.TrimEndingDirectorySeparator(app0Root));
+            if (string.IsNullOrWhiteSpace(appName))
+            {
+                appName = "default";
+            }
+
+            var invalidChars = Path.GetInvalidFileNameChars();
+            appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
+            root = Path.Combine(Path.GetTempPath(), "SharpEmu", appName, "temp0");
+            Environment.SetEnvironmentVariable(temp0VariableName, root);
         }
 
-        var invalidChars = Path.GetInvalidFileNameChars();
-        appName = new string(appName.Select(ch => invalidChars.Contains(ch) ? '_' : ch).ToArray());
-        var root = Path.Combine(Path.GetTempPath(), "SharpEmu", appName, "temp0");
-        Environment.SetEnvironmentVariable(temp0VariableName, root);
+        // Provision the mount root like the sibling resolvers (download0/hostapp/devlog)
+        // so a non-recursive mkdir of /temp0/<subdir> finds its parent. On PS5 the temp0
+        // mount root always exists; only subdirectories are the guest's responsibility.
+        Directory.CreateDirectory(root);
         return root;
     }
 

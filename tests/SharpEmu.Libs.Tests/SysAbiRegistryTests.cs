@@ -49,4 +49,23 @@ public sealed class SysAbiRegistryTests
         Assert.Equal("sceKernelWaitSema", export.Name);
         Assert.Equal("libKernel", export.LibraryName);
     }
+
+    // The exports added to resolve the previously-unresolved import warnings seen in the game
+    // logs must register under the exact catalog identity their NID hashes to.
+    [Theory]
+    [InlineData("4fU5yvOkVG4", "sceSysmoduleGetModuleInfoForUnwind", "libSceSysmodule")]
+    [InlineData("VkqLPArfFdc", "sceImeKeyboardGetInfo", "libSceIme")]
+    [InlineData("MsaFhR+lPE4", "sceNpWebApi2PushEventCreateFilter", "libSceNpWebApi2")]
+    [InlineData("fIATVMo4Y1w", "sceNpWebApi2PushEventDeleteHandle", "libSceNpWebApi2")]
+    [InlineData("s6W4Zl4Slgk", "sceNpUniversalDataSystemCreateEventPropertyObject", "libSceNpUniversalDataSystem")]
+    [InlineData("crb5j7mkk1c", "_is_signal_return", "libkernel")]
+    public void RegistryResolvesNewlyAddedExports(string nid, string name, string libraryName)
+    {
+        var manager = new ModuleManager();
+        manager.RegisterExports(SharpEmu.Generated.SysAbiExportRegistry.CreateExports(Generation.Gen4 | Generation.Gen5));
+
+        Assert.True(manager.TryGetExport(nid, out var export));
+        Assert.Equal(name, export.Name);
+        Assert.Equal(libraryName, export.LibraryName);
+    }
 }

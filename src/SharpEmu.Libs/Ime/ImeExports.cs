@@ -43,4 +43,30 @@ public static class ImeExports
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
+
+    // sceImeKeyboardGetInfo(resourceId=rdi, SceImeKeyboardInfo* info=rsi). No
+    // physical keyboard is attached in the emulator, so zero the caller's info
+    // struct (a deterministic "no keyboard / status disconnected" report) and
+    // return success instead of leaving it unresolved, which stranded the caller
+    // reading uninitialised device info. The struct is 136 bytes (userId/device/
+    // type/repeat/order/resourceId + status + reserved); zeroing it is the
+    // canonical "not connected" state.
+    [SysAbiExport(
+        Nid = "VkqLPArfFdc",
+        ExportName = "sceImeKeyboardGetInfo",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceIme")]
+    public static int ImeKeyboardGetInfo(CpuContext ctx)
+    {
+        var infoAddress = ctx[CpuRegister.Rsi];
+        if (infoAddress != 0)
+        {
+            Span<byte> zeroed = stackalloc byte[136];
+            zeroed.Clear();
+            _ = ctx.Memory.TryWrite(infoAddress, zeroed);
+        }
+
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
 }

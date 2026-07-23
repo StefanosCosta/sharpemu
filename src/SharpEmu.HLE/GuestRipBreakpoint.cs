@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Globalization;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace SharpEmu.HLE;
@@ -107,6 +109,58 @@ public static unsafe class GuestRipBreakpoint
     private static int _recordFlushIndex;
 
     public static bool Enabled => _enabled;
+
+    /// <summary>
+    /// Pre-JIT the SIGTRAP hit path so none of it compiles inside the signal frame
+    /// (a cold signal-path method there manifests as the fatal "attempted to call a
+    /// UnmanagedCallersOnly method from managed code" JIT-in-signal-frame abort — see
+    /// <see cref="GuestSingleStepTracer.WarmUp"/>). The existing synthetic-SIGTRAP
+    /// warmup enters <see cref="TryHandleTrap"/> with a fake RIP=0, so only its
+    /// no-match branch is JITted; its match / emulate / callee branches are not. Called
+    /// once, outside signal context, from WarmUpPosixSignalPath. Unlike the tracer this
+    /// is the breakpoint's ONLY warmup — it has no synthetic-fault coverage of its hit
+    /// path at all.
+    /// </summary>
+    public static void WarmUp()
+    {
+        if (!_enabled)
+        {
+            return;
+        }
+
+        var t = typeof(GuestRipBreakpoint);
+        foreach (var name in new[]
+                 {
+                     nameof(TryHandleTrap), nameof(ArmAndFlush),
+                     "SafeReadU64", "SafeReadStack", "SelectRegister", "ClassifyPrologue",
+                 })
+        {
+            var m = t.GetMethod(name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (m != null)
+            {
+                RuntimeHelpers.PrepareMethod(m.MethodHandle);
+            }
+        }
+
+        // The capture can arm a dynamic write-watch, whose ArmDynamic runs in the
+        // signal frame and whose TryHandleWriteFault runs in the SIGSEGV frame — warm
+        // both so the write-watch follow-up (SHARPEMU_BP_WATCH_*) is also signal-safe.
+        var w = typeof(GuestWriteRipWatch);
+        foreach (var name in new[] { "ArmDynamic", "TryHandleWriteFault" })
+        {
+            var m = w.GetMethod(name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (m != null)
+            {
+                RuntimeHelpers.PrepareMethod(m.MethodHandle);
+            }
+        }
+
+        // Warm the mprotect P/Invoke stub used from the byte-restore path (a scratch
+        // page kept RW then released is a harmless no-op).
+        var scratch = NativeMemory.AllocZeroed(0x1000);
+        _ = Mprotect((nint)scratch, 0x1000, ProtRead | ProtWrite);
+        NativeMemory.Free(scratch);
+    }
 
     /// <summary>
     /// Managed-context pass (call from the import dispatch loop): print pending

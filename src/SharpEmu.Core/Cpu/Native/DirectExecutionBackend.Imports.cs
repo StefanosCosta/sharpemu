@@ -137,6 +137,28 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// Win64 gateway for the signal-free guest execution logger (SHARPEMU_GUEST_HOOK).
+	// Reached by a normal call from a planted E9 detour trampoline running in preemptive
+	// guest context — never from a signal frame — so recording may JIT/allocate freely.
+	// Never throws back into guest code.
+	private static void GuestHookGatewayManaged(nint backendHandle, int hookIndex, nint snapshotPtr)
+	{
+		try
+		{
+			if (!(GCHandle.FromIntPtr(backendHandle).Target is DirectExecutionBackend))
+			{
+				return;
+			}
+
+			SharpEmu.HLE.GuestExecLogger.Capture(hookIndex, snapshotPtr);
+		}
+		catch (Exception ex)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] GuestHookGatewayManaged exception: {ex.GetType().Name}: {ex.Message}");
+		}
+	}
+
 	private unsafe static int RawVectoredHandlerManaged(void* exceptionInfo)
 	{
 		return TryRecoverUnresolvedSentinel(exceptionInfo);
@@ -233,6 +255,10 @@ public sealed partial class DirectExecutionBackend
 		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled)
 		{
 			SharpEmu.HLE.GuestRipBreakpoint.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestExecLogger.Enabled)
+		{
+			SharpEmu.HLE.GuestExecLogger.ArmAndFlush();
 		}
 		if (SharpEmu.HLE.GuestSingleStepTracer.Enabled)
 		{
@@ -427,6 +453,21 @@ public sealed partial class DirectExecutionBackend
 			}
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
+		}
+		// Host shutdown safe-point. Once RequestHostShutdown/Dispose set the
+		// backend-wide forced-exit flag, redirect ANY thread currently returning
+		// through an import - including cooperative guest workers - out to the
+		// host-exit sentinel. A thread spinning on a non-blocking import (e.g. an
+		// FMOD audio worker re-calling sceKernelSignalSema) never surfaces the
+		// shutdown at a guest-code entry boundary otherwise, so it would loop
+		// forever and stall guest-thread quiescence. Gate on the raw shutdown
+		// field (not ActiveForcedGuestExit, which TryForceGuestExitToHostStub
+		// itself sets) and NOT on !isGuestWorker (the offending thread is one).
+		if (_forcedGuestExit &&
+			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid, shutdown: true))
+		{
+			cpuContext[CpuRegister.Rax] = 1uL;
+			return 1uL;
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
@@ -1821,7 +1862,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid)
+	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, bool shutdown = false)
 	{
 		ulong num = ActiveEntryReturnSentinelRip;
 		if (num < 65536 || !TryPatchActiveGuestReturnSlot(num))
@@ -1837,6 +1878,14 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 		ActiveForcedGuestExit = true;
+		if (shutdown)
+		{
+			// Host shutdown redirect: not a stall, so skip the loop-guard LastError
+			// text and the recent-import dump. The thread simply winds out at the
+			// host-exit sentinel so teardown can reach guest-thread quiescence.
+			Console.Error.WriteLine($"[LOADER][INFO] Forced guest exit on host shutdown at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
+			return true;
+		}
 		LastError = $"Detected repeating import loop at import#{dispatchIndex} ({nid}) and forced guest exit.";
 		Console.Error.WriteLine($"[LOADER][ERROR] Import-loop guard fired at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
 		DumpRecentImportTrace();

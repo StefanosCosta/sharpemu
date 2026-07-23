@@ -50,6 +50,7 @@ public static class IcedDecoder
                 instruction.FlowControl,
                 GetNearBranchTarget(in instruction),
                 GetMemoryAddress(in instruction),
+                instruction.IsIPRelativeMemoryOperand,
                 effectiveBytes);
             return true;
         }

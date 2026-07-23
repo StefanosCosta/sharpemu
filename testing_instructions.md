@@ -7819,3 +7819,2001 @@ host-parks if a title needs a target suspended while blocked on those; (2) handl
 cond mutex is reacquired (POSIX runs it before) - fine when the mutex is free (observed case), revisit
 if a contended-mutex suspension deadlocks; (3) subnautica `vk.flip_capture_failed`; (4) metal_slug
 timed-wait timeout loop.
+
+---
+
+## 2026-07-21 - Black screen (subnautica) ROOT CAUSE: AGC indirect-register PATCH blob misdecode
+
+Post-signal-fix, subnautica/powerwash/metal_slug reach a black screen at 0 fps. Diagnosed
+subnautica precisely (present path is fine; it's a render-translation gap):
+
+- The Vulkan present path is correct but STARVED: guest registers scanout buffers
+  (`videoout.register_buffers addresses=[0x20010000,0x02010000]`) and submits ~1300 flips, but
+  `ExecuteOrderedGuestFlip` finds no `_guestImages` entry at the scanout addr -> `vk.flip_capture_failed
+  found=False` x1318. Nothing was rendered to present.
+- `_guestImages` color entries require a draw whose `GetRenderTargets(state.CxRegisters)` is non-empty
+  (needs CB_COLOR group: 0x318/0x390/0x31C/0x3B0/0x3B8). Instrumented `TryTranslateGuestDraw`
+  (`agc.draw_census`): 821 draws, `ps=True es=True psInEna/Addr=True` but **cb0Base=False for every
+  draw** - the render target register is never in the decoded state.
+- `op=0x69` (direct SetContextReg) NEVER appears; subnautica sets ALL context registers via
+  `ItNop reg=0x12` = RCxRegsIndirect. The applied cx blobs (`agc.indirect_apply_cx`) are all
+  `sawColorBase=False`; the per-draw interpolant/prim blobs (count 190/192, proper (offset,value)
+  pairs via CreateInterpolantMapping/CreatePrimState) top out at offset 0x310 and omit CB_COLOR.
+- CONTRAST that nails it: metal_slug (which DOES present) - `agc.draw_census cb0Base=True`,
+  `agc.indirect_apply_cx sawColorBase=True`, `cx_blob_dump idx=0 off=0x0318 val=0xC200`. metal_slug
+  binds CB_COLOR via the PLAIN `sceAgcDcbSetCxRegistersIndirect` blob (proper (offset,value) pairs).
+- subnautica instead builds its render-target register set via the AGC indirect-register PATCH API
+  (`sceAgcSetCxRegIndirectPatchSetAddress` + `...AddRegisters`, `agc.patch_cx_add` x40934). The
+  patched packet (cmd=0x6419AD638, blob=0x6419B4600) IS a valid RCxRegsIndirect packet and IS applied
+  (count=187) - but its blob is NOT in (offset,value)-pair layout: raw dump shows register VALUES
+  with the offset slots all 0 (idx 0-35) plus a sequential-offset/zero-value region (idx 38+). So the
+  decoder (`ApplySubmittedRegisters`, which reads 8-byte (offset,value) pairs) recovers offset=0 for
+  every patched entry, never CB_COLOR.
+- The PATCH API args (from `agc.patch_add_args`): `AddRegisters(patchInfo=rdi, count=rsi,
+  byteSize=rdx=count*8, values in rcx/r8/r9/stack...)` - the register VALUES are passed as call args
+  (e.g. 0xE00000, 0x3FF00, 0x1E9, 0x08700F00, all seen in the blob). SharpEmu's `AddIndirectPatchRegisters`
+  only increments the packet count; it does not write the supplied register (offset,value) data into
+  the blob. `SetIndirectPatchAddress(patchInfo, dataAddr, cap=rdx=0x1FEE)` just records the address.
+
+**Root cause (universal AGC gap, not game-specific):** the `sceAgc*IndirectPatch*` register-patch
+family is effectively stubbed - it adjusts the RCxRegsIndirect packet's address/count but never
+populates the blob with the (offset,value) register data the guest supplies, so the render-target
+(and other) context registers set through the patch path are lost. Any title using the patch API
+(subnautica, likely powerwash and other Unity/newer-SDK titles) renders nothing; titles using the
+plain indirect path (metal_slug) work.
+
+**Open item for the fix:** determine the exact patch-blob layout / how the supplied values map to
+register offsets (the offset "template"): whether `AddRegisters` must copy variadic (offset,value)
+pairs (or values against a per-patch offset template) into the blob so the existing apply recovers
+CB_COLOR. Diagnostic probes added (all gated behind `_traceAgcShader`, i.e. `SHARPEMU_LOG_AGC_SHADER=1`):
+`agc.draw_census`, `agc.indirect_apply_cx`, `agc.cx_oddblob*`, `agc.patch_cx_probe*`,
+`agc.patch_add_args`/`agc.patch_addr_args`, `agc.parser_reset`.
+
+---
+
+## 2026-07-21 - Universal Unity black screen = frame-pump/GC-bootstrap release-chain DEADLOCK (cat_quest_3 cleanest repro)
+
+The Unity games (metal_slug, metal_slug_tactics, powerwash, cult_of_the_lamb, cat_quest_3) all black-
+screen at 0 fps after at most one frame. NOT one bug per game - same class, different parking spot:
+metal_slug_tactics parks on `sceKernelSyncOnAddressWait(0x6080EE558)`, powerwash on `WaitSema(0x89)`,
+cult on `WaitSema(0xCC)`. (Subnautica is a SEPARATE outlier - AGC indirect-patch render-target decode,
+diagnosed earlier.) Prior sessions ruled out GfxFlipThread / UnityGfxDeviceWorker / Gfx Task Executor
+/ suspendPoint watchdog and pinned it to the main thread never submitting frame 2.
+
+**cat_quest_3 is the cleanest repro: a TOTAL deadlock** (all threads Blocked, 20s no-import-progress
+watchdog fires at imports=74752, exit=4). Full topology from the stall dump + `SHARPEMU_LOG_SYNCADDR`
++ `SHARPEMU_LOG_SEMA` + disassembly:
+- **Main thread** (primordial/external, so absent from "Scheduled guest thread"/stall guest-thread
+  lists): `sceKernelWaitSema(handle=0x28)`. Sema 0x28 is a Unity `Baselib_SystemSemaphore` (init=0);
+  it is **never signaled** (0 SignalSema in the whole run). Main's code at guest `0x8041F85B6` is a
+  Baselib semaphore acquire (decrement counter; if <=0 -> WaitSema).
+- **13 `AssetGarbageCollectorHelper` threads**: each `sceKernelSyncOnAddressWait` (INFINITE) at
+  `ret=0x800AA8859` on its own site-A futex counter `X = 0x6007138D8 + i*0x150`, pattern=0. Guest code
+  is a Baselib futex-semaphore acquire: wait while `*X==0`, then `lock cmpxchg` decrement. **At the
+  stall `*X == 0` for every helper** - so this is NOT a lost wakeup; the producer never incremented/
+  dispatched. Each helper first passed a site-B slot `X+0x50` (`ret=0x800AA81C3`) which WAS woken
+  (from a producer at `ret=0x800AA88D0`), then parked at site-A forever. No `Wake` ever targets a
+  site-A slot.
+- **1 `Thread-...E60`**: `sceKernelWaitSema(handle=0x2A)`.
+- No thread is Ready/Running at the stall -> genuine deadlock, not scheduler starvation of a runnable
+  thread. Every `SyncOnAddressWake` in the run has `cooperative_woken=0`, and every helper wait
+  resolves via the HOST path (guest handle 0) - i.e. these run as external/primary-style threads, not
+  cooperative `_guestThreads`, when they block.
+
+**Conclusion:** all threads are ACQUIRING semaphores (kernel sema 0x28/0x2A, and the Baselib futex
+site-A counters) that are never RELEASED. Because this cannot deadlock on real PS5 hardware, a
+bootstrap release SharpEmu should perform is being lost (a `SignalSema`/`SyncOnAddressWake`/counter-
+increment that never happens, or a thread that should run first to issue it and doesn't). NOT a lost
+wakeup (counters are 0) and NOT a runnable-thread starvation (nothing is Ready). Next: identify the
+producer(s) that should `SignalSema(0x28)` and increment the helper site-A counters, and why they
+never execute. Diagnostic env used: `SHARPEMU_LOG_SYNCADDR`, `SHARPEMU_LOG_SEMA`,
+`SHARPEMU_STALL_DUMP_RANGE` (dump guest code/data at the stall). cat_quest_3 is the reference repro.
+
+---
+
+## 2026-07-21 — Subnautica render root cause CONFIRMED: AGC IndirectPatch blob is values-only, offsets lost
+
+**Symptom:** Subnautica boots to full import volume (2.8M imports) but presents a black frame; every
+flip logs `vk.flip_capture_failed found=False`; 0 `[GIMG]` color guest-images created.
+
+**Investigation (this session), decisive traces from a `SHARPEMU_LOG_AGC_SHADER` run:**
+- **13,075 draws** issued (`agc.draw_census`), **every one `cb0Base=False rts=0`** — draws fire but no
+  render target ever binds. (Earlier "subnautica is compute-only" pivot was WRONG: the single traced
+  compute shader `cs=0x64364B400` writing a 640 KB buffer is one Unity worker kernel, not the renderer;
+  all 1635 compute dispatches share that one shader.)
+- **14,704 `agc.indirect_apply_cx`** events, each `zeroOffsets≈half, sawColorBase=False` — CB_COLOR0_BASE
+  (cx 0x318) NEVER lands. The scanout buffers (0x02010000 / 0x20010000) are entirely zero at flip
+  (`agc.flip_content nonzero=0/8192`), confirming nothing is ever rendered to them.
+
+**Root cause (confirmed):** Subnautica binds render-target/context registers through the AGC
+**IndirectPatch** path (`sceAgcSetCxRegIndirectPatchSetAddress` + `...AddRegisters`), NOT the direct
+`ItSetContextReg` path (which carries `startRegister` + consecutive values and works for metal_slug).
+SharpEmu's `ApplySubmittedRegisters` (AgcExports.cs ~5418-5449) decodes the IndirectPatch blob as
+8-byte `{offset@0, value@4}` pairs and does `destination[registerOffset]=value`. But the real blob is
+**values-only**: raw dump shows every EVEN dword = 0, every real value in the ODD dword
+(`0x20000100`, `0x00008828`, `0x00068400`=`0x6840000>>8` a real GPU base addr, …). So SharpEmu reads
+the zero even-dword as the register offset → ~half the entries collapse onto `destination[0]`
+(DB_RENDER_CONTROL) and CB_COLOR never arrives → `GetRenderTargets` returns empty →
+`SubmitOffscreenTranslatedDraw` never runs → 0 guest images → black.
+
+**Confirmed mechanics via guest disassembly (capstone):**
+- The guest CxRegister builder at `0x8000442D0` ends with `memcpy(dst=[cmd+0x28]+…, src, count*8)` then
+  calls the SetAddress stub (`0x800041820`) and AddRegisters stub (`0x800041830`). Entries are 8 bytes,
+  copied verbatim from a caller-built source array.
+- SharpEmu's HLE `AddIndirectPatchRegisters` (AgcExports.cs ~10777) only bumps the packet's count field
+  (`cmd+4 += rsi`); it never captures per-register OFFSETS. The offsets are therefore NOT in the blob —
+  they belong to the patch descriptor built by the guest's `AddRegisters` machinery (the `patch_add_args`
+  `rcx/r8/r9` args), which SharpEmu currently discards.
+
+**Fix shape (universal, next step):** SharpEmu must recover the register offset for each IndirectPatch
+value. Authoritative next RE step: instrument at the builder entry `0x8000442D0` to dump `[rsp]`
+(builder's caller) and disassemble the CALLER that fills the source array — that code shows exactly how
+offset↔value are associated. Then either (a) store offsets from the `AddRegisters` descriptors and pair
+them with the blob values at apply time, or (b) parse the blob per the true (non-pair) layout the caller
+reveals. Must stay on the generic AGC path (no title check) and must not regress the direct
+`ItSetContextReg`/metal_slug decode.
+
+### 2026-07-21 (same day, refinement) — CxRegister layout REVERSED: decode is structurally correct
+
+Disassembled the guest builder's CALLER (`0x800038E36`, calls builder `0x8000442D0` at `0x800038F91`
+with `rsi`=source array, `rdx`=16) via a one-frame-up `[rbp+8]` stack-walk probe (`agc.builder_caller`):
+
+- The source array is bulk-initialised by AVX from a static template table (guest `0x8019CD290`), then
+  each 8-byte entry's LOW dword is overwritten with `template[i] + index*scale` while the HIGH dword
+  (the register VALUE) is left from the template. `scale = 15` for the first 9 entries, `1` for the rest.
+- So the entry layout is genuinely `{offset@0, value@4}` — **SharpEmu's `ApplySubmittedRegisters`
+  decode is structurally CORRECT**. The `+index*15` scaling even matches the real CB_COLORn stride
+  (`CB_COLOR0_BASE=0x318`, `CB_COLOR1=0x327`, +0xF). My earlier "values-only, offsets lost" reading
+  was wrong: the offsets ARE in dw0.
+- In the sampled blob every dw0 (offset) is 0 and values sit in dw1, i.e. the template base offsets for
+  THIS group are 0 with index 0 → this is an **offset-0, index-scaled register group that is NOT
+  CB_COLOR**. The blob dump also EXCLUDED the common `count∈{190,191,192}` per-draw blobs.
+
+**Revised open question / next step:** CB_COLOR0_BASE (0x318) never appears in ANY decoded cx register
+(14,704 `indirect_apply_cx` all `sawColorBase=False`; 13,075 draws all `cb0Base=False`). Since the
+IndirectPatch decode is correct, CB_COLOR must be (a) inside the EXCLUDED `count 190/191/192` blobs
+[remove that dump filter and scan them for 0x318], or (b) set via a register path SharpEmu doesn't
+intercept/apply, or (c) subnautica binds its RT via a mechanism other than CB_COLOR context regs
+(e.g. the same static-libSceAgc `Core::initialize` register image, applied without going through the
+HLE'd indirect-patch or SetContextReg packets SharpEmu watches). Also dump the template table at guest
+`0x8019CD290` to identify which register group the offset-0 blobs actually are. This remains a
+universal AGC-decode question (no title-specific fix).
+
+### 2026-07-21 (probes 1+2 results) — Real draws, but SharpEmu recovers ZERO pipeline state
+
+Ran two probes (comprehensive cx-offset scan across ALL indirect applies; full PM4 opcode census;
+per-draw blob sampler; template dump). Findings:
+
+- **PM4 opcode census (graphics):** only 9 distinct opcodes, ALL handled by SharpEmu —
+  `0x10 Nop, 0x13 IndexBufferSize, 0x15 DispatchDirect, 0x26 IndexBase, 0x27 DrawIndex2,
+  0x2A IndexType, 0x2F NumInstances, 0x46 EventWrite, 0x76 SetShReg`. **No `SET_CONTEXT_REG`
+  (0x69), no `LOAD_*` packet exists.** All context registers arrive via the indirect NOP path.
+  So there is NO unhandled packet — the LOAD_CONTEXT_REG hypothesis is disproven.
+- **cx-offset scan (all indirect applies, whole run):** 71 distinct context offsets, `hasColor318=False`.
+  Offsets span `0x0–0xF` (DB/depth), `0x191–0x1C5` (PA_SC/PA_CL viewport+scissor), `0x1E0..0x2xx`
+  (SPI/CB_BLEND), up to `0x310`. **CB_COLOR block (0x318+) never written on any queue** (direct or
+  indirect). Register template at `0x8019CD290` is all zeros (the odd blobs are a zero-base group).
+- **The draws are REAL:** `agc.shader_draw` shows 4K textures (`3840x2160`), vertex+index geometry,
+  constant buffers with live data, `blend=0:1/0/0 write_mask=0xF`. Subnautica IS trying to render.
+- **But SharpEmu recovers NOTHING from them:** every draw reports `targets=[none] depth=[none]
+  raster=[screen_br=0x00000000, window/viewport/scissor all "missing"]`. The per-draw indirect blobs
+  (count 190/191/192) decode with `offset=0` for EVERY entry — real values (`0x44F00000`=1920.0f,
+  `0x44870000`=1080.0f, 4K tex addrs) all collapse onto register 0.
+
+**Root cause (refined & confirmed):** This IS an AGC indirect-register DECODE bug, but broader than
+"CB_COLOR pairs": the per-draw context blobs' register OFFSETS decode as 0, so NO pipeline state
+(render target, raster window, scissor, depth) is reconstructed. Subnautica issues real geometry but
+SharpEmu can't rebuild the pipeline state → `targets=[none]` → 0 guest images → black. The
+`{offset@0,value@4}` layout I reversed applies to the zero-template ODD blobs; the count-190/191/192
+PER-DRAW blobs (which carry the actual RT/raster/depth state) use a DIFFERENT builder/layout whose
+offsets are not at dw0. 
+
+**Next step (decisive):** capture and disassemble the builder for the count-190/191/192 per-draw blobs
+(distinct from the odd-blob builder at `0x8000442D0` / caller `0x800038E36` already reversed) to read
+the true per-draw CxRegister layout — where the offsets `0x191–0x1C5`, `0x310`, and the render-target
+registers actually live. Fix must be universal (generic AGC decode, no title check) and must not
+regress the working direct `SetContextReg`/metal_slug path.
+
+### 2026-07-21 (per-draw blob RE) — blob fully characterised; builder is a one-time static build
+
+Followed the "RE the per-draw blob" path. The count-190/191/192 per-draw indirect cx blobs have a
+two-region layout (8-byte {offset@0,value@4} entries):
+- **Region A (idx 0-~57): offset=0**, carrying the REAL missing state — viewport transform
+  (0x44F00000=1920f, 0xC4870000=-1080f, 0x3F800000=1f), render-target/texture base addresses
+  (0x0648xxxx, 0x064Axxxx, 0x0641xxxx). SharpEmu writes all of these to register 0 (garbage).
+- **Region B (idx ~58-191): correct {offset,value}** — offsets map to real gfx10 context regs:
+  0x191-0x1B0 = SPI_PS_INPUT_CNTL_0..31, 0x1B1 = SPI_PS_IN_CONTROL, 0x1C2-0x1C5, 0x1FF, 0x2xx = PA/SPI.
+  The SPI run 0x191-0x1B0 appears TWICE (two shader configs).
+
+So region B decodes fine; region A's registers (RT, viewport, depth) have offset=0 in guest memory and
+never bind -> targets=[none] -> black. Ruled out this session:
+- No unhandled PM4 packet (9 opcodes, all handled; no SET_CONTEXT_REG 0x69, no LOAD_*).
+- No static offset table for the SPI run in the image (scanned 0x800000000-0x802000000 for the
+  0x191,0x192,0x193 u32 signature -> 0 hits) -> region-B offsets are code-generated (base+i).
+- Write-watch (SHARPEMU_WATCH_WRITE_RIP=0x641A34E08) caught 0 faults -> the per-draw blob is a ONE-TIME
+  static build (loading-screen state, reused every frame), built before page-arm; sampling watch misses it.
+- The odd-blob builder's offset-base template 0x8019CD290 (added as template[i]+index*scale) is all-zero
+  even during active rendering -> for that path offset collapses to index*scale. Whether that zero
+  template is the root cause (uninitialised AGC register-offset base table) or an unused default
+  codepath is unresolved.
+
+State: blob format understood; exact region-A->register offset mapping still unknown. Remaining viable
+techniques are heavier: (a) locate & disassemble the guest-static AGC setRenderTargets/register-image
+builder (find via xref to the SPI/CB offset constants); (b) determine whether 0x8019CD290 SHOULD be a
+populated offset-base table and why it is zero (loader/reloc vs missing guest init). Both multi-cycle.
+Subnautica runs steadily (10k+ submissions, not deadlocked) rendering ~4 shaders = persistent early state.
+
+---
+
+## 2026-07-21 — GC-bootstrap deadlock ROOT CAUSE CONFIRMED: signal delivery can't interrupt a semaphore host-park
+
+**Repro:** cat_quest_3 total-deadlocks at 74,752 imports (watchdog exit 4). Cleanest of the 5 affected
+Unity/IL2CPP titles (cult_of_the_lamb, powerwash_sim, metal_slug_tactics).
+
+**Identities (via SHARPEMU_LOG_SEMA create traces):**
+- Sema `0x2A` = **`SuspendSemaphore`** (init 0, max 256), `0x2B` = `ResumeSemaphore` — the IL2CPP
+  stop-the-world thread-suspend handshake. `0x28` = a generic `Baselib_SystemSemaphore`.
+
+**Confirmed chain (SHARPEMU_LOG_GUEST_EXCEPTIONS + LOG_POSIX_SIGNALS + LOG_SEMA):**
+1. `Thread-…DEC0` = the IL2CPP stop-the-world **coordinator**: it `pthread_kill(SIGUSR1)`s the other
+   runtime threads, counts successful sends, then `WaitSema(SuspendSemaphore 0x2A)` for that many acks
+   (each signalled thread runs its SIGUSR1 handler → GC safepoint → posts SuspendSemaphore).
+2. Exactly ONE SIGUSR1 is raised: `guest_exception.raise target=<main-external-handle> type=0x1E
+   handler=0x809B3C210`, then `guest_exception.queued … mode=external` — the handler is **queued** for
+   the primordial/external **main** thread and never consumed.
+3. main is host-parked in `WaitSema(0x28)` (`sema.wait-host-block guest=0x0 ret=0x8041F85BB`, a Baselib
+   `Acquire`: `lock xadd [r14+0x90],-1` → `WaitSema` on the kernel handle). The primordial thread runs
+   guest code directly (`_currentGuestThreadHandle==0`), so it blocks via the HOST path
+   (`WaitSemaphoreOnHostThread`, `Monitor.Wait` on the sema `Gate`).
+4. The prior signal-delivery fix (121ece7) only interrupts **cond-wait** host-parks
+   (`InterruptHostParkedThreadForSignal` → `_hostParkedCondWaiters`, `KernelPthreadCompatExports.cs`).
+   A thread host-parked in a **semaphore** (or syncaddr) wait is NOT interrupted → main never returns
+   to an HLE boundary → never runs the queued SIGUSR1 handler → never acks SuspendSemaphore →
+   coordinator waits forever → total deadlock. (0 SignalSema, all futex counters 0 — no releases at all.)
+
+This is why the `SHARPEMU_FORCE_WAIT_UNBLOCK_MS` hack "works": force-returning main from `WaitSema(0x28)`
+lets it reach an import boundary where the queued SIGUSR1 is delivered, main acks, the GC completes.
+
+**Fix (universal, Shape B — scheduler/delivery defect, matches the prior fix's philosophy):** make a
+thread host-parked in `WaitSemaphoreOnHostThread` (and the syncaddr `WaitOnHostThread`) deliver a
+queued guest exception **in-place** on its own host thread, then **re-enter** the wait — because the
+Baselib `Acquire` does NOT loop, WaitSema must not return spuriously. Reuse
+`DeliverPendingGuestExceptionAtSafePoint` (`DirectExecutionBackend.cs:4335`, runs the handler
+synchronously on the current context and returns; the SIGUSR1 handler itself parks on ResumeSemaphore
+until the GC resumes). The host-park loop already re-wakes every ≤100ms, so add a
+`HasPendingGuestException`/in-place-deliver check there via a new `IGuestThreadScheduler` method keyed on
+the current (external) thread handle. No title/handle matching; benefits any IL2CPP stop-the-world.
+
+### 2026-07-21 (same day) — FIX IMPLEMENTED & VERIFIED: in-place signal delivery to host-parked waits
+
+Implemented the fix from the plan. New `IGuestThreadScheduler` members
+`HasPendingGuestExceptionForCurrentThread()` / `TryDeliverPendingGuestExceptionInPlace(CpuContext)`
+(implemented in `DirectExecutionBackend`, resolving the external/primordial handle via
+`_currentExternalGuestThreadHandle`, capturing the interrupted continuation from the live import call
+frame via the new public `GuestThreadExecution.TryCaptureCurrentImportBoundaryContinuation`, then
+reusing the existing private `DeliverPendingGuestExceptionAtSafePoint`). `WaitSemaphoreOnHostThread`
+and the syncaddr `WaitOnHostThread` now, at the top of each ≤100ms poll iteration, deliver a queued
+guest exception IN PLACE (releasing the gate first, since the SIGUSR1 handler parks on ResumeSemaphore
+for the whole GC) and `continue` to re-check the wait condition — never returning WaitSema spuriously.
+The syncaddr wait was additionally bounded to 100ms (was effectively infinite). Removed the
+`SHARPEMU_FORCE_WAIT_UNBLOCK_MS` experiment and the `Stall baselib` diagnostic.
+
+**Results (WITHOUT force-unblock):**
+- **cat_quest_3**: was hard-deadlock/exit-4 at 74,752 imports → now runs past **1,874,658 imports**,
+  3 GC stop-the-world cycles complete (`guest_exception.safe_point_enter type=0x1E` fires,
+  `SuspendSemaphore` gets signalled/waked). New later steady state: repeated
+  `ORBIS_GEN2_ERROR_TIMED_OUT (Hc4CaR6JBL0)` timed SyncOnAddressWait — a separate downstream issue.
+- **cult_of_the_lamb**: no stall → **1.24M imports**; GC safepoint delivered; later steady state is a
+  timed `WaitSema(0xCC)` timing out (the sibling parking spot, now non-fatal).
+- Tests: 636 green (576 Libs incl. 4 new `KernelHostParkSignalDeliveryTests` + 27 Metal + 33 SourceGen).
+
+The GC-bootstrap deadlock (the shared blocker across the 5 Unity/IL2CPP titles) is resolved. What
+remains for these titles is the later timed-wait/frame-pump/render wall — a separate track.
+
+**Additional verification (all 4 primary deadlock titles now progress, none deadlock):**
+- **powerwash_sim**: 0 stalls, **4.5M imports**, 12 GC stop-the-world cycles, reaches the AGC render
+  loop (`sce::Agc::suspendPoint`).
+- **metal_slug_tactics**: 0 stalls, **789K imports** and climbing; later steady state is the same timed
+  `SyncOnAddressWait (Hc4CaR6JBL0)` wall (no regression vs the prior-fix behaviour).
+All four (cat_quest_3, cult_of_the_lamb, powerwash_sim, metal_slug_tactics) went from a hard bootstrap
+deadlock to running deep into their game loops. Changes are uncommitted (4 source files + 1 new test).
+
+---
+
+## Resume prompt for next session — the frame-pump / dead-worker-pool wall (post-deadlock-fix)
+
+Copy-paste this to continue:
+
+```
+Read testing_instructions.md's "2026-07-21 — GC-bootstrap deadlock ROOT CAUSE CONFIRMED" +
+"FIX IMPLEMENTED & VERIFIED" milestones for background. STATUS: the IL2CPP GC-bootstrap deadlock is
+FIXED (in-place signal delivery to host-parked WaitSema/SyncOnAddress; 4 source files + 4
+KernelHostParkSignalDeliveryTests; 636 tests green). All 5 Unity/IL2CPP titles now boot far past the
+old deadlock (1.8M-4.5M imports) and PRESENT EXACTLY ONE guest frame — but none advance to frame 2 /
+gameplay. Fix the frame-pump wall so they progress.
+
+What is known about the wall (this session, no code changed for it — used existing env-gated traces):
+- Games present frame 1 (`Vulkan VideoOut ready`, `presented guest frame`), then the primordial/main
+  thread (external, guest=0) spins on a per-game timed wait that keeps timing out
+  (ORBIS_GEN2_ERROR_TIMED_OUT), interleaved with real work (memcpy/mutex). Per game the spin site:
+  cat_quest_3 SyncOnAddressWait ret=0x801810B56 (also the ONLY one that flip_capture_failed);
+  cult_of_the_lamb WaitSema(handle=0xCC) ret=0x800A5C2F9; powerwash_sim WaitSema ret=0x800D189F9
+  (reaches the AGC render loop / sce::Agc::suspendPoint, furthest along); metal_slug_tactics
+  SyncOnAddressWait ret=0x8018A6415.
+- RULED OUT as the blocker: the `scePthreadMutexTrylock`(upoVrzMHFeE)->BUSY loop is normal transient
+  contention (cult mutex 0x6016C36F8 is locked/unlocked 10k+ times, main acquires it fine 107x, only
+  23x briefly owned by an active worker). Not a stuck lock.
+- The behavior is TIMING-VARIABLE run-to-run: sometimes a worker makes progress, sometimes the whole
+  Job.Worker pool sits idle and only main runs (spinning), sometimes it eventually true-stalls
+  (watchdog exit 4). This variability => a cooperative-SCHEDULER / frame-pump issue: post-boot the
+  producer never reliably dispatches frame-2 work and/or ready workers are not run.
+- This is the SAME wall prior sessions hit on metal_slug (testing_instructions ~7455-7560,
+  "CASE (A): the guest never calls worker-wake post-boot ... an enqueue-time decision current tooling
+  cannot yet attribute"). Force-waking idle workers is WRONG (see fixes-force-unblock-crash.md: it
+  fabricates tokens and crashes on an uninitialised job fn ptr).
+
+Recommended next step: characterize the worker pool at a representative moment (why Job.Worker threads
+sit Blocked/Ready-but-not-run while main spins). The stall watchdog only dumps on a true no-progress
+stall; the games often SPIN (import progress) so it won't fire — add a periodic/on-demand thread-state
++ ready-queue dump (or use SHARPEMU_PERIODIC_SNAPSHOT_SECONDS, but verify it actually emits the
+guest-thread list). Decide: (a) do Ready workers fail to get dispatched by the cooperative scheduler
+(scheduler bug -> fix dispatch), or (b) are workers genuinely Blocked waiting for a
+producer-increment/signal main never issues (enqueue-time gap -> find why main's per-frame dispatch
+never fires). Start from cult (cleanest: WaitSema(0xCC), one worker 0x...FB51F0 seen active). Do NOT
+force-wake; no title/handle matching. cat_quest_3 also still flip_capture_failed = the same AGC
+render-target decode gap investigated for subnautica (region-A per-draw indirect blob offsets decode
+to 0; see the 2026-07-21 subnautica render milestones) — likely a separate parallel track.
+```
+
+---
+
+## 2026-07-21 — Frame-pump wall CLASSIFIED as (b) missing-signal, NOT a scheduler-dispatch bug — via a new ready-queue/deferral census; located the exact missing signal (`SignalSema(0xCA)` gating `Loading.PreloadManager`)
+
+Followed the post-GC-fix plan: added a small, permanent, env-gated **ready-queue census** and captured
+the worker pool DURING the spin (existing stall watchdog can't — imports keep advancing). This
+**decisively settles the multi-session (a)-vs-(b) fork as (b)**, and pins the missing signal at the
+actionable HLE semaphore layer rather than deep in JobSystem memory.
+
+**Tooling added (diagnostic-only, ~5 lines, no logic change, no-op unless env set):** extended the
+existing `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1` emitter in
+`src/SharpEmu.Core/Cpu/Native/DirectExecutionBackend.cs` (`~:6051`) with a per-thread
+`deferrals={ExecutorClaimDeferrals}` field and a new per-cycle summary line
+`guest_thread.ready_queue count=<_readyGuestThreadCount> handles=[...]` (read under the already-held
+`_guestThreadGate`). Build Debug+Release clean; `dotnet test -c Release` **636 green** (576 Libs + 27
+Metal + 33 SourceGen) — no regressions.
+
+**cult_of_the_lamb capture (55s, steady spin, `SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1 SHARPEMU_LOG_SEMA=1`):**
+- **`ready_queue count=0` in ALL 51 census cycles; `state=Ready` appears 0 times in the entire run;**
+  last cycle = 65 Blocked + 5 Running (the 5 Running are benign self-poll loops: a worker, GfxFlipThread
+  on `sceKernelWaitEqueue`, 3 FMOD threads). Deferrals are stale cumulative boot counters, not rising.
+  → **No thread is Ready-but-not-dispatched. (a) scheduler-dispatch bug is RULED OUT.**
+- The frame pump is **alive**: main (guest=0) signals sema `0x99` 22,520× and its consumer worker
+  `0x700BE215F8F0` (waits at ret=`0x800B3E177`, JobSystem region) wakes 22,498× — a balanced,
+  healthy ping-pong. The cooperative scheduler dispatches the worker fine every iteration.
+- **The stuck chain (semaphore layer, all confirmed by `SHARPEMU_LOG_SEMA`):**
+  ```
+  main (guest=0)  ──WaitSema(0xCC, timeout=1000ms) ×22,316, ret=0x800A5C2F9──►  awaits PreloadManager
+  Loading.PreloadManager (0x700BE0C8A700)  ──signalled 0xCC ONCE (ret=0x800A5BF26), then
+                                             WaitSema(0xCA, timeout=infinite, ret=0x800A5BECE)──► blocks forever
+  0xCA (Baselib_SystemSemaphore, init=0)  ──►  signalled 0 times in the whole run  ◄── THE MISSING SIGNAL
+  ```
+  Sequence at the freeze (log lines 115823-825): PreloadManager signals `0xCC` → immediately waits on
+  `0xCA` → main wakes from `0xCC` once. From then on `0xCA` is never signalled, so PreloadManager never
+  loops, never signals `0xCC` again, and main's per-iteration `WaitSema(0xCC)` times out forever.
+
+**Generality (powerwash_sim, 45s):** identical shape — `ready_queue count=0` all 40 cycles, 0 Ready,
+59 Blocked + 2 Running. Main spins on Baselib sema `0x89` (signalled ONCE, waited 455×);
+`Loading.PreloadManager` is the permanently-blocked producer (here parked on `sceKernelWaitEventFlag`
+flag `0x2` — same role, different primitive), `Loading.AsyncRead` blocked on a sema. So the wall is a
+**universal Unity/IL2CPP "Loading.* producer never re-armed" gap**, primitive varies per title.
+
+**Conclusion / classification: (b) genuine missing-signal, not a dispatch bug.** The whole pool is
+legitimately Blocked; the scheduler dispatches every runnable thread (ready queue provably empty; the
+main↔worker pump runs 22k×). The single missing event that would unblock the chain is
+`sceKernelSignalSema(0xCA)` (cult) / the analogous `Loading.*` re-arm (powerwash). This is the SAME
+root cause the pre-GC-fix metal_slug RE proved at the memory level (testing_instructions ~7267: a
+JobSystem loading-job whose dependency queue never drains because its descriptor phase `[desc+0x20]`
+is frozen, so its completion/notify path — which is what signals `0xCA` to re-arm PreloadManager —
+never runs), now surfaced cleanly one layer up. **No fix landed — deliberately** (approved scope was
+"fix only if clear-cut (a)"; force-signalling `0xCA` is the same ruled-out fabricate-a-token move as
+`fixes-force-unblock-crash.md`).
+
+**Concrete next step:** identify `0xCA`'s intended producer — the loading-job COMPLETION path — and
+why it never runs. Two sub-questions: (1) which guest thread/job is supposed to call
+`SignalSema(0xCA)` (grep the guest image for the `0xCA` handle's signal site, or set a one-shot on the
+`0x800A5Bxx` PreloadManager function's caller); (2) whether that path is gated on the frozen JobSystem
+descriptor phase (re-run the ~7267 memory-chain RE for cult's descriptor, or attribute the missing
+`[desc+0x20]` advance with the map-time write-watch). The fix is to make that job complete, NOT to
+force the semaphore.
+
+**Game(s) tested:** cult_of_the_lamb (PPSA — 55s census, primary), powerwash_sim (45s, generality).
+Code: `DirectExecutionBackend.cs` ready-queue/deferral census (env-gated, diagnostic-only). Build
+Debug+Release clean; 636 tests green.
+
+### 2026-07-21 (same session, continued) — traced the (b) chain to its producer: cult's async asset-load pipeline never advances past its FIRST step; PreloadManager's run-semaphore producer (`AddToQueue`) is never re-armed. JobSystem workers are ALIVE (refutes the old "dead worker pool" read).
+
+Drilled the (b) gate down through the guest code (built-in disassembler
+`SHARPEMU_STALL_DUMP_RANGE` via the periodic-snapshot path → offline capstone; `SHARPEMU_LOG_EVENT_FLAG`;
+`SHARPEMU_LOG_NID_HISTOGRAM`). Findings, all cult, all hard data:
+
+1. **JobSystem workers are ALIVE — the old "workers never woken post-boot" framing does NOT hold for
+   cult.** Job.Worker 0-12 wait on `sceKernelWaitEventFlag` flag `0x3`, Background Job.Worker 0-15 on
+   flag `0x4`. `SHARPEMU_LOG_EVENT_FLAG`: flag `0x3` SET 56× / flag `0x4` SET 87×, **continuing into
+   steady state** (last set at log line 30569/30854), with 1338 `wait-wake` events. Workers wake and
+   run jobs the whole time. (cult uses event-flags where metal_slug used per-worker sync-on-address —
+   different Unity build, same role.)
+
+2. **The gate is PreloadManager's run-semaphore producer, disassembled.** PreloadManager's consume
+   loop (guest `0x800A5BA70`): `lock xadd [r14+0x70], -1; jle →WaitSema(0xCA)` — a **userspace-counted
+   semaphore** whose kernel handle is `0xCA`; it then drains an integration queue at `[r14+0x160]`
+   (min-priority pick via vtable `[..+0x20]`), runs the op, and `SignalSema(0xCC)` (wakes main).
+   `SignalSema(0xCA)` fires **0× in the whole run** ⟹ the producer `PreloadManager::AddToQueue`
+   (enqueue op into `[r14+0x160]` + release `[r14+0x70]`) is **never called after the initial op**.
+   Main's side (guest `0x800A5B600`) is a passive per-frame work loop: `SignalSema(0x99)` to wake
+   `UnityGfxDeviceWorker`, process a work queue `[rbx+0x190]`, then `WaitSema(0xCC, 1s)` — a loading
+   spinner polling for integration-done.
+
+3. **Steady state is FULLY QUIESCED except main's busy-loop.** `SHARPEMU_LOG_NID_HISTOGRAM` last 2s
+   window: `distinct=7` — 63,508 memcpy, 35,404 scePthreadSelf, 27,534 pthread_mutex_unlock, +tiny
+   pthread bits, +1 `sceSystemServiceHideSplashScreen`. **Zero file I/O, zero job-submit, zero
+   SignalSema/SetEventFlag NIDs.** The `memcpy` is an 85-byte append helper (`0x800A6C60F`:
+   `call memcpy; add [r14],r12`) — main runs a serialization/append loop 31k×/s. The whole async-load
+   pipeline (`Loading.AsyncRead` parked on `0x92`, no reads in flight) is stalled, NOT mid-flight.
+   Behaviour is run-to-run variable (one run main polls `0xCC`; the histogram run was the pure
+   memcpy/mutex-spin variant — no `0xCC` wait at all).
+
+**Consolidated root (cult):** main got exactly ONE integration-done (`0xCC`) signal, then waits for
+more; PreloadManager processed ONE op then blocked on `0xCA` with no further work. The pipeline needs
+N integration steps but only step 1 happened. Step 2 is enqueued (→ `AddToQueue` → release
+`[r14+0x70]` → `SignalSema(0xCA)`) by the **completion of op #1's downstream job**, which never fires
+— even though other JobSystem jobs run fine. This is the SAME class as the metal_slug root
+(`[job+0x30]`-null / epoch-skipped job that never completes, ~6722/7267), now reached cleanly from the
+semaphore layer and with the key new fact that the worker pool is NOT dead. Still (b); no fix landed
+(scope: fix only if clear-cut (a)); force-releasing `[r14+0x70]`/`0xCA` is the ruled-out fabricate-a-
+token move.
+
+**Concrete next step:** find op #1's completion / the specific downstream job it waits on, and why it
+never completes for cult. Trace what SHOULD trigger the 2nd `AddToQueue`: instrument the guest job the
+first `AddToQueue`'s op depends on (its completion callback is what re-arms `[r14+0x70]`). Given
+workers are alive, the likely culprit is one specific job/asset-load op whose completion is dropped —
+re-run the `[job+0x30]`/descriptor-phase memory-chain RE (~6722/7267) for CULT's addresses (differ
+from metal_slug), or watch `[r14+0x70]` (PreloadManager control block +0x70) and `[r14+0x160]`
+(integration queue) with the map-time `SHARPEMU_WATCH_WRITE_RIP` to catch who was supposed to write
+them. Fix = make that op/job complete, NOT force the semaphore.
+
+**Game(s) tested (continued):** cult_of_the_lamb — event-flag capture (45s), NID histogram (40s),
+two `SHARPEMU_STALL_DUMP_RANGE` code dumps (`0x800A5B600`+0x1000, `0x800A6C400`+0x400) disassembled
+with capstone. No code changes this continuation (the ready-queue census from the entry above is the
+only diff); build clean; 636 tests green.
+
+### 2026-07-21 (op-completion trace) — traced the deadlock to the EXACT stuck AsyncOperation and its never-resolving dependency; deserialization COMPLETES then hangs; ruled out file-I/O and slow-progress. Root SharpEmu defect still unpinned (needs live stepping / differential ref).
+
+Drilled all the way to the leaf via `SHARPEMU_STALL_DUMP_RANGE`+capstone and a live-register capture
+(added `r12/r13/r14/rbx/rbp` to the `RetAddrHit` log line + a temporary cb-walk, since reverted).
+
+**The exact stuck object (cult, live addresses this run):**
+- PreloadManager control block `cb=0x60663EDF0`: `inCount[+170]=0`, **`outCount[+190]=1`** (ONE stuck
+  item), `mainSema[+120]` low dword `=-1` (main is the 1 waiter). Main's integration-wait loop (guest
+  func `0x800A5C130`) loops while `[cb+0x170]||[cb+0x190]!=0`, so the single output item gates it.
+- Stuck item `0x60663D8E0`, vtable `0x801C06DE8`, `execute()=[vtbl+0x58]=0x800A58070`,
+  `item.state[+0x48]=0`.
+- `execute()` (short, disassembled) returns NOT-DONE **iff `0x800a55e50(item+0x98)` returns 0**.
+  `0x800a55e50` is a 16ms-budgeted work/continuation-queue drainer (calls `vtable[+0x18](elem,3)` per
+  element); it returns 0 forever ⟹ the queue never drains.
+- The item's dependency collection (`item+0x98` begin=`0x6002D9570` end=`0x6002D95D0`, 2 entries)
+  references asset metadata: ASCII **`/app0/Media/sharedassets0.assets`**, **`Sirenix.Serialization`**,
+  **`EnsureLoaded`** (Odin Serializer). Entry data is float structs (1.0f, 1024.0f) + name strings —
+  NOT JobHandles/fences.
+
+**Decisively ruled out this session:**
+- **File I/O** — host `strace` shows every asset opens+reads fully: `sharedassets0.assets` (5MB),
+  `.assets.resS` (9.7MB), `resources.assets` (45MB), `level0`, `global-metadata.dat` (20.2MB, full
+  pread), catalog/param/ScriptingAssemblies JSON — all OK, zero read errors. Only ENOENT is
+  `Media/UnitySubsystems` (a dir; benign). The flat-fallback `ResolveApp0RelativePath` correctly maps
+  the guest's `/app0/Media/...` requests onto the flat dump files. **Not a file/path bug.**
+- **Slow-progress vs deadlock** — a **180s** run: 1 frame only, `outCount` stuck at 1 for all 22,405
+  samples, reached 4.1M imports then the memcpy/deserialization stream STOPPED and main settled into a
+  pure `scePthreadMutexLock`(9UK1vLZQft4)×3 + `sceKernelClockGettime`(QBi7HCK03hw) FMOD-Studio
+  (`ret=0x80AEF0xxx`) poll loop, tripping the "repeating import loop" force-exit. So the scene
+  **deserialization COMPLETES** (~160s, single-threaded, pathologically slow — a separate perf
+  concern), and only THEN does main idle-spin forever waiting on the item that never finalizes.
+  **Hard deadlock, not slowness.**
+- **Scheduler dispatch / dead workers** — already ruled out (ready queue empty every cycle, Job.Worker
+  event-flags fire into steady state).
+
+**Honest status: root-cause MECHANISM fully mapped (deepest ever), SharpEmu-side DEFECT not pinned.**
+Everything SharpEmu provides looks correct (files, metadata, scheduler, memory), yet the game's own
+async-load state machine deadlocks: one AsyncOperation's continuation-drain (`0x800a55e50`) never
+returns done. Pinning the specific SharpEmu behavior that corrupts that state needs either a live
+stepping debugger (which per many prior sessions does NOT reliably stop the primordial/external
+thread) or a known-good IL2CPP control to diff (none reaches gameplay). No fix landed — a blind one
+(force-complete the item, force-drain the queue) would fabricate a pass and is exactly what this
+project forbids.
+
+**Precise next step:** step INTO `vtable[+0x18](elem,3)` for the stuck continuation element (the
+`elem` values 0x606609A80 / 0x60663ED00) to learn why each never reports done — this is one function
+below where every tool this session could reach. Given the Odin/`Sirenix.Serialization`+`EnsureLoaded`
+involvement, the leading hypotheses are (a) a type/reflection resolution that Odin retries forever
+because an IL2CPP metadata query returns wrong data, or (b) a per-element async sub-op whose
+completion SharpEmu never signals. Also worth a dedicated look: WHY the deserialization needs ~4M HLE
+calls / 160s (a real perf pathology, independent of the deadlock). Tooling: the cb walk was reverted
+but is trivially re-added; capture `cb` via `RetAddrHit` r13 at `ret=0x800A5C2F9` (only fires on the
+0xCC-wait-timeout variant, not the memcpy-spin variant — retry runs until it hits).
+
+**Code this continuation:** reverted the cult-specific cb-walk; kept only `r12/r13/r14/rbx/rbp` on the
+env-gated `RetAddrHit` line (general, matches the prior-session pattern of adding callee-saved regs).
+Build Debug+Release clean; `dotnet test -c Release` **636 green**.
+
+### 2026-07-21 (op-completion, deeper) — NEW TOOL: a working guest-RIP breakpoint (SHARPEMU_BP_RIP); used it to descend cult's stuck chain to a NULL continuation-work pointer `[elem+0x58]` — CONVERGENT with metal_slug's null `[job+0x30]` root.
+
+Built the one tool every prior session wished for: **`SHARPEMU_BP_RIP=<addr[,addr...]>`** — a
+software breakpoint that captures the full guest register file at an arbitrary guest RIP, *including
+on the primordial/external thread* the cooperative `--debug-server` pause can't stop. A single-byte
+`INT3` (0xCC) patch raises SIGTRAP synchronously; the POSIX handler snapshots registers, restores the
+byte, rewinds RIP, and disarms (**one-shot per run** — re-arming while guest threads execute the page
+is a cross-modifying-code hazard that faults the CLR signal path with "Invalid Program: … from
+managed code", so a hot site is re-sampled by re-running). New `src/SharpEmu.HLE/GuestRipBreakpoint.cs`
++ SIGTRAP hook in `DirectExecutionBackend.PosixSignals.cs` + arm/flush from the import loop. Env-gated
+no-op; build Debug+Release clean, **636 tests green**.
+
+**Descended cult's stuck chain to the leaf (all via BP + static dumps):**
+- Item `execute()` (`0x800A58070`) returns not-done ⟺ its continuation-queue drain
+  `0x800a55e50(item+0x98)` returns 0. BP at the drain's per-element dispatch `0x800A5602E`
+  (`call [rax+0x18]`) captured a stuck continuation **element** (vtable `0x801C03C28`, process method
+  `[+0x18]=0x80094FB20`). The BP fired reliably on the primordial thread (guest=0).
+- Element process method `0x80094FB20`: does work only if `elem->vtable[+0x130]()==0` **AND
+  `[elem+0x58]!=0`**; else returns without doing/removing anything.
+- Read the stuck element live: **`[elem+0x58] = 0x0` (NULL)** — a work/continuation pointer that is
+  never populated. Also `[elem+0x11c]=1`, `[elem+0xa0]=0x19`; the gating manager singleton
+  (`*0x801DB04C0 = 0x601740360`) has `[mgr+0x275]=0` (skips the mutex-guarded registry lookup
+  `0x800af52a0`, so readiness falls back to element state → null → not ready).
+
+**Root, now convergent across two titles:** the stuck continuation carries a **NULL work/continuation
+pointer** (`[elem+0x58]` in cult) that real hardware populates and SharpEmu leaves null — the SAME
+shape as metal_slug's permanently-null `[job+0x30]` (~6730, "an unset completion-callback/continuation
+pointer something is supposed to populate and never does"). Both bottom out at the same never-firing
+construction/scheduling step (the same producer gap behind PreloadManager's never-issued `AddToQueue`
+/ the `0xCA` re-arm). So this is one systemic SharpEmu defect — a per-object scheduling/continuation-
+install step that doesn't run (or whose write is lost) during the boot window — not a per-title quirk.
+
+**Still no fix — honestly.** The remaining unknown is unchanged in KIND from ~10 prior sessions (what
+should populate that pointer, and why SharpEmu's equivalent step doesn't run), but is now pinned to a
+single field and reachable with the new BP tool. Element addresses vary run-to-run (heap), so a
+fixed-address write-watch can't catch the writer; the next move is to BP the element's *constructor /
+work-assignment* site (find it by BP-ing `elem->vtable[+0x170]=0x800952C70` — the work method — on a
+DIFFERENT element that DOES have `[+0x58]!=0`, then diff), or to determine whether the manager flag
+`[mgr+0x275]` should be 1 (a missing subsystem-init) by finding its writer. A blind fix (stuffing a
+pointer / forcing the flag) stays forbidden.
+
+**Code kept:** `GuestRipBreakpoint` (new, env-gated, general-purpose) + the earlier ready-queue census
++ `RetAddrHit` callee-saved regs. Build clean; 636 tests green; nothing committed.
+
+### 2026-07-21 (op-completion, hot-code BP) — made the guest-RIP breakpoint work on HOT multi-threaded code via instruction EMULATION; reframed the leaf: continuations are STARVED of work-assignment (most sit with null `[+0x58]`), work IS assigned but slowly — same "producer never fires" root, at the work-assignment layer.
+
+The INT3 breakpoint crashed on hot functions (restoring the byte while other cores execute the page =
+cross-modifying code → garbage instruction → CLR "Invalid Program" abort). **Fixed by keeping the INT3
+armed permanently and EMULATING the overwritten instruction** instead of restoring+re-executing it —
+no byte is ever restored under concurrency, so it is safe on hot multi-threaded code. `GuestRipBreakpoint`
+now classifies the target byte and emulates `push rbp` (0x55), `endbr64` (F3 0F 1E FA), and
+`call qword [rax+disp8]` (FF 50 disp8); unknown bytes fall back to the cold-only one-shot restore. Also
+warmed the SIGTRAP handler path in `WarmUpPosixSignalPath` (JIT-in-signal-frame was a second crash
+source). Build Debug+Release clean; **636 tests green**.
+
+**What the working tool showed (cult):**
+- BP'd the continuation **work method** entry `0x800952C70` (hot, many threads): 18 clean captures, all
+  vtable `0x801C03C28`, **all with non-null `[+0x58]`** (work objects from a pool `0x6001991E0..0x600199500`).
+  So the machinery DOES assign work and complete elements — not systemically dead.
+- BP'd the **drain dispatch** `0x800A5602E` continuously into steady state (127 captures): **118/127 had
+  null `[+0x58]`**, and one element was caught transitioning `[+0x58]: 0 → 0x6002EA9A0`. So
+  `[elem+0x58]==0` is the NORMAL "waiting for work-assignment" state, not a single stuck object — and
+  MOST continuations are waiting. Work is assigned, but slowly.
+
+**Reframed root:** the continuation pool is **starved of work-assignment** — most continuations wait
+with a null work pointer and only a few get work per cycle. The load churns forward slowly (~160s / 4M
+imports — abnormally slow, ~80× real HW) and then the gate item still never reports done. This is the
+same "producer never fires / fires too rarely" root as the top-level `0xCA`/`AddToQueue` finding and
+metal_slug's null `[job+0x30]`, now observed at the work-assignment layer. The specific permanently-
+stuck continuation is buried in a general, slowly-progressing work queue, and the observation window
+(deserialization-done → main-goes-idle) is narrow, so isolating the single broken assignment from the
+churn was not achieved this push.
+
+**Still no fix.** The tool is now strong enough to breakpoint any hot site; the remaining unknown is
+unchanged in kind — what should assign work to the stuck continuation (and why SharpEmu's producer
+under-fires) — likely tied to the ~80× deserialization slowness starving the producer. Next candidate:
+investigate WHY the load needs 4M HLE calls / 160s (per-object mutex/clock churn) — if the slowness is
+a SharpEmu perf pathology starving the cooperative producer, fixing it may unblock the assignment. A
+blind fix (stuffing work pointers) stays forbidden.
+
+### 2026-07-22 — CONVERGENT ROOT CONFIRMED by disassembly: cult's gate is the SAME epoch-skip as metal_slug (frozen descriptor phase `[desc+0x20]`). The `[elem+0x58]` "starvation" theory was a RED HERRING (it cycles normally). New tool: dynamic write-watch (`SHARPEMU_BP_WATCH_OFFSET`).
+
+Ruled out the branch-regression theory (the removed 100ms syncaddr self-heal): restoring it self-healed
+12,228× on the worker slots but they re-parked on a *genuinely unchanged* slot (not a lost wake) and it
+aborted Neva — reverted. The equeue/completion audit + probe (`SHARPEMU_LOG_EQUEUE`) also ruled out the
+HLE-completion suspects for cult: the ordered guest-work consumer completes all 56 items; the starved
+equeue threads (GfxFlipThread on eq 0x5, UnityEOPThread on eq 0x3) are SYMPTOMS — the game stops
+producing flips/EOP because it's stuck upstream in the load.
+
+**New tool — dynamic write-watch:** extended `GuestWriteRipWatch` with `ArmDynamic(addr)` (signal-safe,
+fixed slots, page-dedup, persistent re-arm) and wired `SHARPEMU_BP_WATCH_OFFSET=<hex>` into
+`GuestRipBreakpoint` so a breakpoint capture arms a write-watch on `[rdi+offset]`. Build clean; **636
+tests green**.
+
+**The correction:** BP'd the drain `0x800A5602E` with `SHARPEMU_BP_WATCH_OFFSET=0x58` → the ONLY writer
+of `[elem+0x58]` is RIP `0x80094FA6B` = `mov qword [r15+0x58], 0`, and `value_before` was a valid work
+object (`0x6002EBxxx`). So `[elem+0x58]` is CLEARED on completion — it cycles null→work→cleared→null.
+**Null `[+0x58]` is the normal completed/idle state, not starvation.** The whole "continuations starved
+of work-assignment" line (prior entries) was chasing a red herring.
+
+**The real, convergent gate (proven by disassembly of `0x800a55e50`, the fn whose return gates the
+item's `execute()`):** its work-steal loop at `0x800A55F72` does
+`mov rax,[rbx]; mov eax,[rax+0x20]; cmp eax,[rbx+8]; je 0x800a562ea` — and `0x800a562ea` is
+`xor eax,eax; …; ret` = **return 0 (not done)**. This is EXACTLY metal_slug's epoch-skip (~7267):
+`cmp [desc+0x20],[item+8]; je →return-0`. So cult's item is epoch-skipped because its descriptor phase
+`[[deque_item]+0x20]` equals the item's tag `[deque_item+8]`. On real HW a job completion advances
+`[desc+0x20]`; SharpEmu leaves it frozen. **cult and metal_slug share ONE root — a frozen descriptor
+phase — now confirmed convergent by disassembly, not just by shape.**
+
+**The crux (unchanged from metal_slug's multi-session wall, but now with a working attribution tool):**
+what advances `[desc+0x20]`, and why SharpEmu never does. Prior metal_slug RE: the job must run on a
+WORKER to advance its phase, but is never PUSHED onto a worker deque (only the primordial steal loop
+sees it, and epoch-skips it). Next: use the dynamic write-watch (generalized to `[[reg]+offset]`) armed
+via a BP at `0x800A55F72` (capture `rbx`=deque item → `[rbx]`=descriptor) to catch what writes
+`[desc+0x20]` in any healthy case, then find why the stuck descriptor's advancer never runs / the job is
+never worker-dispatched. Metal_slug's addresses are STABLE (descriptor `0x600116290`) → better target
+for the write-watch than cult (heap varies run-to-run).
+
+### 2026-07-22 (metal_slug descriptor attribution) — the working write-watch DEFINITIVELY settles the prior (a)-vs-(b) question: the stuck descriptor is COMPLETELY INERT (whole page never written). It's (a) — the job's owner never runs — NOT a wrong value written at enqueue.
+
+Used the new dynamic write-watch (the exact tool ~7321 said prior sessions lacked) on metal_slug's
+STABLE descriptor. BP'd the epoch-check `mov rax,[r13]` at `0x800B00CCF` and captured the stuck
+descriptor at the prior-session address `0x600116290` (still stable). Then
+`SHARPEMU_WATCH_WRITE_RIP=0x6001162B0` (the phase `[desc+0x20]`): **armed OK on page `0x600116000`,
+`faults_seen=0` — the ENTIRE page is never written for the whole run.** So the descriptor is inert:
+`[+0x20]=1` (phase frozen), `[+0x30]=0` (null completion callback), `[+0x28]=0x6002A1420`,
+`[+0x00]=0x600116210` (dependency/sibling pointers). **Definitively (a): the descriptor's owner never
+runs; the write that would advance `[desc+0x20]` never happens (not a wrong value at enqueue).** The
+convergent root across cult+metal_slug is one JobSystem defect: a job that must run (on a worker) to
+advance its descriptor phase is never dispatched.
+
+**Tooling generalized:** `SHARPEMU_BP_WATCH_BASE=<reg>` + `SHARPEMU_BP_WATCH_DEREF=1` so a breakpoint
+can arm a write-watch on `[[reg]+offset]` (e.g. base=deque item → `[base]`=descriptor). Build clean;
+636 tests green.
+
+**Next:** follow the descriptor's dependency pointers (`[desc+0x28]=0x6002A1420`,
+`[desc+0x00]=0x600116210`) to the ROOT job that has no unmet dependency yet still isn't dispatched, and
+find the DISPATCH site (push to a worker Chase-Lev deque `0x800A9E140`) — watch a HEALTHY job's deque
+push to learn the push code, then find why this job is never pushed. That push-decision is the fix
+point. BP tool still crashes on the hot steal loop `0x800B00CCF` (mov-from-mem not emulated) — use the
+write-watch (crash-free) for stable addresses; add `mov rax,[r13+disp8]` emulation if BP re-capture on
+the steal loop is needed.
+
+**Code kept (this push):** `GuestRipBreakpoint` emulation (PushRbp/Endbr64/CallMemRaxDisp8) + SIGTRAP
+warmup. Build clean; 636 tests green; nothing committed.
+
+### 2026-07-21 (external tip) — REAL FIX landed: `sceVideoOutGetFlipStatus` reported `flipArg=0` at `status+0x18` (a friend's Neva diagnosis); fixes that title's class, not our 5 (they have separate gates).
+
+A friend who booted **Neva** in another fork reported: the game's graphics thread, after each flip in a
+triple-buffered 0/1/2 loop, calls `sceVideoOutGetFlipStatus` and reads `status+0x18` — the `flipArg` of
+the last completed flip — to learn which flip finished; SharpEmu always wrote **0** there, stranding the
+loop after one frame. Verified against the code and it was exactly right: `VideoOutGetFlipStatus`
+(`VideoOutExports.cs`) hardcoded `TryWriteUInt64Compat(status+0x18, 0)`. The real `SceVideoOutFlipStatus`
+layout is `count@0x00, processTime@0x08, tsc@0x10, flipArg@0x18, submitTsc@0x20`.
+
+**Fix (universal, VideoOutExports.cs):** added `VideoOutPortState.LastCompletedFlipArg`, set it to
+`flipArg` in `SubmitFlip` under `_stateGate` (SharpEmu presents synchronously, so submit == completed),
+and report it at `status+0x18` in `VideoOutGetFlipStatus` instead of 0. Verified exercised: powerwash
+submits a real `arg=0x8000000000000000`, now surfaced at `+0x18` (was 0). Build clean; 576 Libs tests
+green (636 total).
+
+**Does NOT fix our 5 titles.** cult/cat_quest_3/powerwash/metal_slug_tactics still present exactly 1
+frame with the fix — confirming their gates are *separate* from Neva's: cult = the async-load
+`AsyncOperation` with null `[elem+0x58]` (traced above); cat_quest_3 = the AGC render-decode track. So
+this is a real, correct, credited fix that helps Neva-class flip-status-polling titles, but our set
+needs their own (distinct) fixes.
+
+**Noted, not changed (follow-ups):** (1) SharpEmu writes `currentBuffer` at `status+0x20`, but the real
+struct has `submitTsc@0x20` and `currentBuffer@0x38` — a latent offset bug the friend didn't flag;
+left alone to avoid regressing whatever relies on +0x20. (2) The friend also mentioned
+`sceAgcDriverGetEqContextId` "returning the wrong field"; SharpEmu's reads `udata` at `event+0x18` with
+a justifying comment (looks correct here) — not touched.
+
+### Resume prompt for next session — find why cult's async asset-load pipeline never advances past step 1 (the op-completion that never re-arms PreloadManager)
+
+Copy-paste this to continue:
+
+```
+Read testing_instructions.md's "2026-07-21 — Frame-pump wall CLASSIFIED as (b)" milestone AND its
+"(same session, continued) — traced the (b) chain to its producer" follow-up. STATUS: the post-GC-fix
+single-frame wall is (b) a genuine missing-signal (NOT a scheduler-dispatch bug: ready queue empty in
+ALL census cycles, 0 threads ever Ready, JobSystem workers ALIVE — event-flags 0x3/0x4 set into
+steady state, 1338 wait-wakes). Chain (cult, disassembled): main (guest=0, func 0x800A5B600) is a
+loading spinner — SignalSema(0x99)→gfx worker, process work queue, WaitSema(0xCC,1s). PreloadManager
+(func 0x800A5BA70) is a consumer: `lock xadd [r14+0x70],-1; jle →WaitSema(0xCA)` (userspace-counted
+run-semaphore, kernel handle 0xCA), drains integration queue [r14+0x160], SignalSema(0xCC). It
+processed ONE op, signalled 0xCC once, then blocked on 0xCA forever. SignalSema(0xCA)=0× ⟹ the
+producer PreloadManager::AddToQueue (enqueue op into [r14+0x160] + release [r14+0x70]) is NEVER called
+after op #1. Steady state fully quiesced (NID histogram distinct=7: memcpy/scePthreadSelf/mutex only;
+zero file-I/O, zero job-submit, zero SignalSema/SetEventFlag) — pipeline stalled, not mid-flight.
+Behaviour is run-to-run variable (pure memcpy-spin vs 0xCC-poll).
+
+Root: the load needs N integration steps; only step 1 happened. Step 2's AddToQueue is triggered by
+op #1's downstream JOB COMPLETION, which never fires — even though OTHER jobs run (workers alive).
+Same class as metal_slug (~6722/7267: [job+0x30]-null / epoch-skipped job that never completes), now
+reached from the semaphore layer.
+
+Next step: find op #1's downstream job and why it never completes for CULT. (a) Watch PreloadManager's
+control block with the map-time GuestWriteRipWatch (SHARPEMU_WATCH_WRITE_RIP on [r14+0x70] and the
+[r14+0x160] queue-count [r14+0x170]) to catch who was supposed to release/enqueue and never did — the
+RIP that writes them is AddToQueue's caller. (b) Or re-run the constant-pointer memory-chain RE
+(~6722/7267) for cult's job descriptor (addresses differ from metal_slug) to find the frozen
+completion field ([desc+0x20]/[job+0x30]-equivalent). To read r14 (PreloadManager cb) live: it's the
+`this` of func 0x800A5BA70; capture via SHARPEMU_LOG_RET_ADDRS/register capture at its entry, or from
+the 0xCA WaitSema call frame. Fix = make that op/job COMPLETE (a real missing/wrong HLE write or a
+job-dispatch gap), NOT force-release [r14+0x70]/0xCA (fabricating a token crashes — see
+fixes-force-unblock-crash.md). Tooling: SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS=1 (now emits deferrals= +
+guest_thread.ready_queue), SHARPEMU_LOG_SEMA=1, SHARPEMU_LOG_EVENT_FLAG=1, SHARPEMU_LOG_NID_HISTOGRAM=1,
+SHARPEMU_STALL_DUMP_RANGE="addr,len" (+ SHARPEMU_PERIODIC_SNAPSHOT_SECONDS=N to dump code during a spin)
+→ capstone offline (scratchpad/disasm.py). cat_quest_3's flip_capture_failed = SEPARATE AGC
+render-decode track. Do NOT force-wake; no title/handle matching.
+```
+
+---
+
+## 2026-07-22 — Unity 1-frame-hang: ENTIRE "lost wake" class DEFINITIVELY RULED OUT (metal_slug, semaphore-value proof)
+
+Pushed the dispatch/dependency trace to a conclusive negative result. Using the working
+write-watch + `SHARPEMU_STALL_DUMP_RANGE` semaphore-value dumps, established with certainty:
+
+**The gate is a Unity async scene-load of `sharedassets0.assets.resS`** (17 MB resource-stream).
+The stuck "descriptors" at `0x600116290`/`0x600116210` are **async-read descriptors** (`[desc+0x28]`
+→ the filename string `/app/0/Media/sharedassets0.assets.resS`, `[desc+0x38]`=byte size 0x1000000/
+0x80000, `[desc+0x20]`=phase=1). Only 2 are active; rest of the array is zeroed slots (the `[+0x00]`
+link is a slot allocator, NOT a dependency chain).
+
+**Full thread census at stall** (`SHARPEMU_LOG_GUEST_THREAD_SNAPSHOTS`): ~38 of 41 threads Blocked on
+`sceKernelSyncOnAddressWait`; only 3 alive — main (poll-`isDone` loop, ~6 mutex-unlock/2s),
+UnityEOPThread + GfxFlipThread (idle `sceKernelWaitEqueue` frame-pumps, no new frame ⇒ no events).
+Key waiters: **Loading.PreloadManager** parked on sema `0x608ABA458` (ret 0x800B0588A, JobSystem
+`Complete()`); **Loading.AsyncRead** parked on sema `0x600E40110` (ret 0x800937337, imports=39 ⇒
+parked almost immediately, never processed any read); all Job.Workers on the `0x600108D70..F80` slot
+array; a 4th live-ish thread timed-waits sema `0x608ABA518` (ret 0x8018A6415) forever.
+
+**All three wait sites are the identical Unity Baselib counting-semaphore-over-syncaddr acquire:**
+`loop: SyncOnAddressWait(sem,pattern=0); rax=[sem]; if(rax<=0) loop; cmpxchg [sem],rax-1`. Release
+path is `lock add [sem],n; if(waiters<0) SyncOnAddressWake`. SharpEmu's `SyncOnAddressWait` returns
+EAGAIN when `*addr!=pattern` (futex contract) ⇒ a token present at park time can NEVER be missed.
+
+**DECISIVE semaphore-value dumps (the experiment all ~10 prior sessions lacked):**
+- AsyncRead sema `0x600E40110`: **count=0, waiter=-1**
+- PreloadManager sema `0x608ABA458`: **count=0, waiter=-1**
+- Timed-poll sema `0x608ABA518`: **count=0, waiter=-1**
+- **ALL 30 Job.Worker semas `0x600108D70..F80`: count=0, waiter=-1**
+- `SHARPEMU_LOG_SYNCADDR` full history: these addrs get a `wait-block` and **NEVER a `wake`** the
+  whole run. Write-watch on `0x600E40110`: **faults_seen=0** (page never written after arm).
+
+**Interpretation (airtight): count=0 everywhere ⇒ NO producer ever posts a token; waiter=-1 everywhere
+⇒ every consumer IS correctly registered (any release WOULD wake it).** So this is NOT a lost / missed
+/ dropped / skipped wake anywhere — the ENTIRE hypothesis class (incl. the reverted syncaddr self-heal,
+the GC-fix residue, worker-dispatch-wake-loss) is **dead**. It is a **genuine deadlock: the producers
+never execute**. No worker is ever handed the `.resS` deserialize/read job.
+
+**Pinned mechanism:** PreloadManager's `Complete()` steal loop (`0x800B00BB0`, skip at `0x800B00CCF`)
+**epoch-skips** item[0]: `cmp [desc+0x20]==[item+8]==1 → je (xor eax,eax; ret)` — it treats the job as
+"claimed/in-progress by a worker," but NO worker runs it (all worker semas count=0, never posted). The
+phase=1 is written once early and never advances (write-watch on `0x6001162B0` sees 0 writes in-window)
+⇒ **phantom claim**: the descriptor is marked in-progress but its work is never dispatched, so the
+phase never advances to done, so the steal loop skips forever, so PreloadManager's completion sema is
+never released, so the whole chain (main isDone, AsyncRead, workers) stays parked. Convergent with
+cult (`0x800a55e50`) — same frozen-descriptor-phase root.
+
+**Why real HW ≠ SharpEmu:** with lost-wakes excluded, the remaining explanation is an
+interleaving/timing divergence — a worker (or the steal loop) that on real parallel HW claims-AND-runs
+the job atomically, but under SharpEmu's cooperative-ish executor claims the phase (sets =1) then is
+descheduled/parked before running the body, orphaning it. NOT yet proven.
+
+**Next step (new sub-investigation — requires catching the FRAME-1 transition, which the static
+end-state cannot show):** capture WHO writes `[0x6001162B0]`=1 and whether that thread then parks
+without running the job body. The import-boundary write-watch can't arm before the frame-1 write;
+options: (a) arm the write-watch at process start (add an env to `GuestWriteRipWatch` to mprotect the
+descriptor page immediately, before first import); (b) BP the JobSystem schedule/claim function and log
+claim→run ordering; (c) log every guest thread's claim of a descriptor phase + its next block. The fix
+point is the claim/dispatch atomicity, NOT any wake delivery. Do NOT force-wake / stuff tokens
+(fabricating crashes — fixes-force-unblock-crash.md; all counts are legitimately 0).
+
+Tooling proven this session: semaphore-value dumps via `SHARPEMU_STALL_DUMP_RANGE` are the decisive
+discriminator (count>0+parked = lost wake; count=0+waiter=-1 = never-produced). 636 tests green.
+
+### Follow-up (2026-07-22, same session) — located the JobSystem worker-dispatch code (0x800A9F970)
+
+Continuing the frame-1 dispatch trace. From `SHARPEMU_LOG_SYNCADDR`, ALL 7 worker-sema wakes during
+frame 1 share one call site: **`ret=0x800A9FA82`** (`cooperative_woken=1`). Disassembled its function
+**`0x800A9F970` = JobSystem "notify/wake up to N workers"**: round-robins worker cbs
+(`cb = scheduler + (idx)*0x8140`, scheduler=`[0x801FFED88]`=0x6007536C0 this run, confirmed by
+`sched+0x148`==steal-loop r12), and for each idle worker whose sema-count word `[cb+0]` is negative (a
+parked waiter) posts a token (`cmpxchg` count+1 with a version in the high bits) and calls
+`SyncOnAddressWake` (`0x8018a9110`) on `[cb+0x40]` at `0x800A9FA82`. It fired 7× in frame 1 and
+**never** for the `.resS` job (all worker sema counts=0 at stall) ⇒ the read/deserialize job is
+**never added to the ready set** (dependency-deferred), so this notify is never invoked for it.
+
+The steal loop `0x800B00BB0` fetches continuations from a **segmented std::deque-style container**
+(`0x800B00F50`: begin=`[c]`, end=`[c+0x40]`, seg=`[c+0x90]`, seg_array=`[c+0xa0]`) and epoch-skips
+each whose `[desc+0x20]==[item+8]`. Worker deque header offsets from the older notes DON'T match
+(values at cb+0x100/+0x108 are heap pointers, not Chase-Lev indices) — occupancy not readable statically.
+
+**The fix-relevant code is `0x800A9F970`'s CALLER** = the JobSystem schedule / dependency-complete
+path that decides to add a job to the ready set + notify. Added a `[rsp]` (caller return-address)
+capture to `GuestRipBreakpoint` (`caller=` field) and BP'd `0x800A9F970` (entry `push rbp` =
+emulatable ⇒ safe) to read those callers, to then RE the add/defer decision and find why the `.resS`
+job's dependency never resolves. Next: disassemble the caller(s); identify the dependency the read-job
+waits on and the code that should decrement/resolve it.
+
+### Follow-up (2026-07-22) — full JobSystem dispatch machinery mapped; root narrowed to "job never enqueued"
+
+BP'd the dispatch `0x800A9F970` (added `[rsp]` caller-capture to GuestRipBreakpoint: `caller=` field,
++ `SafeReadStack` for host-mmap'd guest stacks ~0x00006FFF..). Its 3 callers, all JobSystem:
+- **`0x800A9E715`** (main enqueue): `lock cmpxchg [q+0xc0]; [q+0x108]++; [q+0x100]=bottom` (push job to a
+  segmented deque `q`=rbx), then `rdx = bottom-top` (queue depth), `call 0x800A9F970` (notify that many
+  workers). So **enqueue == push-to-deque + notify** — the notify only fires when a job is pushed.
+- **`0x800A9F42A` / `0x800A9F5D4`** (in `0x800A9F3E0`): affinity path, strides worker cbs by `0x8140`
+  (`[r14+0x8180]`), wakes a specific worker.
+
+Complete machinery map (metal_slug, addresses stable): scheduler=`[0x801FFED88]`=0x6007536C0; worker
+cb=`sched+(idx)*0x8140`; worker main loop 0x800AA0550 → pop 0x800A9E140; PreloadManager `Complete()`
+steal loop 0x800B00BB0 (skip 0x800B00CCF), continuation container fetch 0x800B00F50 (segmented deque);
+dispatch/notify 0x800A9F970 (→ SyncOnAddressWake wrapper 0x8018a9110); enqueue 0x800A9E715.
+
+**Root now narrowed to: the `.resS` read/deserialize job is NEVER enqueued** (0x800A9F970 fires 7× in
+frame 1, never for it; all worker sema counts stay 0). Its descriptor phase is frozen at 1, so its
+continuation epoch-skips forever and PreloadManager's `Complete()` never returns. Everything downstream
+(AsyncRead read-request sema, main isDone poll) is a consequence.
+
+**Still open (the actual fix):** WHY the job is never enqueued — i.e., the frame-1 schedule/dependency-
+resolve decision that should push it. Blocked on catching that deterministically: the write-watch is
+unreliable on the busy heap page 0x600116000 (other allocs on the page unprotect it between
+import-boundary re-arms), and the enqueue BP fires for MANY jobs (identifying the `.resS` one among them
+needs a discriminator). The evidence (no lost wake anywhere; a job whose enqueue simply never happens)
+points at a scheduling/timing interaction under SharpEmu's cooperative-ish executor rather than a
+one-line HLE gap. NOT force-wake/stuff-token (all counts legitimately 0). Concrete next experiments:
+(1) BP enqueue 0x800A9E715 with a filter on the pushed job's descriptor==0x600116290 (needs reading the
+pushed job ptr from the deque slot in the BP) to prove it's never pushed; (2) find the dependency the
+read-job waits on (the field the descriptor's phase mirrors) and BP the code that should decrement it;
+(3) trace PreloadManager's last N imports before it parks at 0x800B0588A to see the call sequence that
+stops short of submitting the read. 636 tests green; tooling changes (caller-capture) uncommitted.
+
+### 2026-07-22 — Three-experiment convergence: the async .resS read is NEVER submitted by any thread
+
+Ran all three follow-up experiments (added `SHARPEMU_TRACE_IMPORTS_THREAD=<name>` per-thread import
+trace, incl. `__BARE__` for the primordial thread that runs with NO cooperative guest-thread state).
+
+**Exp 3 — PreloadManager full trace (22,899 imports → park):** it does pure PATH RESOLUTION —
+3181 scePthreadMutexLock, 1712 strchr, 467 new / 454 delete, 61 _Getptolower, **10 sceKernelStat**
+(0 open, 0 read, 0 Aio). It stats the assets (the 2 read descriptors' sizes 0x1000000+0x80000 =
+17301504 = EXACT `sharedassets0.assets.resS` size ⇒ stat is CORRECT), creates the 2 read descriptors,
+dispatches 3 early jobs to Background workers (#721/742/743 → worker semas 0x600108EB0/EC0/ED0 via the
+0x800A9FA82 notify), then its FINAL act (#22898) is `sceKernelSyncOnAddressWake` on **0x608ABA518**
+(ret=0x800B05877) — a handoff — immediately followed by parking on its completion sema 0x608ABA458.
+
+**Who consumes 0x608ABA518:** a thread that waits there 23,958× with **guest=0** (ret=0x8018A6415, a
+Baselib timed sema-acquire job loop) — i.e. the PRIMORDIAL/main thread, which runs "bare" OUTSIDE the
+cooperative scheduler (not in _guestThreads / the census).
+
+**Bare/main thread trace (227,463 imports):** it is the busy main engine thread (thread-create ×49,
+AGC reg-patches, 126k mutex, 37k new) — NOT deadlocked, it runs a Baselib job loop polling 0x608ABA518.
+But it does **0 Aio, 0 open, 0 read/pread**; its 7 wakes hit the Gfx device worker (0x6031139A0 ×6) and
+one worker — **never AsyncRead**.
+
+**Exp — AsyncRead full trace (39 imports):** thread setup + lowercases one path (16× _Getptolower) then
+parks on 0x600E40110 forever. Never processes a read.
+
+**DECISIVE:** across the ENTIRE run, `0x600E40110` (AsyncRead's request sema) is woken **0 times by
+anyone**, and NO thread ever calls Aio / open / read for the `.resS`. **The async read is never
+submitted.** PreloadManager stats the file and creates the descriptors, hands off to the main thread's
+job loop (0x608ABA518), the main thread consumes the handoff but the read-submit code never runs, so
+AsyncRead's sema is never posted, so the read never happens, so the descriptor phase never advances,
+so the continuation epoch-skips forever and PreloadManager's `Complete()` never returns.
+
+**Narrowed root:** the PreloadManager→main-thread(0x608ABA518)→AsyncRead read-submission handoff breaks
+at the main-thread stage: the job the main thread should run (submit the `.resS` reads) either is never
+actually enqueued for it, or runs but doesn't submit. The main thread running "bare" (guest=0, host-
+thread WaitOnHostThread path) while PreloadManager wakes via the cooperative WakeBlockedThreads is the
+prime SharpEmu-specific suspect (the finite-timeout poll self-heals the token, but a queue-visibility /
+job-body-execution gap across the cooperative/bare boundary would not). Exp 1 (enqueue is a complex
+work-stealing state machine; .resS never among the 3 worker dispatches) and Exp 2 (phase advances only
+on read completion, which never happens) are consistent. Next: trace the main thread's activity in the
+window right AFTER it consumes the 0x608ABA518 token (#22898-equivalent) to see what its handoff job
+does instead of submitting the read. Tooling (per-thread + __BARE__ import trace, BP caller-capture)
+uncommitted.
+
+### 2026-07-22 — OS-CONFIRMED ROOT: metadata reads fully, the async .resS DATA read is never submitted
+
+Ran the post-handoff experiment set. Corrected an earlier grep error: the file I/O is done by the
+PRIMORDIAL/main thread (traced via SHARPEMU_TRACE_IMPORTS_THREAD=__BARE__), which does sceKernelOpen ×7,
+sceKernelStat ×34, sceKernelPread ×25 (my first pass used wrong NID patterns and wrongly concluded 0).
+
+**strace (OS ground truth) — the decisive evidence:**
+- `sharedassets0.assets` (42992 B metadata) opened (fd 192) + read FULLY: `pread64(192,...,42992,0)=42992`.
+- `level0` (scene, 10376 B) opened (fd 193) + read fully; both then RE-READ (retry/poll loop).
+- **`sharedassets0.assets.resS` (17301504 B, the actual asset DATA) is NEVER referenced — 0 mentions,
+  never opened.** (The 2 stuck read descriptors' sizes 0x1000000+0x80000 == 17301504 == that file.)
+
+**Main thread's metadata-load loop** (guest code ~`0x80146A40`, sites: open ret=0x80146(...)9F2F,
+stat ret=0x8014696ED/0x80146B39F, pread ret=0x80146AB79): `stat → open → pread` over successive files
+(fds 8→0xB), reading serialized-file HEADERS. It creates the 2 `.resS` read descriptors (phase=1),
+then STOPS all file I/O and drops into the 0x608ABA518 timed-poll loop. It never issues the async
+data reads, never posts AsyncRead's request sema `0x600E40110` (confirmed 0 wakes to it all-run), never
+opens `.resS`.
+
+**So the stall is precisely the transition "serialized-file metadata read complete → submit async
+`.resS` data read(s)" — that transition never fires.** PreloadManager (path resolution: strchr/stat/
+lowercase, 0 read/open/Aio) hands off to the main thread (0x608ABA518 wake) and parks on its completion
+sema; the main thread consumes the handoff but the async-read-submission never runs; AsyncRead idles
+forever; the descriptor phase never advances; PreloadManager's Complete() never returns.
+
+This supersedes "job never dispatched" framing: the JobSystem dispatch is downstream. The real missing
+producer is the **AsyncReadManager submission** for the `.resS` data. Prime suspects for a FIX: (1) a
+SharpEmu HLE gap the submission path depends on — e.g. sceKernelStat/Open metadata (verify the .resS
+stat/size and any dir-entry/exists check the loader makes BEFORE it will submit the read; if SharpEmu
+returns a wrong dirent/flag/errno the loader may believe the data is already resident or missing and
+skip the read), or the async-read registration checking a status/event SharpEmu never satisfies;
+(2) the cooperative↔bare(primordial) handoff. NOT force-wake. Next: disassemble the loader's post-
+metadata branch (the code right after the last pread at eboot-offset ~0x146AB79) to find the condition
+gating async-read submission, and check what sceKernelStat returns for `.resS` specifically (does the
+loader ever stat `.resS`? strace shows it does NOT — so it may be resolving `.resS` existence via a
+directory/dirent read that SharpEmu answers wrongly). Tooling added: SHARPEMU_TRACE_IMPORTS_THREAD
+(comma-list, `Name*` prefix, `__BARE__`), BP caller-capture. 636 tests green; all uncommitted.
+
+### 2026-07-22 — post-metadata branch traced via call-stack walk; main thread is the WAITER, not the submitter
+
+Added an rbp-chain stack-walk to GuestRipBreakpoint (prints `stack:` = return-address chain) — reusable
+for any call-site. Used it to walk the asset-load call graph on metal_slug.
+
+**Metadata-read call stack** (BP on SerializedFile read-op `0x80146ACD0`, hit twice, args = fd handle,
+size 0x5F0/0x1143): `0x80146ACD0 → 0x800BD4D71 → 0x801205555 → 0x800868E69 → 0x800AD79BF →
+0x801473400 → 0x801483C01 → (thread entry)`. So the main/primordial thread reads serialized-file
+headers through this loader chain (0x801473400 constructs a 0x1d-char string + calls 0x800d3fb20; the
+read helper at ~0x80146A900 branches on `[obj+0x428] bit32` = direct-pread vs alternate, and sets read
+status `[obj+0x434]` = 0/0xe).
+
+**Main thread's completion-wait call stack** (BP on the Baselib timed `Semaphore::TryAcquire`
+`0x8018A6300`, rdi=sema=**0x608ABA518**, called 23,958×): `0x8018A6300 → 0x800B05C32 → 0x800AECE43 →
+0x801477FA4 → 0x801483C01 → (thread entry)`. Same top-level frame `0x801483C01` as the loader ⇒ the
+main thread's top-level loop BOTH reads metadata AND then waits on 0x608ABA518.
+
+**Corrected model:** the main thread is the **WAITER**, not the read-submitter. Chain of waits:
+- main thread waits `0x608ABA518` (TryAcquire loop) for PreloadManager to post load-complete;
+- PreloadManager waits `0x608ABA458` for the async read/deserialize JOBS to finish;
+- those jobs are never dispatched/run ⇒ the `.resS` read is never submitted ⇒ nothing advances.
+
+**Determination:** it is a WAIT, not an error or retry — steady-state NID histogram shows ZERO reads
+(the metadata re-reads were 2 init passes during frame 1, not a steady-state retry), and no read ever
+returns the 0xe error status on the main path. So the loader successfully read ALL metadata and is
+parked waiting for async data that is never requested.
+
+**Still unpinned:** the exact guest condition that should schedule the `.resS` read/deserialize job
+after metadata is parsed. It lives in heavily-inlined C++ across frames 0x800868xxx/0x800AD7xxx/
+0x801473xxx/0x801483xxx and did not yield to frame-by-frame static disasm efficiently. The reusable
+stack-walk + per-thread trace tooling now makes the next attempt faster: BP the point where the
+serialized-file external-reference (the `.resS` `FileIdentifier`) is resolved into an async read
+request, and compare a HEALTHY external-ref resolution (e.g. level0's) against the stuck one; or find
+the AsyncReadManager submit function (posts sema 0x600E40110) and BP its would-be caller. Tooling this
+session: GuestRipBreakpoint `stack:` rbp-walk + `caller=`; SHARPEMU_TRACE_IMPORTS_THREAD (comma-list,
+`Name*` prefix, `__BARE__`). 636 tests green; all uncommitted.
+
+### 2026-07-22 — differential comparison: no healthy .resS exists (whole async-data path is dead); stall is INSIDE the scene-load fn 0x8014709a0
+
+Ran the differential. First finding that reframes it: **there is no "healthy" .resS to diff against** —
+strace shows NO resource-stream (.resS) or level data file is EVER opened by any path. The entire
+async-data-read subsystem (AsyncRead thread) gets 0 work all run. So it is not one file mis-resolving;
+the whole async-data path is dead.
+
+**Orchestration mapped** (top-level main-thread frame, shared by both the metadata-load and the
+completion-wait stacks): function at ~0x801483B40 builds path/log strings (snprintf 0x8019b08b0 with
+0x124-byte buffers; strlen 0x8019b0750; memcpy 0x8019b21d0) and calls import stub 0x8019b1560 (PLT →
+HLE export, ordinal 0xeb; has an error branch at 0x801483BBE that sets flag [rip+0xbaa2ba]=1), then at
+**0x801483BFC calls the scene-load function `0x8014709a0`** (returns to the shared frame 0x801483C01).
+The main thread is stuck INSIDE 0x8014709a0: it reads all serialized-file metadata (via ...0x801473400)
+and then waits on sema 0x608ABA518 (via ...0x801477FA4) for async completion that never comes.
+
+**So the async-read submission gate lives inside 0x8014709a0's (heavily-inlined) call tree, between
+"metadata parsed" and "wait for completion."** Frame-by-frame static disasm of this tree did not
+converge (large inlined Unity SerializedFile/Scene-integration code).
+
+**Strongest remaining fixable hypotheses (for next session):**
+1. Unity's AsyncReadManager is initialized into a disabled/synchronous-fallback mode because a SharpEmu
+   HLE that reports storage/device capabilities returns a wrong value (e.g. a 0 max-read-size / sector
+   size / direct-memory query, or the ordinal-0xeb import at orchestrator setup erroring). Because the
+   async subsystem is 100% unused, an INIT-time gate is more likely than a per-file bug. Check: trace
+   the main thread's imports during AsyncReadManager/PreloadManager INIT (early frame 1) for any query
+   returning 0/-1 that would disable streaming; and identify import ordinal 0xeb (the 0x8019b1560 stub)
+   and whether it errors.
+2. A cooperative/bare-thread interaction: the scene-load runs on the primordial (guest=0) thread and
+   waits on a Baselib sema the JobSystem workers must post; verify the workers actually execute the
+   scene-integration job bodies (BP a worker's job-dispatch and confirm it runs the .resS-read job).
+
+Reusable tooling built across this investigation (all uncommitted): GuestRipBreakpoint with emulated
+prologues + `caller=` + rbp-chain `stack:` walk; SHARPEMU_TRACE_IMPORTS_THREAD (comma-list, `Name*`
+prefix, `__BARE__`); semaphore-value dumps as the lost-wake discriminator. 636 tests green.
+
+### 2026-07-22 — Experiment #3 (import-return-value differential on init): async-disable-at-init RULED OUT
+
+Built the return-value differential: added `[IMPRET]` logging (gated by SHARPEMU_TRACE_IMPORTS_THREAD)
+right after the HLE runs in DispatchImport (cachedExport path, line ~620) — logs rax, the int return,
+and read-back of the likely out-param pointers (*rsi, *rdx) to catch a capability/size query that
+returns OK but writes a wrong value.
+
+Ran on the main/primordial thread (__BARE__). Every init capability query returns a SANE value:
+- sceKernelGetDirectMemorySize = 0x400000000 (16 GiB) ✓
+- sceKernelGetProcessTimeCounterFrequency = 0x3B9ACA00 (1 GHz) ✓
+- scePthreadAttrGetstacksize = 0x200000 (2 MiB) ✓; sched params/stackaddr sane ✓
+- sceKernelVirtualQuery mostly OK (rax=0); DirectMemoryQuery one 0x8002000D failure but that's the
+  normal iterate-until-error enumeration (rsi=0x1).
+- All error returns are EXPECTED probing: sceKernelStat/Open/Mkdir ENOENT (0x80020002) on optional
+  files, sceVideoOutIsOutputSupported "not supported", scePadOpen "no pad". None disables I/O.
+
+**Result: hypothesis 1 (an init capability query flipping Unity into a disabled/synchronous-fallback
+async path) is NOT supported.** The async subsystem initializes correctly (AsyncRead thread exists and
+waits; memory/timer/stack queries all correct). So the divergence is at RUNTIME during the load, not in
+setup. Leading remaining hypothesis is #2: the JobSystem workers don't execute the scene-integration
+job body that would submit the .resS read — the decisive next differential is to BP a worker's job
+dispatch and compare a frame-1 job that DID run vs the stuck .resS-read job.
+
+Caveat: [IMPRET] only covers the cachedExport dispatch path; hot "leaf" imports (most sceKernelPread,
+mutex) bypass it. The 2 preads it did capture were full reads (rax==rdx). Tool reusable. 636 tests green.
+
+### 2026-07-22 — Built a working guest single-step / branch execution tracer (SHARPEMU_TRACE_SS)
+
+Added `src/SharpEmu.HLE/GuestSingleStepTracer.cs` + a SIGTRAP hook in
+`DirectExecutionBackend.PosixSignals.cs` (before the GuestRipBreakpoint block) + `ArmAndFlush()` beside
+the existing one in `DirectExecutionBackend.Imports.cs` + `WarmUp()` in `WarmUpPosixSignalPath`.
+
+**What it does:** captures the exact RIP sequence a guest function executes, to a binary file (stream of
+little-endian u64 RIPs), for diffing a working vs a stuck code path. Config:
+`SHARPEMU_TRACE_SS=<armAddrHex>,<loHex>-<hiHex>[,<maxSteps>]` + `SHARPEMU_TRACE_SS_OUT` (default
+`sharpemu_ss_trace.bin`). Plants an INT3 at armAddr; on hit, sets the x86 Trap Flag (EFLAGS bit 8, gregs
+offset 136) in the mcontext and single-steps, recording RIPs in `[lo,hi)`. Calls OUT of the window are
+stepped-OVER (clear TF, plant a one-shot INT3 at the return addr, run the callee full speed, re-arm on
+return) so the trace stays at the traced function's own granularity. Stops on RET-above-frame,
+tail-call-out, or maxSteps. Linux-only, env-gated off by default (636 tests unaffected).
+
+**PROVEN WORKING** on metal_slug: `SHARPEMU_TRACE_SS=0x8014709A0,0x801470000-0x801478000,100000` traced
+the scene-load fn's first invocation — 19 steps (0x8014709A1,A4,A6,A8,AA,AC,AD,B1,B8,BF,C2,CA,D1,D7 then
+a step-over'd call to 0x8019B15C0), `[SS] trace complete`, no crash.
+
+**Two hard bugs fixed during bring-up (both would recur for anyone extending this):**
+1. JIT-in-signal-frame ("attempted to call a UnmanagedCallersOnly method from managed code" fatal):
+   fixed by `WarmUp()` (PrepareMethod the signal-path callees Record/Stop/TryPlantReturnBp/SafeReadStack
+   + warm the write/mprotect P/Invokes) — TryHandleTrap itself is warmed by the existing synthetic
+   SIGTRAP warmup, but its callees are not reached by that fake trap.
+2. **Over-broad arm-guard → infinite loop → stack-overflow SEGV:** a concurrency guard for
+   `trapRip-1==_armAddr` (meant for a second thread hitting the arm-INT3) ALSO caught the STEPPING
+   thread's own first single-step after a 1-byte entry instruction (push rbp), rewinding forever and
+   overflowing the stack. Fixed by gating on `!_steppingActive`.
+
+**Verified during bring-up:** gregs offsets correct (recorded rewound RIP=0x8014709A0, EFLAGS=0x202);
+arm site MUST be single-threaded (0x80146ACD0 read-helper is multi-threaded (workers deserialize) and
+crashes on concurrent INT3 hits — the arm-guard now makes concurrent hits non-fatal, but step-over
+return-INT3s in shared code are still unsafe, so target MAIN-THREAD-ONLY loader code and window the
+shared helpers OUT so they're step-over'd). `SHARPEMU_TRACE_SS_NOTF=1` = arm-only diagnostic (no
+stepping). Diag counters printed from ArmAndFlush: armFires/stepTraps/stepOvers/stops/recorded.
+
+**Next (use it for the differential):** trace the async-read-submission decision path — arm at the
+scene-load/reference-resolution frame that contains the branch, diff a working reference-resolution RIP
+sequence vs the stuck `.resS` one; the first divergent RIP is the fix point. May need a "skip first N
+arm hits" feature if the target function is called multiple times before the relevant invocation.
+
+### Follow-up (2026-07-22) — tracer classification fix + first loader traces (differential in progress)
+
+Used the tracer for the differential. Findings + one more fix:
+- `0x8014709A0` is called ONCE (19-step early-out) - NOT the scene loader. The real loader is the deep
+  chain from the metadata-read stack; the top-level main-only loader is the function containing
+  `0x801473400`.
+- **Classification bug fixed:** the step-over check (CALL vs return) only ran for `rip >= _hi`; a call to
+  a callee at a LOWER address (`rip < _lo`, common - the loader at 0x8014xxxxx calls helpers at
+  0x8008xx/0x800Bxx) was mis-read as "returned to caller -> STOP", truncating the trace at 21 steps.
+  Now the `[rsp]`-in-window CALL check runs for BOTH directions; a genuine return is the only STOP.
+- Added `SHARPEMU_TRACE_SS_SKIP=N` (skip first N arm hits untraced, re-arming between) for functions
+  whose first invocation early-outs.
+- With the fix, tracing `0x801473400` (window 0x801470000-0x801480000) produced a **450,560-step trace**
+  (2470 distinct in-window instructions, 69 distinct callee functions step-over'd) - the real loader
+  control flow. It did NOT complete in 90s: single-stepping is ~5K steps/sec and the loader's in-window
+  parsing loops dominate (450K in-window steps).
+
+**Status:** the tracer is proven on real loader code. The remaining gap for the differential is SCALE -
+the full loader is too large to single-step to completion interactively, and the async-submit decision
+is buried in the 450K-step parse. Next: NARROW the target - identify the specific external-reference /
+FileIdentifier-resolution sub-function (a smaller, main-only function) and trace just that, OR bisect
+the 450K trace by windowing sub-ranges; then diff a working reference's resolution vs the stuck `.resS`
+one. The tool + SKIP + fixed classification make that iteration straightforward. 636 tests green;
+tracer + fixes uncommitted.
+
+### Follow-up (2026-07-22) — differential blocked: no "working" async-load exists to compare against
+
+Narrowing analysis on the 450K-step loader trace (arm 0x801473400): the loader body spans
+0x801473400..~0x80147B596, with 1943 in-window RIPs executed ONCE (sequential decision logic) + a
+139-RIP hot parse loop + 69 distinct step-over'd callees. It progresses through its code (last
+newly-reached ~0x801477xxx at the 90s cutoff) - at full speed it completes; single-stepping (~5K/sec)
+just can't reach the end interactively.
+
+**The real blocker for the differential:** it needs a WORKING reference resolution to diff the stuck
+`.resS` one against - but strace confirms NO resource-stream / async-data read EVER happens in ANY of
+the 5 hung titles (the AsyncReadManager is 100% unused). So there is no working async-load trace to
+compare. Pinpointing the one diverging branch among 1943 sequential candidates by inspection, with no
+comparison, is not tractable.
+
+**What the tracer IS good for (delivered + working):** capturing exact control flow of any single-
+threaded guest function; it found+fixed real bugs during bring-up and traces the real loader. But this
+specific bug (async `.resS` submit never fires) can't be cracked by DIFFERENTIAL comparison here.
+
+**Realistic paths to actually crack the async-submit gate (all bigger than one step):**
+1. **Data-correlated tracing** - extend the tracer (or a new hook) to log the RIP that WRITES the read
+   descriptor `0x600116290` / builds the `.resS` filename (append of ".resS" to the base name). That
+   RIP is the resolution site; from there, static+trace RE the branch. The existing write-watch misses
+   it (busy heap page 0x600116000), so this needs a reliable single-write catch (e.g. arm PROT_NONE on
+   the exact 8-byte descriptor field the instant its page maps, or a hardware watchpoint via DR0-3).
+2. **Reference trace from real PS5 HW** (or a known-good emulator) of the same load, to get the
+   "working" side of the differential.
+3. **Deep static RE** of the identified loader region (0x801473xxx tree) to find the conditional that
+   gates the AsyncReadManager::Request call.
+
+636 tests green. Tracer (GuestSingleStepTracer.cs) + all fixes + trace tooling uncommitted.
+
+### 2026-07-22 — Data-correlation hook built (GuestAddrWriteCatcher); defeated by heap-address instability
+
+Built `src/SharpEmu.HLE/GuestAddrWriteCatcher.cs` + SIGSEGV/SIGTRAP hooks in PosixSignals.cs: a reliable
+single-address write catcher that page-protects the target's page read-only and, on each write-fault,
+records the writer RIP (if it hits the target) then SINGLE-STEPS the one store and RE-PROTECTS - so it
+catches EVERY write to the page (no busy-page miss, unlike GuestWriteRipWatch's import-boundary re-arm).
+`SHARPEMU_CATCH_WRITE=<addr>[,<max>]`; `SHARPEMU_CATCH_WRITE_PAGE=1` records all page writes. Armed
+correctly ("[CW] armed page ..."), warmup + signal-safety fine. 636 tests green; env-gated off.
+
+**Blocker (fundamental):** the `.resS` read-descriptor is NOT at a stable address in this build. Earlier
+in the investigation (older build) it was consistently at 0x600116290; after adding the tracer+catcher
+code the heap layout shifted and it moved. Two plain dumps of page 0x600116000 now show NO active
+descriptor there. The descriptor SLOT, the filename string, and even its PAGE all vary per build (and
+possibly per run) - so there is NO stable data address to target, and the catcher (which needs a fixed
+address) cannot be aimed. Page-mode caught 0 writes = the descriptor lives on a different page this build.
+
+**Cascade of fundamental blockers now hit for this specific bug (async `.resS` submit never fires):**
+1. Differential trace: no WORKING async-load exists in any of the 5 hung titles to diff against.
+2. Data-correlation (this): no STABLE data address (heap layout shifts per build/run).
+3. Full loader single-step trace: too large/slow (~5K steps/sec, 450K+ steps, doesn't complete).
+
+**Stable anchors that remain (paths that could still work, each a larger effort):**
+- CODE addresses are stable (guest image @0x800000000). Find the resolver via the stable metadata-read
+  call chain (0x80146ACD0->0x800BD4D71->0x801205555->0x800868E69->0x800AD79BF->0x801473400) - trace/RE
+  the SerializedFile external-reference resolution (~0x800868xxx, main-only) where the `.resS`
+  FileIdentifier becomes (or fails to become) an async read request.
+- Two-runs-same-build: run 1 plain to FIND the descriptor's current address (dump a wide heap range /
+  search for the filename "sharedassets0.assets.resS" or size 0x1000000), run 2 catcher to watch THAT
+  address's creation - IF the address is stable run-to-run within one build (needs verifying).
+- perf_event_open hardware read-watchpoint on the stable ".resS" string literal in the image (catches
+  the resolver reading it to build the filename) - a new tool, and HW-bp availability under the sandbox
+  is unverified.
+- A real-PS5-HW reference trace to supply the missing "working" differential side.
+
+Tooling delivered this session: GuestSingleStepTracer (works), GuestAddrWriteCatcher (works, but no
+stable target), + fixes. All uncommitted.
+
+### 2026-07-22 — Data-correlation hook WORKED: found + traced the SerializedFile-load/resolution function
+
+Fixed the GuestAddrWriteCatcher (re-protect the page EVERY import boundary, not once - SharpEmu lazily
+recommits guest heap pages, resetting protection). It then caught the write to the .resS descriptor's
+[+0x28] filename field: **rip=0x800AD57DA** - a constructor `vmovdqu [rax+0x28], xmm0` in the loader
+function `0x800AD5xxx` (same region as the loader frame 0x800AD79BF), which allocates a 32-object
+descriptor pool. (The catcher CRASHES after ~1 catch on this busy multi-threaded heap page -
+single-stepping writes there is unstable - but one clean catch was enough to anchor.)
+
+**Traced that function (0x800AD5xxx) with the WORKING single-step tracer** (arm 0x800AD57DA, window
+0x800AD5000-0x800AD9000): completed cleanly, **97,302 steps, 1926 distinct, 2097 step-overs, no crash**.
+It is the **SerializedFile METADATA load**: allocates the descriptor pool, builds asset paths (~1208
+strlen/alloc/memcpy string-build calls incl. appending ".resS"), and 13 meaningful calls ending
+0x800868E10 (SerializedFile), 0x80146EF80/E620/F420 (loader helpers), 0x800AD9210. Its finalization
+(0x800AD8Exx) REGISTERS the loaded file object (stores to globals @0x800AD8E30, sets [rbx+0xbc]=1,
+xchg [rax+0x28]) and calls 0x80146f420.
+
+**Key conclusion:** this function correctly loads the metadata and CREATES+registers the .resS
+descriptor. The `.resS` DATA read is a SEPARATE deferred/on-demand operation - NOT submitted here. So
+the gate is downstream: the deserialize job that would demand the data is never dispatched (the
+steal-loop phantom-claim, phase==tag==1, from the earlier milestones). That specific gate has resisted
+this entire investigation.
+
+**Tools delivered (all working, uncommitted, 636 tests green):**
+- GuestSingleStepTracer (SHARPEMU_TRACE_SS) - reliable branch/exec tracer, step-over, skip-N.
+- GuestAddrWriteCatcher (SHARPEMU_CATCH_WRITE[,_PAGE,_NONZERO]) - reliable single-address write catcher
+  (page-protect + single-step re-arm + continuous re-protect); crashes on busy multi-threaded pages
+  after ~1 catch but one catch anchors the code.
+- BP caller/stack-walk, per-thread import trace - from earlier.
+
+**HONEST STATUS:** despite finding+tracing the metadata-load/resolution function, the actual fix - why
+the `.resS` deserialize job is never dispatched (phantom claim) / why the data read never fires - was
+NOT determined. This bug has now resisted ~15 sessions + extensive tool-building. Next would need:
+tracing the JobSystem claim/dispatch of THIS specific job (correlating the phantom-claimed descriptor
+across the busy-page barrier), or a real-PS5-HW reference. The tracer makes tracing any single-threaded
+function tractable; the blocker is the MULTI-THREADED job-dispatch path (tracer/catcher both unsafe on
+multi-threaded code).
+
+### 2026-07-22 — HW watchpoint DELIVERED + NEW heap-discovery tool cracks the "unstable heap address" blocker; decoded the live .resS FileIdentifier; consumer is NOT on the heap (stable image code)
+
+Two tools delivered this session (build clean, 636 tests green, env-gated off, all uncommitted):
+
+1. **GuestHwWatchpoint** (`src/SharpEmu.HLE/GuestHwWatchpoint.cs`, `SHARPEMU_HW_WATCH=<addr>[;addr][,len][,max]`,
+   `SHARPEMU_HW_WATCH_SIG`): perf_event_open(PERF_TYPE_BREAKPOINT) hardware data write-watch — crash-free on
+   busy multi-threaded pages (the thing the page-protect catcher could not do). Per-thread perf fd model
+   (attach at both GuestExecution/GuestContinuation ThreadMain + primordial CallNativeEntry + belt-and-
+   suspenders at ArmAndFlush); RT signal 43 delivered to the writing thread via F_SETSIG+F_SETOWN_EX(TID)+
+   O_ASYNC; ucontext RIP capture. **Mechanism validated by a standalone C self-probe** (perf_event_open OK,
+   2 writes → 2 signals) — the exact attr layout/fcntl order/signal work on this kernel (perf_event_paranoid=1).
+
+2. **Stall-time heap string/pointer/referrer scanner** (`SHARPEMU_STALL_SCAN_STRING="<ascii>[;lo-hi]"`,
+   default heap 0x600000000-0x610000000, runs from the periodic-snapshot path since the title SPINS —
+   "Forcing sce::Agc::suspendPoint" busy-loop — rather than parks, so the import-stall watchdog never fires).
+   Pass1 finds the string; Pass2 finds aligned pointers to it + dumps the presumed descriptor [base..+0x60);
+   Pass3 finds pointers to those descriptor bases (referrers). **This is the tool the last ~15 sessions
+   lacked** — it locates the per-run-unstable heap descriptor by content, self-contained in one run.
+
+**Findings (metal_slug, live at the hang):**
+- The `.resS` FileIdentifier descriptors were found + decoded. Two of them point at "sharedassets0.assets.resS":
+  - desc A base ~0x60314C828: [+0x20]=0x80000, [+0x28]=filename ptr, [+0x38]=0x19 (=25 = strlen).
+  - desc B base ~0x60314EDE8: **[+0x20]=0x1000000 (16MB = the .resS DATA size)**, [+0x28]=filename ptr, [+0x38]=0x19.
+  So [+0x20] is the file SIZE, [+0x38] is the filename length — this is a FileIdentifier/ResourcePath
+  struct, NOT the JobSystem job descriptor (whose [+0x20] was the epoch/phase in earlier milestones).
+- **Cross-run stability is only PARTIAL** (desc A base stable run-to-run; desc B moved) → the two-run
+  "find address then watch it next run" approach is unreliable; single-run discovery is mandatory.
+- **Pass3 refs=0**: NOTHING on the heap (0x600000000-0x610000000) points to either FileIdentifier base.
+  The object that should consume the FileIdentifier to issue the 16MB `.resS` read does not hold it on the
+  heap → it is referenced from **stable guest-image code/globals** — i.e. the SerializedFile external-
+  reference resolver (~0x800868xxx, main-thread, per the call chain 0x80146ACD0->0x800BD4D71->0x801205555->
+  0x800868E69->0x800AD79BF->0x801473400).
+
+**Consequence for tool choice:** the gate (why the .resS read is never submitted) lives in stable, single-
+threaded image code (the resolver), which the WORKING GuestSingleStepTracer can trace directly — the HW
+watchpoint's multi-thread-safety is not what this specific gate needs. Next drill: single-step-trace the
+resolver ~0x800868xxx (arm on entry, window ~0x800868000-0x800869000) to see where the .resS FileIdentifier
+(now locatable live via the heap scanner) is read and where the async-read request is (or isn't) built.
+
+**HONEST STATUS:** the actual fix is still not found, but the multi-session "can't find the unstable heap
+address" blocker is now solved, the .resS FileIdentifier is decoded (16MB size confirmed), and the search
+is correctly redirected from the multi-threaded job page to the single-threaded, tracer-friendly resolver.
+
+### 2026-07-22 — CPU-topology-leak hypothesis DISPROVEN (taskset experiment); the .resS I/O layer is complete and simply never reached
+
+Chat-driven architectural review + one decisive experiment:
+
+- **There is no ".resS resolver" in SharpEmu, and there should not be** — it is Unity/IL2CPP guest code
+  (SerializedFile external-ref resolution, ~0x800868xxx, baked into eboot.bin, run directly on the host CPU).
+- **SharpEmu's file I/O + AIO IS complete and is NOT the culprit.** `sceKernelAioSubmitReadCommands` /
+  `...Multiple` (KernelFileExtendedExports.cs:548+) perform the read SYNCHRONOUSLY at submit time
+  (`KernelAioTransfer` -> `RandomAccess.Read`) and mark the request Completed; poll/wait report completed.
+  Consistent with strace: `.resS` is never `open`ed, so the guest never reaches the I/O layer at all.
+- **sync-on-address (KernelSyncOnAddressCompatExports.cs) is careful and just-hardened** (generation-based
+  anti-lost-wake, cooperative + host-fallback, in-place async-exception delivery). And the phantom-claim
+  *steal loop* itself (`cmp [desc+0x20],[item+8]; je`) is lock-free USERSPACE code with no kernel park in
+  the claim path — under direct execution it runs natively on the host, so the comparison is correct by
+  construction. This is WHY the bug has resisted ~15 sessions: every primitive SharpEmu owns on the
+  reached path is correct.
+
+- **EXPERIMENT (decisive):** metal_slug spawns 13 foreground `Job.Worker`s (0-12). Suspected a host-core
+  leak (host=12, 12+1=13). Ran `taskset -c 0-5` -> .NET correctly reported "6 logical processors"
+  (Environment.ProcessorCount respects the affinity mask), **but the guest STILL spawned exactly Job.Worker
+  0-12 (13)** — identical. => The guest worker count is INDEPENDENT of host cores; 13 is the game's own
+  PS5-derived value (7 cores x 2 SMT = 14 threads - 1 = 13). **Topology leak DISPROVEN; do not revisit.**
+
+**Net:** I/O complete (unreached), sync-on-address correct, atomics native, topology host-independent and
+PS5-correct. The divergence is in guest JobSystem dispatch STATE set up before the reached path, which is
+best attacked by single-step-tracing the stable, single-threaded resolver ~0x800868xxx (arm on entry,
+identify the .resS invocation via the FileIdentifier now locatable live with SHARPEMU_STALL_SCAN_STRING).
+
+### 2026-07-22 — MAJOR REFRAME via disassembly+thread-snapshot: the hang is producer-consumer SEMAPHORE STARVATION (not a live phantom-claim). Plus: perf HW data breakpoints do NOT fire in SharpEmu's guest-execution context (tool negative result).
+
+**Method:** dumped decrypted guest code at runtime (SHARPEMU_STALL_DUMP_RANGE via periodic snapshot) + capstone; read the full guest-thread snapshot.
+
+**Thread topology at the hang (metal_slug):**
+- ALL Job.Worker 0-12 + Background Job.Worker 0-15 + Loading.AsyncRead + AssetGC helpers are BLOCKED in
+  `sceKernelSyncOnAddressWait` (nid Hc4CaR6JBL0). Each worker waits on a per-worker slot 0x600108D70+0x10*idx.
+- The load-driver thread is parked the same way on a distinct completion semaphore (~0x600B58E08, semi-stable).
+- The only RUNNING threads are red herrings: a 1 Hz monitor loop (usleep 1e6; nid tn3VlD0hG60 = scePthreadMutexUnlock)
+  and the GfxFlip/UnityEOP suspendPoint spinners (nid fzyMKs9kim0 = sceKernelWaitEqueue).
+
+**Disassembled the park primitive (0x8018A90C0) — it is a COUNTING SEMAPHORE acquire:**
+`lock xadd [sem+8], -1 ; jle slow` ; slow path `mov rax,[sem]; ... lock cmpxchg [sem]; call 0x8019b2050 (=SyncOnAddressWait)`.
+So every worker is blocked on a semaphore whose **token count ([sem+8]) is <= 0** — i.e. **no work was ever posted**.
+This is a producer-consumer STARVATION: nobody increments+wakes the worker/completion semaphores.
+
+**Disassembled the steal-loop "phantom-claim" (0x800B00CA0..CD6):** a job runs only when phase `[desc+0x20]` !=
+tag `[item+8]`; `je` skips when equal. This is the CONSUMER side and is downstream of the starvation - the
+workers never even get to run the steal loop because their semaphore is never posted. The prior "phase==tag"
+framing described a symptom, not the gate.
+
+**Ruled out this session:** CPU topology (taskset -c 0-5 -> guest still 13 workers, host-independent);
+file I/O + AIO (KernelFileExtendedExports - complete, synchronous read+complete, never reached, .resS never
+open()ed); sync-on-address correctness (SHARPEMU_LOG_SYNCADDR trace shows clean wait->wake->resume pairs for
+the AssetGC threads - no lost wakes). atomics are native under direct execution.
+
+**TOOL NEGATIVE RESULT (perf HW data watchpoint / GuestHwWatchpoint):** does NOT work in SharpEmu.
+perf_event_open(PERF_TYPE_BREAKPOINT) + F_SETSIG(43)/F_SETOWN_EX(TID)/O_ASYNC + IOC_ENABLE all succeed on
+12+ guest threads (all fcntl/ioctl return 0, errno 0); a standalone C probe with the identical attr proves the
+mechanism works on this kernel (paranoid=1). BUT: reading the perf fd's kernel-level hit count returns 0 on
+every thread, 0 overflows, 0 records - even watching the semaphore count words that churn heavily during load,
+and even after re-arming once the page is mapped. Conclusion: **DR0-3 hardware breakpoints do not trigger on
+stores executed by directly-run guest code in this process** (the direct-execution model / signal+thread
+handling prevents the per-task debug registers from applying). The HW watchpoint is therefore NOT the tool for
+this bug; keep using disassembly + the HLE sync-on-address trace instead.
+
+**NEXT (does not need HW bp):** the producer that should post a worker/completion semaphore does so via
+`xadd [sem+8],+1` then `sceKernelSyncOnAddressWake(sem)` - an HLE call. So SHARPEMU_LOG_SYNCADDR can reveal it:
+check whether 0x600108D70+ (workers) or ~0x600B58E08 (completion) EVER receive a Wake. In the (perturbed) trace
+they did not - only AssetGC addresses (0x60071xxxx) were woken. If confirmed, the deserialize/read job's
+producer never runs -> trace WHY the main/loader thread parked on the completion sem before posting the workers.
+
+### 2026-07-22 — SyncOnAddressWake CENSUS pins the gate: Loading.AsyncRead is NEVER woken; the whole job pipeline dispatches ~7 jobs then stops. The main thread spins on an operation-completion semaphore that is never posted.
+
+Ran SHARPEMU_LOG_SYNCADDR=1 to full timeout (143K lines). Counted every wait-block vs every wake by address:
+- **47,073 wait-blocks on 0x608ABA518, timeout=finite, ret=0x8018A6415, and it is NEVER woken.** This is the
+  MAIN thread in a generic `Semaphore::WaitTimeout(ms)` primitive (0x8018A6300: `lock xadd [sem+8],-1; jle ->
+  timed SyncOnAddressWait`; returns 1 if posted, 0 on timeout). It loops forever because 0x608ABA518 (an
+  operation-completion semaphore) is never posted -> the async scene-load never signals done.
+- **Loading.AsyncRead (0x600E40110): parked exactly ONCE, NEVER woken.** Its thread fn 0x800937130 parks on a
+  request-semaphore at [r15+0xa0] (r15 = AsyncReadManager). A producer submits a read by pushing the request +
+  posting 0x600E40110. That producer NEVER runs -> the .resS data read is never submitted (matches strace: .resS
+  never open()ed; matches the 16MB FileIdentifier that is created but never read).
+- Workers 0x600108D80/D90/EB0/EC0/ED0/EE0/EF0: woken exactly ONCE each (7 total), then parked forever.
+- **ONLY 25 wakes in the ENTIRE run.** A healthy Unity scene-load dispatches thousands of jobs. So the job
+  system dispatched ~a handful of jobs and stopped cold, very early - it is not stalling deep in asset loading,
+  it barely started.
+
+**Refined gate:** the load pipeline kicks off (main thread posts a few worker jobs), ~7 jobs run, then the
+cascade halts before the deserialize job that would submit the .resS read to Loading.AsyncRead. Nobody ever
+posts 0x600E40110 (AsyncRead) or re-posts the workers or posts 0x608ABA518 (main completion). All three starve.
+
+**Why the perf HW watchpoint can't help here (confirmed dead): DR0-3 breakpoints do not fire on directly-executed
+guest stores in SharpEmu** (kernel hit-count stays 0 despite successful setup). So the producer of the missing
+post must be found another way.
+
+**NEXT:** trace the MAIN/loader thread's actions in the window BETWEEN "1 frame presented" and "blocks on
+0x608ABA518" - i.e. what load-pipeline call it makes to kick off the async load and what the first ~7 worker
+jobs do - to find where the cascade drops the .resS deserialize/read submission. Candidate tools: per-thread
+import trace (SHARPEMU_TRACE_IMPORTS_THREAD) filtered to the main thread; or single-step-trace the main
+thread's load-kickoff function once its entry is identified from the pre-block call stack.
+
+### 2026-07-22 — ROOT LOCALIZED: the hang is a two-sided deadlock in the main<->Loading.PreloadManager handshake (traced main-thread load-kickoff).
+
+Traced the main/primordial thread (it is __BARE__ - non-cooperative host-wait path) via SHARPEMU_TRACE_IMPORTS_THREAD=__BARE__ and found its load-kickoff, then traced Loading.PreloadManager.
+
+**Kickoff (main thread):** wakes a worker (Wake 0x600108D80), scePthreadMutexInit two mutexes (0x608ABA4C0
+recursive+PRIO_INHERIT, 0x608ABA4D0), **scePthreadCreate a loader thread (entry 0x800BFACC0, arg 0x608ABA3B0)
+= "Loading.PreloadManager"**, then blocks in a Semaphore::WaitTimeout primitive (0x8018A6300, ret 0x8018A6415)
+on 0x608ABA518.
+
+**The handshake object (base = PreloadManager arg 0x608ABA3B0):**
+- [base+0x168] = 0x608ABA518 = COMPLETION sem: PreloadManager posts (Wake), main waits.
+- [base+0xA8]  = 0x608ABA458 = REQUEST sem: main should post (Wake), PreloadManager waits.
+- [base+0x110] = 0x608ABA4C0 = shared recursive mutex.
+
+**The deadlock (exact, from interleaved trace + SHARPEMU_LOG_SYNCADDR):** it works ONCE -
+PreloadManager `Wake(0x608ABA518)` (ret 0x800B05877) -> main's host-wait gets wait-host-wake, main's Wait
+returns rax=0, main proceeds. PreloadManager then `Wait(0x608ABA458)` (ret 0x800B0588A, timeout=infinite).
+**Then main NEVER calls Wake(0x608ABA458)** - instead it loops forever: lock 0x608ABA4C0 x3 (one arg a
+counter incrementing 0x10/iter) + WaitTimeout(0x608ABA518) -> ETIMEDOUT (0x8002003C), repeat. Counts over the
+whole run: Wake(0x608ABA518)=1, **Wake(0x608ABA458)=0**. Both threads wait on the other; neither posts.
+
+This is the TRUE root - upstream of everything earlier (worker starvation, AsyncRead never woken, .resS never
+read are all downstream: PreloadManager is stuck at 0x608ABA458 so it never drives the rest of the load).
+
+**Open question (next):** WHY does main, after the single 0x608ABA518 completion, not post 0x608ABA458? Its
+post-wake code (caller of WaitTimeout 0x8018A6300) evaluates some mutex-protected condition and decides to keep
+waiting on 518 instead of posting 458. Candidates: (a) a genuine guest protocol where a THIRD party should
+post 458 (a worker/sub-op that is itself starved) - i.e. main's single 518 wake was for a sub-step, not the
+one that should trigger main to re-request; (b) a SharpEmu __BARE__(host-wait) vs cooperative-scheduler
+interaction bug (same CLASS as commit eaa4a9f) that makes main mis-observe the shared state after the
+host-wake. NEXT: disassemble PreloadManager's handshake code around 0x800B05877/0x800B0588A and main's
+WaitTimeout caller to see what data/condition gates the 458 post.
+
+### 2026-07-22 (cont.) — CORRECTION via main's completion-handler disasm: main is the INTEGRATION EXECUTOR, not a failed acker. The gate is UPSTREAM (a starved worker never sends PreloadManager its load request).
+
+Disassembled main's outer completion loop (0x800B05B00, the WaitTimeout(518) caller):
+```
+0x800B05B00 lock [rbx+0x120]              ; lock handshake mutex
+0x800B05B30 r12 = ([rbx+0x1e0] | [rbx+0x200]) != 0   ; any INTEGRATION work queued?
+0x800B05B45 unlock
+0x800B05B72 if (!r12) goto done
+0x800B05B88 call 0x800b04930              ; integrate a batch of ready objects
+   ...spin...
+0x800B05C21 rdi=[rbx+0x128]  (= the 518 sem)
+0x800B05C2D call 0x8018A6300 (WaitTimeout 1ms)   ; wait for PM to produce more integration work
+```
+=> **Main is Loading integration EXECUTOR.** It waits on 518 for PreloadManager to hand it ready objects.
+It NEVER signals 458 - so the earlier "main should ack 458" theory is WRONG.
+
+**The handshake is a BIDIRECTIONAL pipeline, not a ping-pong:**
+- 518 = [rbx+0x128] (0x608ABA518): PM -> main "integration work ready". Main waits (WaitTimeout).
+- 458 = [rbx+0x68]  (0x608ABA458): (upstream) -> PM "load request". PM waits (0x800B0588A).
+Both are correctly, legitimately blocked with empty queues. The missing signal is 458 (a load REQUEST to
+PreloadManager), and it originates UPSTREAM - NOT from main.
+
+**Revised root chain:** main kickoff wakes worker 0x600108D80 + creates PreloadManager, then becomes the
+integrator (waits 518). The worker (woken exactly once per the census, then starved) is what should drive
+PreloadManager by signaling 458. It doesn't -> PM waits on 458 forever -> never produces integration work
+-> never signals 518 -> main waits forever -> never reads .resS. So this is a genuine multi-stage pipeline
+starvation (main -> worker -> PreloadManager -> deserialize workers -> AsyncRead), NOT a main-side
+__BARE__/host-wait bug. It is closer to hypothesis (1) than (2), though the worker's own starvation may still
+be a SharpEmu job-dispatch issue.
+
+**NEXT:** trace worker 0x600108D80 (the one main wakes at kickoff): what job it runs, whether it signals
+0x608ABA458 (PreloadManager's request sem), and where it stops. That worker is the true upstream gate.
+
+### 2026-07-22 — TWO parallel investigations CONVERGE: the single broken action is the deferred .resS normal-async-read submission (never enqueued to Loading.AsyncRead). Pinpointed to the op's Perform path at the ".resS not suitable for apr reads" decision.
+
+Ran two parallel sub-agents (phase-2 trigger in guest code; phase-1 faithfulness). Both completed and converge.
+
+**Direction B (phase-1 faithfulness) - CONCLUSIVE: phase 1 is fully faithful.**
+- Metadata reads match on-disk sizes byte-for-byte: sharedassets0.assets=42992=0xA7F0 (Pread rax=0xA7F0), level0=10376=0x2888 (Pread rax=0x2888). No truncation.
+- sceKernelStat writes real host FileInfo.Length to st_size (KernelMemoryCompatExports.cs:7459/7492). The 6 ENOENT stats are normal Unity path-probing (each followed by a successful candidate). No dir-enum (getdents never called). Path resolution correct. No sceKernelApr* import ever called.
+- KEY: a guest-OWN printf fired in phase 1: `[DEBUG][PRINF] path /app0/Media/sharedassets0.assets.resS is not considered suitable for apr reads flags:0x0`. So the guest CORRECTLY parsed the .resS reference and DELIBERATELY deferred it from APR (async-page-read) to the normal async-read path. (.resS real size = 0x1080000 = 17.3MB.)
+
+**Direction A (phase-2 trigger) - the plumbing is healthy; ONE action is missing.**
+- 0x800B05260 = PreloadManager loop: acquires 458 (its idle/request sem) at top, drains input queue [rbx+0x1e0], runs the op's Perform (vtable+0x50), pushes to output [rbx+0x200], posts 518 (Wake 0x608ABA518 @0x800B05877), loops to re-acquire 458 (Wait @0x800B0588A).
+- 0x800B05AA0 = main integration pump (__BARE__): pure consumer, WaitTimeout(518)@0x800B05C2D; never writes 0x1e0, never wakes 458.
+- 0x800B04930 = IntegrateMainThreadObjects: pulls op from 0x200, calls op vtable+0x58 (main integrate) -> r14b. If r14b==0 (data NOT ready) -> je 0x800B0503B -> returns, op LEFT in 0x200, posts nothing. The 0xc0 re-step post (via 0x8018A9110 @0x800B0520A) is only on the READY branch.
+- Live state at stall: input 0x1e0=0 (empty), output 0x200=1 (op 0x81F640680 stuck awaiting integration). 458 count=-1 (PM parked). AsyncRead manager 0x600E40060: input queue empty, request sem 0x600E40110 count=-1, WOKEN 0 TIMES.
+- Census: 518 woken 1x, 458 woken 0x, AsyncRead 0x600E40110 woken 0x. main WaitTimeout(518)=34176 calls ALL TIMED OUT. main reached integrate 76905x, posted 0xc0 re-step 0 times.
+
+**CONVERGED ROOT:** The 16MB .resS streamed read must be submitted to Loading.AsyncRead (enqueue into 0x600E40060+0x1e0 + wake 0x600E40110), analogous to enqueue-0x1e0+post-458. That submission belongs to the op's Perform (vtable+0x50 of PreloadLevelOperation 0x81F640680), right where the ".resS not suitable for apr reads" decision fires. Perform ran once (posted 518) but NEVER submitted the read -> AsyncRead never woken -> data never arrives -> op vtable+0x58 always returns "not ready" -> main re-integrates every frame forever, op wedged in 0x200. NOT a 458 problem (458 already worked once); the missing signal is the AsyncRead request sem 0x600E40110.
+
+**Verdict:** plumbing/handshake healthy; the ONE broken action is the deferred .resS async-read submit-branch being skipped. Since the guest correctly parsed .resS and deliberately chose the normal-async path (the printf, flags:0x0), the submit-branch guard is most likely reading back an EMULATOR-VISIBLE input wrong (an APR / AsyncReadManager capability/registration flag, a file-handle/stat field, or a poll/completion state) rather than a spontaneous guest logic error.
+
+**NEXT (final probe):** disassemble the op at 0x81F640680 vtable+0x50 (Perform) and the code immediately around the ".resS not suitable for apr reads flags:0x0" printf; find the call that should enqueue into 0x600E40060+0x1e0 / wake 0x600E40110, and identify the guard (the "flags" source) it fails - that flag/value is the fix point.
+
+### 2026-07-22 — FINAL PROBE: resolved the op's Perform to stable image code and began disassembling it. New tool: SHARPEMU_STALL_CHASE (pointer-chain deref).
+
+**New diagnostic:** `SHARPEMU_STALL_CHASE="0xBASE:off1:off2:..."` follows a pointer chain (a=BASE; a=*(a+off) per hop), prints each hop + dumps the final address. Resolves per-run-shifting object graphs to stable code. (Added to the stall snapshot path; env-gated; build clean.)
+
+**Resolved the op->Perform chain (stable):**
+`cb 0x608ABA3B0 [+0x1F0]-> outputQueue 0x60010AE90 [0]-> op 0x6081F6480 [0]-> vtable 0x801D64608 [+0x50]-> Perform 0x800B01640`
+(op ptr shifts per run - was 0x81F640680 for the earlier agent, 0x6081F6480 now - but **vtable 0x801D64608 and Perform 0x800B01640 are in the stable image**.) op vtable entries: +0x40 (used @Perform 0x800B01698), +0x50=Perform, +0x58=main-integrate (called by main @0x800B04EE7).
+
+**Perform (0x800B01640) structure so far:**
+- 0x800B01682: `cmp dword [op+0x3b8], 6; je` - checks the op's STATE/phase field [op+0x3b8]. State 6 = a terminal/skip value. KEY candidate: if the op is wedged at a particular [op+0x3b8] value, Perform no-ops the data-load step.
+- 0x800B016CD: reads asset-path std::string at [op+0xa8]; 0x800B0172F hashes it (call 0x800d380f0 -> r12d id).
+- 0x800B01801-0x800B018BD: hash-table lookup of the id (same hash consts as the APR checker) in a registry [0x154d9d8]; 0x800B01900 call 0x800d3cb80 -> entry r15.
+- 0x800B01A2C+: locks mutexes ([r14+0x138], r15), then 0x800B01B55: reads [op+0xd0] (SSO flag) + [op+0xb0] string, calls [vtable+0x20] (0x800B01BAF) -> id; 0x800B01BCE call 0x800d36550 -> record rbx.
+- 0x800B01C0D-0x800B01D60+: iterates the record's DEPENDENCY list ([rbx+0x98]..[rbx+0xa0], stride 0x18; each dep's [+0x14] indexes into [rbx] table stride 0xE0), building dependency arrays and comparing against another list ([r14+0x10]).
+
+So Perform = **resolve the loaded file's dependencies and (should) queue their data reads**. The .resS data-read submit to Loading.AsyncRead (enqueue 0x600E40060+0x1e0 + wake 0x600E40110) is in the not-yet-reached tail of this function (Perform is >0x2000 bytes; the 0x2000 dump did not cover it fully) or in one of the dep-processing callees. The op-state field **[op+0x3b8]** (checked ==6 at entry) is the prime suspect for the guard that routes Perform away from issuing the read.
+
+**NEXT:** dump the tail of Perform (0x800B03640+) and the dep-processing callees; read the live value of [op+0x3b8] (op = 0x6081F6480 this run, via chase :3b8) to see which state the op is wedged in; find the enqueue-to-AsyncRead call and the [op+0x3b8]/dependency-count guard that skips it.
+
+### 2026-07-22 (cont.) — op live state = 2 (NOT 6): the ==6 gates are NOT the skip. The op wedges at state 2; PreloadManager Performs once-per-458-token then parks; nothing advances the op to submit the read. New tool: SHARPEMU_STALL_SCAN_PTR.
+
+New tool: `SHARPEMU_STALL_SCAN_PTR="0xADDR"` scans the guest heap for aligned 8-byte values == ADDR (e.g. a stable image vtable) and dumps 0x400 bytes at each holder - resolves a per-run-shifting object by its STABLE vtable ptr. (Heap base shifts run-to-run: 0x608ABA3B0 control block was valid in one run, unmapped the next; but vtable 0x801D64608 is stable image, so scan-by-vtable is the robust locator.)
+
+Found the single PreloadLevelOperation (holder 0x6081F6480) via its vtable 0x801D64608. **Live state: [op+0x3b8]=0x2, [op+0x3a8]=0x1D, [op+0x3bc]=0x00010001.**
+
+So Perform's `cmp [op+0x3b8], 6; je skip` gates (at 0x800B0168x, 0x800B0282E, and the many cmp ecx/edx,6 switch arms) are NOT triggered (state is 2). The op is wedged at STATE 2.
+
+**Refined model:** PreloadManager loop (0x800B05260) acquires ONE 458 token, drains input queue 0x1e0, calls Perform ONCE (advancing the op to state 2 + producing an integration shell), posts 518 once, loops to re-acquire 458 -> no token -> parks. Main integrates the shell via vtable+0x58 every frame -> "not ready" (data not loaded) -> its 0x800B0503B branch returns WITHOUT re-queuing to 0x1e0, posting 458, or posting the 0xc0 re-step. So NOTHING re-drives Perform to advance the op from state 2 (where the .resS data-read submit to Loading.AsyncRead should occur). The op sits in main's output queue 0x200 forever; AsyncRead 0x600E40110 woken 0 times.
+
+**Crux for the fix:** either (a) Perform pass-1 SHOULD have already submitted the read but took a wrong branch (emulator-visible input), or (b) something (main's "not ready" integrate, or an async-read completion, or a per-frame PreloadManager re-drive) should re-invoke Perform for state 2 and doesn't. Distinguish by: find state-2's handler inside Perform (the `cmp ecx,6`/`cmp edx,6` switch arms near 0x800B02EDA/0x800B02F99 dispatch on state -> locate the state==2 arm and whether it submits to 0x600E40060+0x1e0/wakes 0x600E40110), and check what re-queues the op to PreloadManager's input 0x1e0. Tools ready: SHARPEMU_STALL_SCAN_PTR (locate op), SHARPEMU_STALL_CHASE (deref chains), SHARPEMU_STALL_DUMP_RANGE (dump stable code).
+
+### 2026-07-22 (cont.) — TOOLING WALL on observing Perform's one execution. Localization is maximally precise; the final gate needs an instrumentation method that survives this hot/continuation-resumed code.
+
+Tried to observe which branch Perform (0x800B01640) takes in its single execution (submit block 0x800B028CE vs skip 0x800B02AD9, gated at 0x800B02819 by [PreloadMgr-global]!=0 && [op+0x3b8]!=6 && rax!=0 && r14!=0). All three dynamic tools FAILED on this specific code:
+- Single-step tracer (SHARPEMU_TRACE_SS arm=0x800B01640): produced 0 trace bytes; the run also didn't reach the .resS phase (tracer overhead/timing diverged the boot).
+- GuestRipBreakpoint (SHARPEMU_BP_RIP=0x800B02819/28CE/2AD9): SIGABRT "Invalid Program: attempted to call a UnmanagedCallersOnly method from managed code" in CallNativeEntry via ExecuteBlockedGuestThreadContinuation -> the INT3 fired on a cold CONTINUATION-RESUMED guest thread and JIT ran in the signal frame. So this Perform path is reached via blocked-continuation resume on non-warmed threads (INT3 unsafe there).
+- HW watchpoint (perf DR): confirmed earlier - does not fire on directly-executed guest stores in SharpEmu.
+
+**State at this wall (all verified):** the sole PreloadLevelOperation (vtable 0x801D64608, Perform=vtable+0x50=0x800B01640, main-integrate=vtable+0x58) is wedged at [op+0x3b8]=2, [op+0x3a8]=0x1D, [op+0x3bc]=0x00010001. The .resS async read to Loading.AsyncRead (0x600E40060/sem 0x600E40110) is never submitted (0 wakes). Perform's submit block is gated on state!=6 (passes) plus a runtime object chain (rax/r14 from a dependency-list search, and the PreloadMgr global). The op never advances past state 2 because PreloadManager Performs once-per-458-token then parks, and main's "not ready" integrate (0x800B04930 -> je 0x800B0503B) re-drives nothing.
+
+**Realistic paths to close the last gap (each larger):**
+1. Fully static-decode Perform's state machine: the state dispatch (cmp ecx/edx,6 near 0x800B02EDA/0x800B02F99) -> find the state==2 arm and whether it calls the AsyncRead enqueue; read the gate inputs live via SHARPEMU_STALL_SCAN_PTR/CHASE (the global [0x14ed2a5-rel] and the op's dependency list) to evaluate the 0x800B02819 gate by hand.
+2. A continuation-safe observation method: warm the GuestRipBreakpoint/tracer path for continuation-resumed threads (extend WarmUpPosixSignalPath to cover ExecuteBlockedGuestThreadContinuation), OR emulate the Perform prologue instead of INT3-at-entry.
+3. Real-PS5 reference trace of the same Perform to diff the branch taken.
+
+NOTE: the CallNativeEntry AttachCurrentThread() hook added for the (non-working) HW watchpoint is on the continuation path and may aggravate signal-frame JIT; consider reverting it if the HW watchpoint is abandoned.
+
+### 2026-07-22 — STAGE 1 DIAGNOSTIC (plan): Q1 answered definitively; Q2 shows APR is a path-based red herring; Perform remains unobservable (4th tool failure).
+
+Executed the approved plan's Stage-1 diagnostic on metal_slug.
+
+**Q1 - how is the .resS read submitted? ANSWER: it is NEVER submitted via ANY path.**
+Run with SHARPEMU_LOG_AMPR=1 + SHARPEMU_TRACE_IMPORTS_THREAD="Loading.PreloadManager,Loading.AsyncRead":
+- APR command-buffer activity: **0** (no sceKernelApr* submit/wait ever).
+- AIO submits by loader threads: **0**. No 16MB (0x1000000/0x1080000) read anywhere.
+- Loading.AsyncRead thread does trivial setup (16 tolower, 5 mutex, 1 VirtualQuery, 1 Mprotect) then parks on
+  SyncOnAddressWait(0x600E40110) and NEVER receives a request. => rules out Fix C (completion signaling): the
+  guest decides NOT to submit, upstream, in the op's Perform. Not a lost-completion; a never-issued submit.
+
+**Q2 - what emulator-visible value feeds the "apr suitability" decision? ANSWER: it's PATH-based, a red herring.**
+Disassembled the verdict function (entry 0x801469E40; printf at 0x80146A302, format 0x801C18EA0):
+- The "flags:0x%x" argument is r13d, which at the printf is the low32 of a hash-table base pointer
+  ([rip+0xbaed14]) - a coincidental register value, NOT a capability field. "flags:0x0" is meaningless.
+- The actual suitable/not-suitable verdict is a PATH string match (byte-checks '/app0/' at 0x80146A280-2E3 +
+  string-length compares). It fires "not suitable" for EVERY file - including the metadata that reads fine via
+  Pread. => APR-suitability is NOT the differentiator; st_dev/st_flags (Fix A) and completing APR (Fix B) are
+  BOTH likely the wrong lever. The differentiator is sync-Pread (small files, works) vs the never-issued async
+  submit (large .resS).
+
+**The real gate = the op's Perform (0x800B01640) state machine, and it is UNOBSERVABLE with current tools:**
+- Single-step tracer armed and Perform WAS hit -> SIGABRT "Invalid Program: attempted to call a
+  UnmanagedCallersOnly method from managed code" in CallNativeEntry via ExecuteBlockedGuestThreadContinuation.
+- Same crash as the INT3 breakpoint earlier. Perform runs on CONTINUATION-RESUMED cold threads; INT3/single-step
+  at its entry/interior collides with the continuation-resume (CallNativeEntry jumps to a saved RIP whose page
+  now holds 0xCC / JIT runs in the signal frame). 4th distinct observation tool to fail on this code
+  (HW watchpoint, tracer x2, BP).
+
+**Consequence:** the plan's Stage-2 fix input (which Perform branch/gate skips the .resS submit) is blocked by
+this tooling wall. Options to break it: (a) make an instrumentation tool continuation-safe (warm the
+ExecuteBlockedGuestThreadContinuation/CallNativeEntry path for the tracer/BP signal handler, or emulate the
+prologue so no 0xCC is planted at a resume RIP); (b) fully static-decode Perform's state-2 handler + the
+0x800B02819 submit gate (rax/r14 from dependency-list processing, the [0x14ed2a5-rel] global) by reading the
+live inputs with SHARPEMU_STALL_SCAN_PTR/CHASE; (c) reconsider whether the .resS read is gated by the
+never-dispatched WORKER deserialize job (the original phantom-claim thread) rather than Perform directly.
+
+### 2026-07-22 — STAGE 1 STATIC-DECODE (plan option b): the .resS submit is gated on a NULL manager-singleton global *(0x8021EE918). Strongest root-cause lead yet.
+
+Statically decoded the op Perform submit gate at 0x800B02819 and read the live inputs (SHARPEMU_STALL_SCAN_PTR + SHARPEMU_STALL_CHASE). The submit block (0x800B028CE `call [mgr+0x10]`, 0x800B028E4 `call [mgr+0x28]`) runs only if ALL of:
+- **GATE1 (0x800B02819): `*(0x8021EE918) != 0`** — a manager singleton `mgr = [rbp-0x1e0] = *(0x8021EE918)`, loaded at Perform entry (`mov rax,[rip+0x14ED2A5]` @0x800B0166C; address verified from instr bytes). The submit calls `mgr` vtable+0x10/+0x28.
+- GATE2 (0x800B0282E): op state `[op+0x3b8] != 6` (state=2, passes).
+- GATE3 (0x800B0283C): `[op+0xe8] != 0`.
+- GATE4 (0x800B0284C..81): a type `*(0x801FA7E60)` is found in a per-op list — CONFIRMED present (`*(0x801FA7E60)=0x801F43D38`, non-null).
+- GATE5 (0x800B0288E): the found entry non-null.
+
+**Live read result:** `*(0x8021EE918)` is `<unreadable>` in the snapshot memory view, and `0x8021EE918` is **PAST the loaded image end 0x8021C6BF8** (a BSS/singleton slot). GATE4's type read fine, so the reader works for image addresses — the manager slot being unreadable/past-image is consistent with it being an **uninitialized (null) singleton** that the guest reads as 0 -> GATE1 takes the skip -> the .resS streaming submit is never issued. This cleanly explains Q1 ("never submitted via ANY path").
+
+The manager at `*(0x8021EE918)` is a Unity streaming/async subsystem singleton (its vtable+0x10/+0x28 are the schedule-read methods). On real hardware/PS4(shadPS4) it is constructed during engine init; in SharpEmu it appears never initialized (stays null), so every streamed `.resS` read is gated out.
+
+**NEXT (to confirm + fix):** (1) confirm the slot is genuinely null vs a snapshot-reader limitation (check whether the guest faults/lazy-commits 0x8021EE918; or read it via a guest-level path). (2) Find what constructs the singleton and stores it to 0x8021EE918 (search the image for a store to that global / the subsystem init), and why that init never runs under SharpEmu -> the emulator-visible input that skips the subsystem init is the fix point. Candidate: an engine subsystem whose init is gated on a capability/graphics/streaming query SharpEmu answers wrong, leaving the AsyncUpload/streaming manager unconstructed.
+
+
+Resume the SharpEmu Unity async-load hang investigation.
+
+  Repo: /home/stefanosfefos/Documents/projects/open_source/sharpemu (branch bubble_puzzle). Full running log is in
+  testing_instructions.md — read the entries from 2026-07-22 (especially the last ~6), they contain every address and finding
+  below.
+
+  The bug: 5 Unity/IL2CPP PS5 titles (repro metal_slug_tactics, eboot at
+  /home/stefanosfefos/Documents/ps5_games/metal_slug/eboot.bin) present 1 frame then hang — the async scene load never completes
+  because the 16 MB .resS resource-stream read is never issued.
+
+  Root cause identified last session (needs confirming + fixing): In the sole PreloadLevelOperation's Perform (stable image code
+  0x800B01640, resolved via vtable 0x801D64608+0x50), the .resS streaming submit block (0x800B028CE: call [mgr+0x10] / 0x800B028E4:
+  call [mgr+0x28]) is gated at 0x800B02819 (GATE1) on a manager-singleton global mgr = *(0x8021EE918) being non-null. That global
+  sits in uncommitted past-image BSS (image ends 0x8021C6BF8) and reads as 0 → the submit is skipped → .resS never read → op stuck
+  at state [op+0x3b8]=2 → main spins on WaitTimeout(518) forever. Diagnostics proved no streamed read ever happens (0 APR command
+  buffers, 0 AIO submits, 0 16 MB reads, Loading.AsyncRead sem 0x600E40110 woken 0 times), so this async-streaming subsystem
+  singleton is never initialized. Ruled out this session: it's NOT APR-suitability (path-based red herring), NOT st_dev/st_flags,
+  NOT AIO completion (AIO is sync-complete), NOT phase-1 metadata (byte-faithful).
+
+  Next step: find what constructs this subsystem and stores it to 0x8021EE918, and why that init never runs under SharpEmu (likely
+  an engine-subsystem init gated on an emulator-visible capability/query SharpEmu answers wrong). First confirm *(0x8021EE918) is 
+  genuinely 0 (vs a snapshot-reader limitation), then locate the initializer. The image is 35 MB and SHARPEMU_STALL_DUMP_RANGE caps
+  at 0x2000, so likely build a small image-scan diagnostic to find the rip-relative store to 0x8021EE918, OR trace engine init for
+  the subsystem constructor.
+
+  Tools built this session (all env-gated, in DirectExecutionBackend.cs, keep them): SHARPEMU_STALL_SCAN_STRING,
+  SHARPEMU_STALL_SCAN_PTR=0xVTABLE (find object by stable vtable — used to locate the op), SHARPEMU_STALL_CHASE="0xBASE:off1:off2"
+  (pointer-chain deref), all run via SHARPEMU_PERIODIC_SNAPSHOT_SECONDS=25. Existing: SHARPEMU_LOG_AMPR=1,
+  SHARPEMU_TRACE_IMPORTS_THREAD, SHARPEMU_LOG_SYNCADDR. Note: INT3 breakpoints, the single-step tracer, and the perf HW watchpoint
+  ALL crash/fail on Perform (it runs on continuation-resumed cold threads → Invalid Program aborts) — don't retry them there; use
+  static decode + the scan/chase tools.
+
+  Cleanup pending (from the approved plan): revert the diagnostic-only GuestHwWatchpoint.AttachCurrentThread() hook in
+  CallNativeEntry and the GuestHwWatchpoint wiring — the perf HW watchpoint was proven not to fire on guest stores.
+
+  Constraints: fixes must be universal/correct (real PS5 semantics), no game-specific hacks, no blind/force unblocks. Don't commit
+  — I commit myself when final. Log each milestone in testing_instructions.md live. Approved plan is at
+  .claude/plans/warm-fluttering-newt.md. Build: dotnet build src/SharpEmu.CLI/SharpEmu.CLI.csproj -c Release --no-restore; 636
+  tests green baseline; perf_event_paranoid=1 already set.
+
+  Start by confirming the *(0x8021EE918) value and hunting its initializer.
+
+### 2026-07-22 — STAGE 0 + STAGE 1 TOOLING (new session): reverted the HW-watchpoint diagnostic; built the triangulation probe. Pinned the exact vmem semantics that make the `<unreadable>` result interpretable.
+
+**vmem semantics confirmed (via source read of `PhysicalVirtualMemory`, the runtime impl):**
+- `Map(vaddr, memsz, …)` EAGERLY commits + zero-fills the entire `[vaddr, vaddr+memsz)` incl. the BSS tail (`PhysicalVirtualMemory.cs:832-835`); size only ever rounds UP (`Map:803-806`); loader passes full `header.MemorySize` (`SelfLoader.cs:507-512`). So a global INSIDE a mapped segment's memsz reads back zero + `TryRead`→true, NEVER `<unreadable>`.
+- `TryRead` returns false (`<unreadable>`) ONLY for an address in NO tracked region (`PhysicalVirtualMemory.cs:1022-1030`).
+- Guest stores to reserved-but-uncommitted pages INSIDE a mapped region are committed on the SIGSEGV path + re-executed → persisted, not dropped (`PosixSignals.cs` → `Exceptions.cs:1558-1605`; ownership walks `SnapshotRegions()` `DirectExecutionBackend.cs:3070`). An access to an address in NO region is NOT recovered → chains to previous handler = a real crash.
+
+**Consequence:** the earlier `TryRead(0x8021EE918)=<unreadable>` ⟹ 0x8021EE918 is in NO tracked region ⟹ past every segment memsz SharpEmu mapped. Yet the op reached GATE1's `mov rax,[rip+…]` load and skipped WITHOUT crashing — which an untracked-address access could not do. That contradiction is the crux to resolve. New primary suspect: the loader UNDER-MAPS/mis-sizes the main module's last data+BSS segment (real image covers 0x8021EE918; SharpEmu image-end 0x8021C6BF8 falls short) — Fork A. Alt: init gated wrong upstream — Fork C.
+
+**Stage 0 cleanup (done):** removed ALL GuestHwWatchpoint wiring (proven not to fire on guest stores) — 4 `AttachCurrentThread()` calls in DirectExecutionBackend.cs, the WarmUp/Enabled/OverflowSignal/HandleOverflow paths + the orphaned `InstallPosixSignalHandlerNoChain` helper in PosixSignals.cs, the `ArmAndFlush` call in Imports.cs, and deleted `GuestHwWatchpoint.cs`. Kept the scan/chase/dump tools + the other catchers. Build clean.
+
+**Stage 1 tooling (done):** new `SHARPEMU_STALL_PROBE_ADDR="0xADDR"` in `LogStallWatchdogSnapshot()` triangulates an address 3 ways: (1) tracked-region membership via `IVirtualMemory.SnapshotRegions()` (reports the owning region or "NOT in any region" + nearest-below end + gap, plus the highest 4 tracked regions = true image end); (2) host commit state via `VirtualQuery` (COMMIT/RESERVE/FREE + protect); (3) the 8-byte value via both tracked `TryRead` and a raw identity-mapped read (only if host-committed). Env-gated, inert otherwise. Build clean.
+
+**NEXT:** run `SHARPEMU_STALL_PROBE_ADDR=0x8021EE918 SHARPEMU_PERIODIC_SNAPSHOT_SECONDS=25` on metal_slug to classify the slot (tracked+zero → Fork C; untracked-but-host-committed + image-ends-short → Fork A). Then build `SHARPEMU_STALL_SCAN_RIPREL` to find the initializer store.
+
+### 2026-07-22 — ⚠️ ROOT-CAUSE CORRECTION: the GATE1 global was a DIGIT-TRANSPOSITION TYPO. True singleton = 0x801FEE918 (mapped BSS), NOT 0x8021EE918. This is Fork C (init never ran), not a loader under-map.
+
+**Stage-1 triangulation (SHARPEMU_STALL_PROBE_ADDR=0x8021EE918) on metal_slug:**
+- `tracked: NOT in any region; nearest region below ends 0x8021C7000 (gap 0x27918)`
+- `host: base=0x8021EE000 size=0x1E12000 state=FREE` (unmapped)
+- So 0x8021EE918 is genuinely past the image AND host-FREE → a guest access there would CRASH, but the game only hangs → the guest never reads 0x8021EE918 → the address itself was wrong.
+
+**Loader segment table (from the run's own [LOADER] logs) — main eboot module (base 0x800000000), 5 PT_LOADs:**
+- seg0 VA=0x800000000 memsz=0x19B2C7C; seg1 VA=0x8019B4000 memsz=0x33EA80; seg3 VA=0x801CF4000 memsz=0x9E600; seg7 VA=0x801D94000 filesz=0x1B6178 **memsz=0x2FD1F0** (BSS tail, correctly mapped); seg8 VA=0x8020911F0 memsz=0x135A08 → ends **0x8021C6BF8** (= the "image end"). No memsz truncation anywhere; phdr parse is faithful.
+
+**Capstone decode of the REAL bytes at Perform prologue (dumped via SHARPEMU_STALL_DUMP_RANGE):**
+- `0x800B0166C: mov rax,[rip+0x14ed2a5]` → **RIP target 0x801FEE918** (prior session read 0x80**21**EE918; correct is 0x80**1F**EE918 — 0x20000 transposition).
+- `0x800B01676: mov [rbp-0x1e0], rax` ; `0x800B02819: cmp qword [rbp-0x1e0], 0 ; je skip` (GATE1) ; submit `0x800B028CE call [rax+0x10]` / `0x800B028E4 call [rax+0x28]`.
+- Also nearby image globals: r13/r14 from `[rip]`→**0x801FFED88** (0x800B01665/0x800B0169B), and 0x800B0290E `mov r15,[rip]`→**0x801FFE980**.
+
+**0x801FEE918 is in seg7's BSS tail** (seg7 file-end 0x801F4A178 ≤ 0x801FEE918 < mem-end 0x8020911F0) → legitimately mapped, zero-initialized. So the singleton IS mapped and simply null: **Fork C — the async-streaming manager is never constructed/stored**. The earlier "null past-image singleton / loader under-map" conclusion is VOID (typo artifact). GATE1 semantics stand: `.resS` submit is gated on `*(0x801FEE918) != 0` and it's 0.
+
+**NEXT:** built SHARPEMU_STALL_SCAN_RIPREL to find the STORE (initializer) to 0x801FEE918; re-probe 0x801FEE918 (expect tracked+value 0) and read 0x801FFED88/0x801FFE980. Then decode the initializer + its guard = the real fix point.
+
+### 2026-07-22 — CORRECTION TO THE ABOVE: *(0x801FEE918) is NON-NULL (0x60053DB10). GATE1 PASSES. The entire "null streaming-manager singleton" root cause is DISPROVEN.
+
+Probe/scan of the CORRECTED global 0x801FEE918 on metal_slug:
+- `tracked: IN region VA=0x800000000 end=0x8021C7000 prot=Execute,Read` (mapped ✓)
+- `host: base=0x801FEE000 size=0xA4000 state=COMMIT protect=0x4` (committed RW-ish)
+- `value (tracked TryRead)=0x60053DB10`, raw host read matches → **the manager singleton is CONSTRUCTED and non-null**. (dumps: 0x801FEE918=0x60053DB10; 0x801FFED88=0x60753 6C0; 0x801FFE980=0x74804CF23710.)
+- SHARPEMU_STALL_SCAN_RIPREL=0x801FEE918 found 18 rip-rel refs incl. the GATE1 load @0x800B0166C and the sole STORE (initializer): **`0x800DC5303: mov [rip+0x122960E], rbx` → 0x801FEE918** — and it ran (value populated).
+
+**Consequence:** GATE1 (`*(0x801FEE918)!=0`) is TRUE → the `.resS` submit block is NOT gated out by GATE1. The op still wedges at state 2 and Loading.AsyncRead is still never woken (those empirical facts stand), so the skip/wedge is DOWNSTREAM of GATE1: GATE3 `[op+0xe8]!=0`, GATE4 (search for type *(0x801FA7E60)=0x801F43D38 in the op's per-op list), GATE5, OR (timing) the manager was null when Perform actually ran and Perform is never re-driven. The whole prior null-singleton framing (and the "loader under-map" Fork A) is void — it was the 0x8021EE918↔0x801FEE918 typo.
+
+**NEXT:** read the op's live fields (SCAN_PTR 0x801D64608 → [op+0xe8] GATE3, [op+0x3b8] state) and the manager object at 0x60053DB10 (vtable, +0x10/+0x28 method ptrs) to evaluate GATE3/4/5 by hand and confirm whether the submit path is truly skipped vs the op never re-Performed.
+
+### 2026-07-22 — Perform state machine mapped (corrected-address basis): Perform READS op state but NEVER writes it → state advanced externally; op wedged at state 2 = its external driver never runs.
+
+Decoded Perform (0x800B01640) fully via capstone on SHARPEMU_STALL_DUMP_RANGE dumps:
+- **Manager singleton non-null (0x60053DB10), vtable 0x801D6A0F8**; submit methods vtable+0x10=0x800DE0490, +0x28=0x800DE0510 (both real, deep container ops calling 0x800DD80F0/0x800DD8270/0x800DC2370 — not a direct sema wake).
+- Op live fields: [op+0x3a8]=0x1D, [op+0xe8]=3, [op+0xb0]="level" SSO string, [op+0x3b8]=2.
+- **Submit gate/loop (0x800B02819)** reached after iterating all [op+0x3a8]=0x1D dep entries (loop 0x800B02770/0x800B027A4). GATEs: G1 `*(0x801FEE918)!=0` PASS (non-null); G2 state!=6 PASS; G3 [op+0xe8]!=0 PASS (=3); G4 search list for type *(0x801FA7E60)=0x801F43D38; G5 entry non-null. If reached, it WOULD submit.
+- **State dispatch** at 0x800B02D24: `switch([op+0x3b8])` via jump table 0x801C85868 (6 arms). State-2 arm at 0x800B02E1D. Progress-log helper 0x800B02EB0 resolves symbol ptrs into 0x801FA7D90.. and logs.
+- **CRITICAL:** grep for any write to [op+0x3b8] across all of Perform + callees in the dumps = ZERO. Perform never writes the op state. So the op advances 2→3 via an EXTERNAL agent (a completion callback / worker), not Perform. "Stuck at state 2" ⟹ that external driver never fires. This is consistent with (and re-grounds on corrected data) the earlier "starved worker / never-dispatched job" family — NOT the null-singleton story.
+
+**Open question being resolved now:** does Perform even REACH the submit calls (0x800B028CE/E4)? Tracing imports on Loading.PreloadManager and checking for return addresses inside the submit block / manager methods 0x800DE04xx. If reached → submit runs but read fails downstream; if not → an upstream control-flow gate in Perform bypasses the dep-loop.
+
+### 2026-07-22 — Verification: 636/636 tests green after Stage-0 HW-watchpoint revert + new diagnostics (PROBE_ADDR, SCAN_RIPREL). Import trace inconclusive on submit-reach.
+- `dotnet test SharpEmu.slnx -c Release`: 27 + 33 + 576 = 636 passed, 0 failed.
+- Loading.PreloadManager import trace: ~1023 imports (all NID tsvEmnenz48) then the thread parks; NO ret addresses in the submit block (0x800B028xx) or manager methods (0x800DE04xx–07xx). Suggests Perform doesn't reach the submit — but the manager calls are guest-function calls (not imports), so not conclusive.
+- Net state: the async-streaming manager is fine; the wedge is that the op's state ([op+0x3b8]) is never advanced 2→3 by its external driver. NEXT candidate probe: scan image code for the STORE to [reg+0x3b8] (disp32=0x3b8 byte pattern) to find who advances op state and why it never fires under SharpEmu.
+
+### 2026-07-22 — State-writer hunt (user-chosen direction) COMPLETE: op-advance is a poller (0x800B119D0) blocked on a dependency-completion flag; converges back to "the dependency/.resS read is never issued". New tool: SHARPEMU_STALL_SCAN_FIELDSTORE.
+
+New diagnostic `SHARPEMU_STALL_SCAN_FIELDSTORE="0xDISP"`: scans executable image regions for instructions with a `[reg+DISP]` mod=10 disp32 memory operand, classifying STORE vs load/cmp (offline-decode hits with capstone). Env-gated; build+636 tests green.
+
+Findings (metal_slug):
+- Perform's state jump table @0x801C85868: state0→0x800B02D6B, state1→0x800B02D44, **state2→0x800B02D98**, state3/4→0x800B02DE8 (no-op), state5→0x800B02D44. The state-2 arm (0x800B02D98) calls 0x800ADEAD0/0x800D4E2D0/progress-log — it does NOT write op state.
+- SCAN_FIELDSTORE 0x3b8 → 55 STORE hits. The op-state writer is **0x800B119D0** (an Update/Advance method), storing at `0x800B11E8A: mov [op+0x3b8], eax`. It polls sub-object completion flags (`cmp byte [r1x+0x20],1` = "done?") and virtual status calls (`call [rax+0x80]`/`[rax+0xb0]`), computes the new state in eax, and writes it. It DID advance the op 0→1→2 (so it runs), and is stuck recomputing 2 because a dependency's completion flag never flips.
+- So the op-advance driver is NOT missing — it runs and polls. The op is stuck because a dependency read never COMPLETES ← (prior census) never SUBMITTED to the reader.
+
+**Control-flow re-analysis of Perform:** the state jump-table dispatch (0x800B02D24) is AFTER the submit block (0x800B028CE/E4). So the dep-loop+submit runs on the linear path from entry BEFORE the state switch — i.e. on EVERY Perform call, unless an early-exit or a submit GATE skips it. GATE1 passes (manager non-null). Prime remaining suspect: **GATE4 (0x800B02853-81), the search for type *(0x801FA7E60)=0x801F43D38 in the op's per-op container [rbp-0x1f0]** — if the .resS dependency's type isn't in that container, it `jmp 0x800B02AD9` (skip), and the manager submit calls never fire. Alt: the manager submit methods 0x800DE0490/0x800DE0510 don't actually wake Loading.AsyncRead (they call 0x800DD5B20/0x800DD5E30/0x800DD80F0/0x800DD8270/0x800DC2370 — container ops, undecoded).
+
+**Two remaining candidates for the exact emulator divergence (both need one more step):**
+1. GATE4 type-search fails → dep container built wrong earlier in Perform (dep-resolution 0x800B01C0D+). Would need to read the live container, or observe.
+2. Manager submit runs but its read path doesn't reach the AsyncRead enqueue/wake (or uses a non-AsyncRead subsystem SharpEmu mishandles). Would need to decode 0x800DE0490→callees to the actual file-read/import.
+
+Recommended next: decode 0x800DE0490/0x800DE0510 callee chain to find the concrete read-issue mechanism (import/thread-enqueue) = the emulator-visible API to check; if it cleanly reaches AsyncRead, then GATE4 is the skip and the fix is upstream in dep-resolution. (Breaking the continuation-safe observation wall remains the alternative to end the guesswork.)
+
+### 2026-07-22 — DECISIVE: all 5 Perform submit-gates PASS (GATE4 finds the type). Bug narrowed to (a) Perform never reaches the submit, or (b) the manager read-path never reaches the reader/completion. The null-singleton theory is fully dead.
+
+Live container check (op stable @0x6081F6480, [op+0xd8]=0x6001C0BB0 container, [op+0xe8]=3):
+- container entry TYPEs (at cont+0x10 + i*0x18): entry0=0x801F39670, **entry1=0x801F43D38 (== GATE4 target *(0x801FA7E60)) → FOUND at rsi=1**, entry2=... GATE5 picks r14=[cont+0x18]=0x6032B2E10 (non-null) → PASS.
+- So GATE1 (manager 0x60053DB10 non-null) ✔, GATE2 (state 2≠6) ✔, GATE3 ([op+0xe8]=3≠0) ✔, GATE4 (type found) ✔, GATE5 (entry non-null) ✔. The submit block (0x800B028CE call manager.vtbl+0x10 / 0x800B028E4 call manager.vtbl+0x28, on entry 0x6032B2E10) is NOT gated out.
+
+**Since all gates pass, "read never submitted" now has only two possible causes:**
+(a) Perform never reaches the dep-loop+submit (an early-exit on the entry→0x800B026C0 path — but that path builds the dep arrays and is core to Perform, so unlikely), OR
+(b) The submit DOES run and calls the manager submit methods, but those (0x800DE0490 = register request; 0x800DE0510 = heavy path, sub rsp 0xaa0, calls 0x800DD80F0/0x800DD8270 with rdi=[entry+0x40],rsi=[entry+0x50]) issue/complete the read via a subsystem/mechanism SharpEmu mishandles — so the completion flag the op-advance poller (0x800B119D0) waits on never flips. NOTE: the manager at 0x801FEE918 may NOT be Loading.AsyncRead's manager — the prior "AsyncRead sem never woken" census may have watched the wrong subsystem.
+
+**Recommended next (the real crux):** decode the manager submit method 0x800DE0510's callee chain (0x800DD8270 etc.) to the concrete read-issue (HLE import / thread enqueue / completion signal) = the emulator-visible API/behavior to fix. Alternative: break the continuation-safe observation wall to watch Perform reach (or skip) 0x800B028CE directly.
+
+Session tooling delivered (all env-gated, kept): SHARPEMU_STALL_PROBE_ADDR, SHARPEMU_STALL_SCAN_RIPREL, SHARPEMU_STALL_SCAN_FIELDSTORE. HW-watchpoint reverted. 636 tests green. Nothing committed.
+
+### 2026-07-22 — Manager read-path decoded (user-chosen step): the heavy submit method 0x800DE0510 is a deep descriptor-builder tree with NO top-level imports; and it NEVER EXECUTES. Convergence: Perform's (gate-clear) submit block never runs → a Perform re-drive / scheduling gap, not a read-path bug.
+
+- 0x800DE0510 (manager vtbl+0x28) fan-out: calls 0x800DD80F0/0x800DD8270 (build the read-request descriptor via vector/string helpers 0x800828B10/0x80092CE90/0x800DDC0F0), then twin per-item blocks (0x800CA34E0/0x800CA3860/0x800DC40B0), a far call 0x8015D3910, etc. All targets are guest functions — NO import-trampoline calls in the top 2 levels. The actual file read is issued deep in this tree or by a woken reader thread.
+- PreloadManager import trace: ZERO return addresses anywhere in the submit tree (0x800DD*/0x800DE*/0x800CA3*). Its rets cluster in 0x80080*/0x800DB*/0x80000* (a ~1000x loop on import NID `tsvEmnenz48`, rdx=const 0x801F20000). So the submit method's tree did not run on PreloadManager.
+- Cross-checked with the standing census (0 APR cmd buffers, 0 AIO submits, 0 16MB reads by ANY thread) ⟹ **the submit block (0x800B028CE/E4) never executed at all**, despite GATE1-5 all passing.
+
+**Conclusion:** the read isn't issued because **Perform's submit block is never reached/executed** — NOT because of a gate, a null singleton (typo), or a broken read API. Since the op reached state 2 via the poller (0x800B119D0), and Perform runs the submit unconditionally on the entry→dep-loop path, the likely cause is **Perform is never re-invoked at state 2** — a PreloadManager re-drive/scheduling gap (the 458 semaphore handshake; same host-park signal-loss class as commit eaa4a9f), OR Perform takes an early exit before the dep-loop. Distinguishing "not called" vs "early exit" now genuinely requires observing Perform's execution (the continuation-safe breakpoint wall) OR auditing the PreloadManager 458 re-post handshake (who posts 458 when an op advances, and whether SharpEmu drops that post to a host-parked PreloadManager).
+
+### 2026-07-22 — PreloadManager 458 re-drive audit COMPLETE: NOT a lost-wakeup (unlike eaa4a9f). Genuine producer-consumer wedge; re-drive predicate is always-true. main-integrate gate = 0x800B00BB0(&op[0x98]).
+
+Decoded the PreloadManager loop 0x800B05260 + the Perform re-drive site:
+- When input queue count [rbx+0x1e0]==0 (live), the loop reaches 0x800B05563 which RE-PERFORMS the current op r13: `mov rdi,r13; mov rax,[r13]; call [rax+0x78]` (predicate); `test al,al; je skip`; then `call [rax+0x50]` (Perform 0x800B01640).
+- **The predicate op.vtable+0x78 = 0x800015710 = `mov al,1; ret` → ALWAYS TRUE.** So Perform is NOT gated by a false predicate. (vtable+0x70/+0x80/+0xC8/+0xF0 share this always-true stub; +0x50=Perform 0x800B01640, +0x58=main-integrate 0x800B02C80.)
+- Perform re-runs iff r13 (PM's current op) != 0. The op is in the OUTPUT queue [rbx+0x200]=1 → PM has NO current op (r13=0) → it parks. No 458 post is lost; the handshake is intact.
+- main-integrate 0x800B02C80: `rdi=&op[0x98]; call 0x800B00BB0; test al,al; je return-0(not-ready)`. Returns "not ready" gated on 0x800B00BB0(&op[0x98]) — correctly, since the data isn't loaded. Also toggles [op+0x3bd]/[op+0x48].
+- Confirmed main spins: `Import#... ORBIS_GEN2_ERROR_TIMED_OUT (Hc4CaR6JBL0) rdi=0x608ABA518` (the "518" sema) — WaitTimeout(518) timing out forever, ret=0x8018A6415.
+
+**Audit verdict:** the wedge is NOT a dropped semaphore/signal. It's structural: the op is parked in the main-integration output queue at state 2 with its data unloaded; main-integrate polls not-ready; PM won't re-Perform (op is no longer its current item). The dependency/.resS read that would load the data was never issued because the Perform pass that runs the (gate-clear) submit block at the right op-state never executed. Determining WHICH Perform pass ran at which state — and thus why the submit was skipped — now genuinely needs execution observation.
+
+**Two concrete next options:** (1) decode main-integrate's readiness gate 0x800B00BB0(&op[0x98]) [MAIN thread, no continuation wall] to find the EXACT completion flag the op polls, then hunt who sets it and why SharpEmu doesn't = the emulator-visible divergence; (2) break the continuation-safe observation wall to watch Perform's passes directly. Tools this session (kept): SHARPEMU_STALL_PROBE_ADDR / _SCAN_RIPREL / _SCAN_FIELDSTORE. 636 tests green; nothing committed.
+
+### 2026-07-22 — Resolved the 5 unresolved-NID imports found across the game .log files (cninja/cquest3/subnautica).
+
+Swept every `*.log` for `[LOADER][WARN] Import#… unresolved: nid=…` (the sole missing-HLE-handler format; the `ORBIS_GEN2_ERROR_*` result lines and Unity `sceKernelDlsym failed` symbols are NOT unresolved HLE imports). Five distinct NIDs, all reverse-hashed via `Ps5Nid` and verified verbatim in `scripts/ps5_names.txt`:
+- `VkqLPArfFdc` = `sceImeKeyboardGetInfo` (libSceIme) — **already implemented** (uncommitted `Ime/ImeExports.cs`).
+- `4fU5yvOkVG4` = `sceSysmoduleGetModuleInfoForUnwind` (libSceSysmodule) — the most common (cquest3/cninja/subnautica).
+- `MsaFhR+lPE4` = `sceNpWebApi2PushEventCreateFilter` / `fIATVMo4Y1w` = `sceNpWebApi2PushEventDeleteHandle` (libSceNpWebApi2).
+- `s6W4Zl4Slgk` = `sceNpUniversalDataSystemCreateEventPropertyObject` (libSceNpUniversalDataSystem).
+(pwash/dCells/cult logs had none.) These are the same 5 noted in `fixes-caveman-ninja-blackscreen.md:202-203`.
+
+**Added (universal, real-semantics, no game-specific hacks):**
+- `sceSysmoduleGetModuleInfoForUnwind` in `KernelRuntimeCompatExports.cs` — extracted a shared `GetModuleInfoForUnwindCore` from the existing libKernel twin `sceKernelGetModuleInfoForUnwind` (same 0x130 unwind struct + `TryWriteModuleInfoForUnwind`/`KernelModuleRegistry.TryGetModuleByAddress`); both exports now delegate to it.
+- `sceNpWebApi2PushEventCreateFilter` + `sceNpWebApi2PushEventDeleteHandle` in `NpWebApi2Exports.cs` — added real push-event handle tracking (`_pushEventHandles`/`_pushEventFilters` sets, mirroring the library-context handle trio); CreateHandle now tracks, CreateFilter validates the handle + returns a tracked filter id, DeleteHandle validates + frees once.
+- `sceNpUniversalDataSystemCreateEventPropertyObject` in `NpUniversalDataSystemExports.cs` — mirrors CreateContext/CreateEvent: writes a tracked non-zero marker into the caller's property-object buffer so the sibling `Set*` readability probes succeed; MEMORY_FAULT on bad pointer.
+
+**Tests:** +16 (Kernel `SysmoduleGetModuleInfoForUnwindTests` ×4 validation paths; `Np/NpWebApi2ExportsTests` ×4; `Np/NpUniversalDataSystemExportsTests` ×3; `SysAbiRegistryTests.RegistryResolvesNewlyAddedExports` ×5 NID→name/library identity). Full suite: **652 green** (Libs 576→592), 0 failed. Analyzer accepted all NIDs (hash-matched, no SHEM004/duplicates). Nothing committed.
+
+### 2026-07-22 — Two more log warnings triaged (subnautica/metal_slug); added `_is_signal_return`.
+
+- **`crb5j7mkk1c` = `_is_signal_return`** (was unresolved) — the guest C-runtime unwinder's per-frame "is this pc a kernel signal-return trampoline?" probe, called from the same unwinding path as the just-added `sceSysmoduleGetModuleInfoForUnwind` (`ret=0x807CBF…`). SharpEmu handles faults host-side (`DirectExecutionBackend.PosixSignals`) and never injects a guest-visible sigtramp frame (async guest-exception delivery uses a normal import-frame continuation, commit eaa4a9f), so **no guest pc is ever a signal return → return 0** (ordinary frame) universally. Added to `KernelRuntimeCompatExports.cs` next to the unwind exports (`LibraryName="libkernel"`; NID dispatch ignores the label). +4 tests (`Kernel/IsSignalReturnTests` ×3 + a `SysAbiRegistryTests` identity case). Full suite green (Libs 592→604), 0 failed.
+- **`hwVSPCmp5tM` = `sceKernelCheckedReleaseDirectMemory`** returning `ORBIS_GEN2_ERROR_NOT_FOUND` (subnautica.log:2252+, polled every ~10k imports with identical `start=0, len=0x100000`) — **NOT a bug, left as-is** (user decision). `TryReleaseDirectMemoryRangeLocked` (`KernelMemoryCompatExports.cs:6612`) correctly returns NOT_FOUND because nothing is tracked at direct-memory offset 0; real HW returns the same for releasing an untracked range, and the game ignores the error (benign release-if-present housekeeping loop). Forcing OK would be a hack. (Orthogonal future correctness note: the release only matches a single fully-containing allocation, stricter than HW's spanning/partial release — would not silence this warning regardless.)
+
+### 2026-07-22 — Subnautica import-warning triage: two real gaps fixed, four confirmed benign.
+
+Triaged 6 NIDs from `subnautica.log` (all surfaced as `[LOADER][WARN]`, which fires on ANY non-OK import return — `DirectExecutionBackend.Imports.cs:705-713` — so most are the loader echoing *correct* error returns from memory/fs probes, not faults). The game runs to the VideoOut flip loop (70+ frames) then stops on a manual `host-interrupt`; the actual visible failure is the blackscreen (`vk.flip_capture_failed` / `Forcing submitDone to avoid TRC R4089 breach`), a GPU/present issue unrelated to these imports.
+
+- `23LRUSvYu1M` = `sceAgcInit` → INVALID_ARGUMENT: **real gap.** Called with register-defaults version **9**; the allow-list was `{7,8,10,13}`. The defaults blob (`TryBuildRegisterDefaults`) is driven by a fixed `groups` table and is version-independent — `version` is purely a validation gate — so v9 reuses the proven blob. **Fixed:** added `RegisterDefaultsVersion9 = 9` + allow-list entry in `Agc/AgcExports.cs`. Same gate governs `sceAgcGetRegisterDefaults2` (null-pointer on unsupported), so this may unblock downstream GPU setup. +8 tests (`Agc/AgcInitVersionTests`).
+- `4fU5yvOkVG4` = `sceSysmoduleGetModuleInfoForUnwind` → unresolved (hot loop): **already fixed in the working tree** (uncommitted `KernelRuntimeCompatExports.cs` block, prior session). The log predates that build → stale WARNs. Needs rebuild + rerun to confirm they clear.
+- `1-LFLmRFxxM` = `sceKernelMkdir` → NOT_FOUND: **real but secondary.** Parent dir of the requested path isn't provisioned. Real PS5 mkdir is non-recursive so ENOENT is technically correct; the gap is an unprovisioned writable guest mount point. **Added** a `LogOpenTrace("mkdir parent-missing …")` on that branch (`KernelMemoryCompatExports.cs`, gated by `SHARPEMU_LOG_OPEN=1`) to capture the path on rerun before provisioning the mount at startup (universal, not per-game).
+- `rVjRvHJ0X6c` = `sceKernelVirtualQuery` NOT_FOUND (FIND_NEXT off the end of `_mappedRegions`; loader image segments aren't tracked there — latent), `BHouLQzh0X0` = `sceKernelDirectMemoryQuery` DELETED (FIND_NEXT @offset 0, no direct memory yet), `E6ao34wPw+U` = `stat` -1 (normal ENOENT): **benign, correct returns, left untouched.**
+
+**Verification:** Libs build clean; `AgcInitVersionTests` 8/8 green. Next: rebuild + re-run Subnautica to confirm `23LRUSvYu1M`/`4fU5yvOkVG4` WARNs are gone and capture the mkdir path (`SHARPEMU_LOG_OPEN=1`). Nothing committed.
+
+### 2026-07-22 — Subnautica unwinder-triplet decoded: a C++ stack-unwind fallback chain, already fully handled in-tree.
+
+A newer `subnautica.log` shows a recurring 3-call pattern from one guest PRX routine (rets 0x807CBF426/630/7B1), all probing the SAME constant host-space address `0x7F7C2EF2A0C4`:
+1. `RpQJJVKTiFM` = `sceKernelGetModuleInfoForUnwind` (libKernel) → NOT_FOUND
+2. `crb5j7mkk1c` = **`_is_signal_return`** → unresolved *(in this stale log)*
+3. `4fU5yvOkVG4` = `sceSysmoduleGetModuleInfoForUnwind` → NOT_FOUND
+
+Reverse-hashed `crb5j7mkk1c` by brute-forcing `scripts/ps5_names.txt` through `Ps5Nid` (SHA1(name+suffix), first 8 bytes reversed, base64 +/- alphabet) → **`_is_signal_return`**. This is the libc/libunwind per-frame probe the C++ unwinder uses to detect a kernel signal-return trampoline frame. The triplet is the unwinder's fallback chain: get eh_frame via libKernel, check for a signal frame, get eh_frame via libSceSysmodule — for a return address (`0x7F7C2EF2A0C4`) that lives in host/HLE space, not any guest module.
+
+**Status — nothing new to fix; the current tree already handles the whole triplet:**
+- `_is_signal_return` (`crb5j7mkk1c`) is already implemented (uncommitted) at `KernelRuntimeCompatExports.cs:1016-1025` → returns 0 (SharpEmu never injects a guest-visible signal-trampoline frame; async guest-exception delivery uses an import-frame continuation, not a signal frame). The log's "unresolved" line is **stale** — captured before this addition. Confirmed by the same log already showing `4fU5yvOkVG4` resolving to NOT_FOUND (the sysmodule fix is present) while `crb5j7mkk1c` still shows unresolved.
+- Both module-info-for-unwind lookups correctly return NOT_FOUND: `0x7F7C2EF2A0C4` is a host address with no guest eh_frame — expected, not a bug.
+- `hwVSPCmp5tM` = `sceKernelCheckedReleaseDirectMemory` → NOT_FOUND (release of an unmapped [0,1MB) direct range) and `E6ao34wPw+U` = `stat` → -1 are benign/correct.
+- `vk.flip_wait_order` / `Forcing submitDone to avoid TRC R4089 breach` are the blackscreen (GPU present), unrelated.
+
+`RegistryResolvesNewlyAddedExports` (SysAbiRegistryTests) already asserts both `4fU5yvOkVG4` and `crb5j7mkk1c` resolve to their catalog identities — 11/11 green. **Action for the user: rebuild + rerun; all three unwind calls will then be resolved/benign.** Minor cosmetic nit (not changed): `_is_signal_return` is the lone export tagged `LibraryName = "libkernel"` (lowercase) vs 318 neighbors using `"libKernel"`; dispatch is by NID so it resolves regardless, and its test asserts the lowercase form.
+
+### 2026-07-22 — cquest3 (Cat Quest 3) warning triage: sceAgcInit v12 gap fixed; 3 one-shot warnings confirmed benign.
+
+Four `[LOADER][WARN]` lines from cquest3.log, all *implemented* imports returning errors, each appearing **once** (startup one-shots). cquest3 barely renders (2 flips).
+- **`23LRUSvYu1M` = `sceAgcInit` → INVALID_ARGUMENT (version 12): FIXED.** The allow-list `IsSupportedRegisterDefaultsVersion` (`Agc/AgcExports.cs`) was `{7,8,9,10,13}` — an 11–12 gap. cquest3 inits AGC with version **12 (0xC)** → boot GPU-context init rejected. The register-defaults blob is version-independent (identical `PrimaryRegisterDefaults`/`InternalRegisterDefaults` for all accepted versions; version is a pure ack gate — same rationale as the earlier v9 add). **Added `RegisterDefaultsVersion11 = 11` + `RegisterDefaultsVersion12 = 12`** constants + allow-list entries, making the acknowledged set contiguous 7–13. +2 tests (`Agc/AgcInitVersionTests` 11u/12u). Full suite green (Libs 604→606), 0 failed.
+- **`xk0AcarP3V4` = `scePadOpen` → 0x80920007 DeviceNotConnected: no change (benign/correct).** userId `0x10000000` correctly matches `PrimaryUserId`; the rejection is **type=2 (SPECIAL) port** — non-ext `scePadOpen` accepts only STANDARD(0), which is HW-documented behavior. Single-shot, no retry in-window. Loosening (to match `scePadOpenExt`/`scePadGetHandle` which take 0/1/2) risks a game relying on the failure to fall back — deferred pending input-path testing (user chose AGC-only).
+- **`1-LFLmRFxxM` = `sceKernelMkdir` → NOT_FOUND / `wuCroIGjt2g` = `open` → -1: no change (benign).** Single-shot startup fs probes (mode 0777 / O_RDONLY 0666); parent-absent / optional-file probes the game handles. Confirming would need guest path-string tracing (not in the log); no hot loop or broken feature observed.
+
+### 2026-07-22 — Completion-wake fix: I/O completion paths now post the sceKernelSyncOnAddress wake (producer half of the futex protocol was missing).
+
+Triaged the latest metal_slug/subnautica log slice (user asked "can we fix them?"). All three lines are facets of the documented PreloadManager wedge, NOT new bugs: `Hc4CaR6JBL0`=`sceKernelSyncOnAddressWait` TIMED_OUT on the "518" sema (the main-thread spin); `[DEBUG][PRINF] "...not suitable for apr reads flags:0x0"` = the confirmed path-string red herring (fires for every file); `hwVSPCmp5tM`=`sceKernelCheckedReleaseDirectMemory` NOT_FOUND (benign, releasing an unmapped range).
+
+A read-completion-path audit found a real, universal HLE correctness gap (separate from — and latent for — the .resS hang, since the census shows that read is never submitted): completion paths write the value a `sceKernelSyncOnAddressWait` waiter polls but never post the matching wake, so a parked futex waiter is never released.
+
+**Fix (producer half of the futex protocol; not a blind unblock — spurious wakes self-recheck the pattern and re-park):**
+- Extracted `KernelSyncOnAddressCompatExports.SignalAddressWaiters(ulong address, int maxCount=int.MaxValue)` from `SyncOnAddressWake` (the existing `WakeBlockedThreads(GetWakeKey(address))` + `_wakeGenerations` bump + `Monitor.PulseAll` body); `SyncOnAddressWake` now delegates to it. Zero-address = no-op.
+- `Ampr/AmprExports.cs` `CompleteWriteAddressRecord`: after writing `*address=value`, call `SignalAddressWaiters(address)` — the explicit "write V to A on completion" primitive is exactly a futex-address write.
+- `Kernel/KernelFileExtendedExports.cs` AIO submit completion: after writing the result struct to `resultPtr`, call `SignalAddressWaiters(resultPtr)` (lower-confidence: AIO is synchronous and the exact futex sub-address is unconfirmed; waking the struct base is harmless if unused).
+- Tests: new `Kernel/SyncOnAddressWakeOnCompletionTests` (host-thread waiter released by a completion-path `SignalAddressWaiters`; zero-address no-op; no-waiters returns 0), in the existing `KernelSyncOnAddressCompatState` (non-parallel) collection. Existing `SyncOnAddressWake` tests still green through the refactor.
+
+Also folded in the user's AgcInitVersionTests edit: AGC register-defaults allow-list now accepts versions 9, 11, 12 (Subnautica=9, Cat Quest 3=12; the blob is version-independent).
+
+**Verification:** Libs build clean; full `SharpEmu.Libs.Tests` = **609 passed, 0 failed**. **Honest caveat (stated to user, they approved anyway):** per the census the .resS read is never submitted, so this will very likely NOT un-wedge metal_slug/subnautica — it fixes the `SyncOnAddressWait`-times-out correctness class, not the never-issued-submit root cause (still open behind the Perform observation wall). Nothing committed.
+
+### 2026-07-22 — PowerWash Simulator (pwash.log) triage: two red herrings dismissed; real failure = main thread hung on unposted semaphore 0x89.
+
+User suspected the loader's `ELF alignment mismatch` warnings caused pwash's load failure. Investigation (2 Explore agents + source read) shows they, AND the `Guest exception delivery failed … type=0x1E` flood, are both red herrings.
+- **ELF alignment warnings = cosmetic.** `SelfLoader.MapLoadSegments` (`SelfLoader.cs:455-513`) byte-copies each segment to the exact `VirtualAddress + imageBase`; the `vaddrMod != offsetMod` check (`:484-492`) is logged-only and used for nothing. Standard-ELF `vaddr ≡ offset (mod align)` congruence only matters for file-backed `mmap()` — a copy loader is immune. All 13 modules registered OK; every PS5 module trips it (they violate congruence by design). The pasted excerpt was **libfmod.prx** (handle 7), loaded fine.
+- **`type=0x1E` exception flood = shutdown teardown.** 0x1E (30) = SIGUSR1 = IL2CPP GC stop-the-world suspend signal (`KernelExceptionCompatExports.Posix.cs:12-15`; handler parks on GC ResumeSemaphore). The 24-line flood is at pwash.log:6553-6577, immediately after `Host shutdown requested: host-interrupt` (:6550) — the user's own interrupt. `RequestHostShutdown` (`DirectExecutionBackend.cs:1216`) sets global `_forcedGuestExit` → all 24 live threads' parked SIGUSR1 handlers torn down with ForcedExit (`:3745-3749`). Only pwash shows it (interrupted with many GC/PSN threads alive); NOT Unity-specific.
+- **REAL failure = post-first-frame hang.** pwash presents splash + first frame + exactly ONE guest frame (pwash.log:2131), then never presents again for ~4400 lines. The **main thread** (`managed=4`) is blocked in **eboot.bin** code (`ret=0x800D189F9`) on `sceKernelWaitSema` (Zxa0VhQVTsk) on **semaphore handle 0x89**, never signaled → 4192 `TIMED_OUT`. Correlated with dynamic `LoadStartModule 'PSNCore.prx'`/`PSNCommon.prx` + Unity Burst (`lib_burst_generated.prx`); handle 0xC (Unity-plugin dlsym probes) = PSNCore.prx (benign).
+
+**NEXT (needs a traced rerun — user has the eboot):** rerun pwash with `SHARPEMU_LOG_SEMA=1` (`KernelSemaphoreCompatExports.cs:700`) to capture sema 0x89's `sceKernelCreateSema` (name/count → subsystem) and any `sceKernelSignalSema(0x89)` attempts. If no signaler ever runs → missing HLE producer (likely PSN/NpToolkit init or a worker the game expects an HLE lib to complete); if it under-posts → count bug in `KernelSignalSema`/`KernelWaitSema`. No fix yet — force-returning the wait is the forbidden blind-unblock. Nothing changed in code this session (analysis only).
+
+### 2026-07-22 — pwash.log WARN triage: 5 benign, 1 real resolver bug fixed (`/temp0` mount root now provisioned).
+
+User asked what was causing a batch of `[LOADER][WARN] Import#… result:` lines. The loader WARN-logs **every** non-zero import return, so most are semantically-normal PS5 results, not bugs. Resolved all six NIDs to source:
+- **Benign (no change):** `upoVrzMHFeE`=`scePthreadMutexTrylock`→BUSY (that's trylock's whole contract); `Zxa0VhQVTsk`=`sceKernelWaitSema`→TIMED_OUT (Unity job-worker idle parks with a finite timeout — same class as the sema-0x89 note above but these are the worker semas, expected); `BHouLQzh0X0`=`sceKernelDirectMemoryQuery`→DELETED and `rVjRvHJ0X6c`=`sceKernelVirtualQuery`→NOT_FOUND (memory-map *walk* probes hitting their normal loop-end / unmapped-probe cases); `xk0AcarP3V4`=`scePadOpen`→DeviceNotConnected (early probe with a non-primary userId; controller attaches fine later).
+- **REAL bug fixed — `1-LFLmRFxxM`=`sceKernelMkdir`→NOT_FOUND (parent-missing):** resolver asymmetry, not the game's fault. `sceKernelMkdir` (`KernelMemoryCompatExports.cs:2193`) is correctly non-recursive → NOT_FOUND when the parent host dir is absent. Three of the four writable scratch-mount resolvers create their host root on first resolution (`ResolveDownload0Root:5543`, `ResolveHostappRoot:5563`, `ResolveDevlogAppRoot:5493`), but **`ResolveTemp0Root` (`:5497`) did not** — so `mkdir /temp0/<subdir>` failed while the same call under `/download0` succeeded. Unity/IL2CPP titles scratch into `/temp0`. **Fix:** restructured `ResolveTemp0Root` so both the `SHARPEMU_TEMP0_DIR`-configured and default branches assign a local `root`, then `Directory.CreateDirectory(root)` once before returning — identical shape to the siblings; the configured branch now provisions too (matches them). No try/catch added (siblings call `CreateDirectory` unguarded; exposure identical). **+`Kernel/KernelTemp0ProvisioningTests`** (2 facts: `/temp0` resolution creates the root; `/temp0/<subdir>` resolves with an existing parent) — there was **no** prior `mkdir`/temp0 coverage. Env var saved/restored, temp dir cleaned up.
+
+**Verification:** new tests green (2/2); kernel/savedata/path subset 150/150 pass, 0 regressions. Pre-existing unrelated `CA2014` warning in `Ngs2Exports.cs`. **Caveat (told to user):** correct on its own merits, but whether it's *the* cause of pwash's logged mkdir line is still path-dependent — needs `SHARPEMU_LOG_OPEN=1` rerun + `grep "mkdir parent-missing"`. If the traced path is a *different* root (unmounted `/savedata0`, `/data/…`), that's a separate mount-layer provisioning gap. Nothing committed.
+
+### 2026-07-22 — cquest3 shutdown hang FIXED: FMOD audio thread spun forever on `sceKernelSignalSema`; added a shutdown safe-point + kept audio pacing during teardown.
+
+Cat Quest 3 (FMOD statically linked into eboot) floods `sceKernelSignalSema(0x3A)→INVALID_ARGUMENT` from its "FMOD AudioOut thread" and never terminates after `Host shutdown requested: host-interrupt`. `4czppHBiriw`=`sceKernelSignalSema`; the failing branch is the (correct) over-max guard at `KernelSemaphoreCompatExports.cs:342` — so the semaphore is saturated because its **consumer stopped draining**. Two stacked defects (2 Explore + 1 Plan agent traced both):
+- **Layer 1 — trigger (audio backpressure lost).** `sceAudioOutOutput` normally blocks ~one buffer period/call (ALSA `snd_pcm_writei`, or `PaceSilence()`), which drains FMOD's ring and keeps sema `0x3A` from filling. `RequestHostShutdown` (`VideoOutExports.cs:167`)→`AudioOutExports.ShutdownAllPorts()` (`:353`) **removed** every port, so `sceAudioOutOutput` took the `_shutdown ? 0` removed-port fast-path (`:209`) returning success **with no pacing**. Backpressure gone → ring never drains → `0x3A` saturates → SignalSema loops on INVALID_ARGUMENT.
+- **Layer 2 — the actual hang.** `_forcedGuestExit` is checked only at guest-code **entry** boundaries, never at the import-return safe-point. A thread spinning on a *non-blocking* import (SignalSema) never surfaces shutdown → loops forever. The rescue primitive `TryForceGuestExitToHostStub` (`DirectExecutionBackend.Imports.cs:1824`) was wired only to the import-loop **heuristic** (`:437`), gated `!isGuestWorker` — and the FMOD thread **is** a guest thread (`isGuestWorker = GuestThreadExecution.IsGuestThread`, `:324`), so it could never fire. Embedded/GUI mode has no `Environment.Exit` fallback (`VideoOutExports.cs:184-191`) → `WaitForGuestThreadQuiescence` times out at 5s, session leaked → true hang. (CLI: `Environment.Exit(0)` fires ~2s later, so there it's a 2s 100%-CPU flood then hard kill.)
+
+**Fix (both layers, user chose recommended scope):**
+- **Layer 2 (universal):** new shutdown redirect at import **entry**, just before the loop-guard (`Imports.cs:431`), gated on raw `_forcedGuestExit` and NOT `!isGuestWorker`, reusing `TryForceGuestExitToHostStub` with the proven `Rax=1uL; return 1uL;` convention (verified via the trampoline `ret` → slice exits `Returned` → `RunGuestThread:4972` sets `Exited` → quiescence succeeds). Entry (not post-return) chosen so it can't clobber the voluntary redirect paths (`:723/:753/:765`) or pre-empt pending-exception delivery (`:661`). Parameterized `TryForceGuestExitToHostStub` with `bool shutdown=false` so the shutdown caller logs `Forced guest exit on host shutdown` and skips the loop-guard `LastError`/`DumpRecentImportTrace`; loop-guard caller unchanged. Fires only during teardown (`_forcedGuestExit` set only in `RequestHostShutdown:1216` + `Dispose:6808`); fails safe if the return slot is already gone.
+- **Layer 1 (pacing + latent-correctness):** `ShutdownAllPorts` now disposes each port's backend but **keeps the port** (new `PortState.EnterShutdownPacing()` nulls `Backend`, made `{ get; private set; }`), so `sceAudioOutOutput` flows through the existing `Backend is null → PaceSilence()` branch (`:239`) with real per-port BufferLength/Frequency — no magic constants. With L2 the thread usually exits first, but this removes the teardown-window flood and is correct on its own.
+- **Tests:** `Cpu/ForcedGuestExitOnShutdownTests` (reflection harness à la `ImportTrampolineAbiTests`, driving the `[ThreadStatic]` active-exec state: shutdown redirect patches arg-pack+96 & guest return slot & sets the flag; fail-safe returns false with no active slot) and `Audio/AudioOutShutdownPacingTests` (`ShutdownAllPorts` retains the port with `Backend==null`; non-parallel collection, static `Ports`/`_shutdown` cleared around the test).
+
+**Verification:** full solution green — Libs **622** passed, SourceGenerators 33, ShaderCompiler.Metal 27, 0 failed; clean build (only pre-existing `CA2014` in `Ngs2Exports.cs`). **Runtime-CONFIRMED by user (2026-07-22):** cquest3 now shuts down cleanly — the SignalSema flood is gone and the process exits promptly instead of hanging. **Out of scope (noted):** threads *parked* in `sceKernelWaitSema`/`SyncOnAddress` at shutdown still poll only pending exceptions, not `_forcedGuestExit` (distinct facet, follow-up if it surfaces); the `vk.flip_capture_failed` blackscreen is a separate GPU issue. Nothing committed.
+
+### 2026-07-22 — cquest3 blackscreen triaged (fresh 60s run, `SharpEmu` linux-x64 apphost): `vk.flip_capture_failed` is a RED HERRING; real cause is the PreloadManager SyncOnAddress wedge.
+
+Ran cat_quest_3 myself (`./artifacts/bin/Release/net10.0/linux-x64/SharpEmu <eboot> --log-file …`, DISPLAY=:1, 60s → SIGTERM; 54k-line log). Timeline is unambiguous:
+- **`vk.flip_capture_failed` fires exactly ONCE** (log line 1554, `addr=0x0000000000C20000 found=False`), at startup right after `Vulkan VideoOut ready`, before any guest frame — it's the initial/default framebuffer flipped before the guest ever rendered/registered a `_guestImages` entry (`VulkanVideoPresenter.cs:5265` `ExecuteOrderedGuestFlip`). **Never recurs; not the blackscreen cause.** Zero successful `vk.flip_capture` in the whole run.
+- **REAL blackscreen = PreloadManager wedge.** From line 1611 on, the **main thread** (managed=4) parks on `sceKernelSyncOnAddressWait` (`Hc4CaR6JBL0`) on address **`0x0000000608C4D8D8`** — **52,497** TIMED_OUT iterations, at `ret=0x801810B56` (inside **eboot.bin** `0x800000000–0x802056358`, the statically-linked FMOD/loader region; same area as FMOD entry `0x8018B4A90`). **Decisive:** `Loading.PreloadManager` was scheduled with `arg=0x0000000608C4D770`, and `0x608C4D770 + 0x168 = 0x608C4D8D8` — the waited futex lives **inside the PreloadManager context object**. Nothing in the entire log ever writes/signals `0x608C4D8D8` (grep: 52,497 hits, all the wait). The PreloadManager worker (managed=80, guest `0x7A798D5353E0`) emits WARN output exactly once (`hwVSPCmp5tM`=`sceKernelCheckedReleaseDirectMemory`→NOT_FOUND, benign) then goes silent; last 5000 lines are 100% main-thread waits. Same **documented PreloadManager wedge** class as metal_slug/subnautica; the earlier completion-wake fix didn't cover it (its triggering read is apparently never submitted → producer never runs).
+- **New lead (novel this run):** immediately before the wedge the main thread does a one-shot C++ **stack-unwind** burst — libc.prx unwinder (`ret=0x808C8BA7C`/`0x808C8BE01`, libc.prx `0x808C54000–0x808D99FD8`) calling module-info-for-unwind (`RpQJJVKTiFM`, `4fU5yvOkVG4`) on a **HOST** address `0x7A89D25F60C4` → NOT_FOUND (4× each, then stops). Hypothesis worth checking: the guest C++ exception unwinder is walking into an **HLE host-trampoline return frame** on the guest stack and cannot cross it (no synthetic eh_frame), so a PreloadManager-init exception handler that would complete setup / signal the futex never runs. Prior sessions called these unwind NOT_FOUNDs "benign," but here they directly precede the permanent wedge — needs confirming whether the cross-host-frame unwind actually aborts init vs. is coincidental. **No code changed; investigation only.** Next: trace what the PreloadManager worker blocks on (why managed=80 goes silent) and/or test the C++-exception-across-host-trampoline hypothesis.
+
+### 2026-07-22 — Two unresolved Np imports resolved: WebApi2 push-event callbacks + UDS destroy-property-object.
+
+A Unity/IL2CPP guest (bubble_puzzle branch) fail-stopped at the import trampoline on two `[LOADER][WARN] Import#… unresolved` NIDs. Reversed each against `scripts/ps5_names.txt` via the `Ps5Nid` SHA1+suffix algorithm:
+- **`fY3QqeNkF8k` = `sceNpWebApi2PushEventRegisterCallback`** (libSceNpWebApi2). The decoded frame (`rdi=0x3E9=1001` user-ctx, `rsi=1` push-event handle, `rdx`=callback ptr, `rcx`=user arg) confirmed the signature `(int userCtxId, int pushEventHandle, cbFunc, void* pUserArg)`.
+- **`kKUH0Viib3c` = `sceNpUniversalDataSystemDestroyEventPropertyObject`** (libSceNpUniversalDataSystem), the missing counterpart to the existing `CreateEventPropertyObject`.
+
+Both were the missing back-halves of lifecycles already half-implemented in files being extended on this branch. No PSN backend is emulated, so the goal is honest bookkeeping (validate args, track/free ids), not network behavior.
+- **`NpWebApi2Exports.cs`:** added `PushEventRegisterCallback` (validates user ctx + push-event handle + non-null callback ptr, mints a tracked positive callback id — the SDK returns an id, not 0, matching the existing `CreateFilter` convention) and its pair `PushEventUnregisterCallback` (NID `hOnIlcGrO6g`, frees the id, rejects unknown/double-free). Also made `CreateUserContext` record its minted id in a new `_userContexts` set so register-callback can validate the user context; new `_callbackHandles` set + `CreateCallbackHandle`/`RemoveCallbackHandle`/`IsValidUserContextId` helpers mirror the existing push-event-handle helpers (all under `_contextGate`).
+- **`NpUniversalDataSystemExports.cs`:** added `DestroyEventPropertyObject` — reads the tracked marker id back from the caller's object memory (`Rsi` then `Rdi` fallback, mirroring `CreateEventPropertyObject`; the decoded frame had `rdi==rsi==0x9150`) and drops it from `_propertyObjects`. Best-effort teardown: unreadable/already-freed is not an error, always returns 0 (matches `DestroyEvent`/`DestroyHandle`).
+- **Tests:** +6 in `NpWebApi2ExportsTests` (register happy path → positive id; unknown handle / null callback / unknown user ctx → invalid-arg; unregister-once-then-reject; unknown-id → invalid-arg), +2 in `NpUniversalDataSystemExportsTests` (create-then-destroy → 0; null/unmapped destroy → 0 best-effort).
+
+**Verification:** `SysAbiExportAnalyzer` accepted all three NIDs at compile time (build clean). Targeted Np filter 15/15; full `SharpEmu.Libs.Tests` = **619 passed, 0 failed**. The unrelated log lines in the same slice (`sceKernelDlsym … 'UnityShaderCompilerExtEvent'`, `vk.flip_wait_order`) are different subsystems, not unresolved SysAbi imports — out of scope. Nothing committed.
+
+### 2026-07-22 — Observation-wall attempt (Steps A+B): warm the Core continuation-resume chain + add the missing GuestRipBreakpoint.WarmUp. Ready for a metal_slug BP run.
+
+The wall: `SHARPEMU_BP_RIP`/tracer at Perform (`0x800B01640`, reached only via continuation-resume) SIGABRTs "Invalid Program: … UnmanagedCallersOnly … in CallNativeEntry via ExecuteBlockedGuestThreadContinuation". Grounding correction from the prior research (`:9336`): the single-step tracer — which ALREADY warms its HLE signal-path callees and was proven working at a normal address (`0x8014709A0`) — still crashed identically at Perform. So warming the HLE handler is NOT the fix. Also found `RunGuestEntryStub`/`NativeGuestExecutor` (the "raw worker, no managed frames below" path, `NativeWorker.cs:59`) is **unused dead code** — ALL guest execution runs inline via `CallNativeEntry` (`:5270/5425/5755`), so "managed frames below" isn't the working-vs-crashing differentiator. The never-tried lever is the **Core** continuation chain (named in the crash), which no warm sweep covers (`SharpEmu.Core` isn't in ModuleManager's HLE-only warm set).
+
+**Implemented (both gated/no-op on normal runs; build clean; full suite 679 green — Libs 619 / SrcGen 33 / Metal 27):**
+- **Step A** — `WarmUpContinuationResumeChain()` in `DirectExecutionBackend.PosixSignals.cs`, called from `SetupPosixExceptionHandler` only when `GuestRipBreakpoint.Enabled || GuestSingleStepTracer.Enabled`. `RuntimeHelpers.PrepareMethod`s the resume chain: `ExecuteBlockedGuestThreadContinuation`, `ApplyGuestContinuation`, `ExecuteGuestContinuationEntry`, `CallNativeEntry`, `RestoreActiveExecutionThread`, `BindTlsBase`, `EmitHostNonvolatileXmmSave` (all `nameof`, best-effort/try-caught so it can't break handler install).
+- **Step B** — new `GuestRipBreakpoint.WarmUp()` (mirrors `GuestSingleStepTracer.WarmUp`), wired at `PosixSignals.cs:119`. PrepareMethods `TryHandleTrap`/`ArmAndFlush`/`SafeReadU64`/`SafeReadStack`/`SelectRegister`/`ClassifyPrologue` + `GuestWriteRipWatch.ArmDynamic`/`TryHandleWriteFault`, and warms the `mprotect` P/Invoke. (It was the ONE instrument with no WarmUp; the synthetic RIP=0 trap only JITs its miss branch.)
+
+**NEXT — user run (needs eboot + GPU):** `SHARPEMU_BP_RIP=0x800B01640,0x800B02819,0x800B028CE,0x800B02AD9` on metal_slug.
+- If the "Invalid Program" SIGABRT is **gone** and the breakpoint ring dumps GPRs: read which of `0x800B028CE` (submit reached) vs `0x800B02AD9` (skip) fires, plus the `0x800B02819` gate snapshot → the fix point. **Step A+B sufficed.**
+- If it **still** SIGABRTs at Perform: warming is not the cure ⇒ CLR thread-mode/stack-walk inconsistency on the continuation-resumed thread (Step C). Cheap discriminator first: does an ordinary SIGSEGV (lazy-commit) get handled on that same resumed thread? Then the likely real fix is wiring the unused `NativeGuestExecutor` worker into the continuation resume (large, separate plan). Nothing committed.
+
+### 2026-07-22 — ⭐ OBSERVATION WALL BREACHED (partial): warm-up makes the Perform-entry breakpoint fire. FIRST DIRECT EVIDENCE: Perform ENTERS but EXITS BEFORE the submit gate (early-exit, not "never re-invoked").
+
+Ran metal_slug_tactics myself (DISPLAY=:1, Vulkan 1.3.275) with the Step A+B warm-up build and `SHARPEMU_BP_RIP=0x800B01640,0x800B02819,0x800B028CE,0x800B02AD9`.
+
+**The warm-up WORKS for the captured hit.** Before: INT3 at Perform → immediate "Invalid Program: UnmanagedCallersOnly" SIGABRT, zero captures. After Step A (warm Core continuation chain) + Step B (new GuestRipBreakpoint.WarmUp): the entry breakpoint **fires and captures**:
+`[BP] seq=1 rip=0x800B01640 rdi=0x6081F6480 [rdi]=0x801D64608 rax=0x801D64608 r13=0x6081F6480 r14=0x608ABA4D0 rbx=0x608ABA3B0 caller=0x800B05591 [rdi+0x58]=0 [rdi+0x118]=0` — i.e. the PreloadLevelOperation (op 0x6081F6480, vtable 0x801D64608) Perform, called from the PM loop re-Perform site (0x800B05591). Confirms Perform IS invoked for the op.
+
+**KEY NEW FINDING — early exit before the gate.** After that single entry capture, Perform demonstrably RAN (the guest `.resS`/sharedassets0/level0 "not suitable for apr reads" printfs + the hwVSPCmp5tM CheckedReleaseDirectMemory all follow the capture), yet **NONE of 0x800B02819 (GATE1 cmp) / 0x800B028CE (submit) / 0x800B02AD9 (skip) ever fired**. Perform runs once (per the documented once-per-458-token model) and that pass **enters 0x800B01640 but never reaches 0x800B02819** → it takes an EARLY EXIT between entry and the dep-loop/gate. This resolves the long-standing "Perform never re-invoked at state 2" vs "early exit before dep-loop" fork (9508/9295) toward **EARLY EXIT**.
+
+**Crash caveat (Step C still open, but does NOT block entry observation).** The process still SIGABRTs later ("Invalid Program … at CallNativeEntry ← ExecuteGuestThreadEntry ← RunGuestThread ← GuestExecutionRunner.ThreadMain") — a FRESH guest thread's signal handling, on a different thread than Perform, AFTER the entry capture (import ~739k vs capture ~722k). Adding ExecuteGuestThreadEntry to the warm set did NOT stop it (run2 identical), which argues this specific crash is a CLR thread-mode/stack-walk inconsistency on a freshly-started runner thread (not cold-JIT) — i.e. warming fixed the continuation-path signal (crash moved off it) but the fresh-entry-path signal fails for a non-JIT reason. Because it fires after the entry capture and on an unrelated thread, we can still observe Perform on the PM thread before it.
+
+**NEXT:** bisecting the early-exit with intermediate BPs (0x800B01682 state-check, 0x800B01C0D dep-resolution, 0x800B02770 dep-loop-pre-gate) to localize the exit branch = the emulator-visible input Perform reads wrong. Build clean; full suite 679 green; nothing committed.
+
+### 2026-07-22 (cont.) — Bisection blocked by the Step-C crash's nondeterminism; entry capture is reproducible, deeper capture is not (yet).
+7-BP bisect run (added 0x800B01682/0x800B01C0D/0x800B02770) crashed BEFORE any capture — right after `Loading.PreloadManager` was scheduled, again "Invalid Program … at CallNativeEntry ← ExecuteGuestThreadEntry" (a fresh runner thread). vs the 4-BP set which captured Perform entry 2/2 times (crash came later). So the SIGTRAP-on-freshly-started-guest-thread crash is nondeterministic (thread-scheduling timing): more INT3 sites ⇒ higher chance a fresh thread hits one and dies before Perform's PM-thread pass is observed.
+
+**Consequence:** reliable bisection of the early-exit needs the Step-C fix (make SIGTRAP safe on freshly-started guest threads) — it's now the gating blocker, not a "maybe." Confirmed data we DO have and can build on: op=0x6081F6480, vtable=0x801D64608, and the BP's live derefs **[op+0x58]=0** and **[op+0x118]=0** at Perform entry (offsets a prior session wired into GuestRipBreakpoint as relevant) — candidate early-exit inputs. Two ways forward: (1) Step C (run continuation/fresh-entry guest code on a raw NativeGuestExecutor worker w/ no managed frames below, so the signal handler thread-mode is consistent — the real, larger fix), or (2) static-decode Perform 0x800B01640→0x800B02819 for the conditional that exits, evaluating it against the live [op+0x58]/[op+0x118]=0 we captured. Nothing committed.
+
+### 2026-07-22 — OBSERVATION WALL BROKEN + PRIOR CONCLUSION OVERTURNED: built a signal-free guest execution logger (SHARPEMU_GUEST_HOOK). Perform DOES reach the submit; the manager submit methods DO run. The read is skipped DOWNSTREAM at a descriptor gate.
+
+**New tool (committed-quality, env-gated): `SHARPEMU_GUEST_HOOK=0xADDR[,0xADDR...]` (+ `SHARPEMU_GUEST_HOOK_MAX`, default 32).** A NON-SIGNAL execution logger that plants a write-once `E9 rel32` detour at each stable guest address into a per-hook trampoline (below-image, rel32-reachable) that snapshots all GPRs+RFLAGS, calls a managed logger (`GuestExecLogger.Capture` via a Win64 gateway, exactly like the import trampolines), restores state byte-for-byte, re-executes the clobbered (position-independent) instructions, and jmps back. Because it reaches managed code by a normal `call` in preemptive guest context — never a signal frame — it is IMMUNE to the "Invalid Program: UnmanagedCallersOnly method from managed code" abort that killed every prior tool (INT3 BP, single-step, HW watch). Verified: hooking Perform entry 0x800B01640 (the continuation-resumed path that crashed INT3) fires cleanly and the game runs on to its normal stall (transparent). Files: `GuestExecLogger.cs` (HLE), `GuestHookRelocator.cs`+`DecodedInst.IsRipRelative` (Disasm), `PatchJmpSite`/`CreateGuestHookTrampoline`/`TryAllocateBelowAnchor`/`InstallGuestExecHooks`/`GuestHookGatewayManaged` (DirectExecutionBackend). Two allocation gotchas found+fixed: (a) trampoline must live BELOW the image base (module loader maps PRX above the image → DEP-faults an above-image page); (b) it must NOT be in `_importHandlerTrampolines` (setup runs 3×, each `SetupImportStubs` frees that list → freed page under a live detour). Own `_guestHookTrampolines` list, never freed till teardown.
+
+**DECISIVE RESULT (metal_slug), all one-shot, no crash:** hooked 0x800B01640(entry)/0x800B02819(gate)/0x800DE0490/0x800DE0510 → ALL FOUR FIRE. So **Perform reaches the submit gate AND both manager submit methods 0x800DE0490/0x800DE0510 execute.** This DIRECTLY OVERTURNS the prior session's "submit block never executed" conclusion (which was built on unreliable INT3 + import-return-address evidence). The submit runs; the `.resS` read is skipped DOWNSTREAM.
+
+**Localized the skip to a descriptor gate inside 0x800DE0510:** it calls 0x800DD80F0 then 0x800DD8270 (both FIRE — they build a read-request descriptor at [rsp+0xd0]) but does NOT reach the per-item read-issue calls 0x800CA34E0(@0x800DE0A02)/0x800CA3860(@0x800DE0AA0)/0x800DC40B0/0x8015D3910 (none fire). Disasm of 0x800DE0510: right after `call 0x800DD8270` (0x800DE0600) — `cmp byte [rsp+0xf0],0; je 0x800DE0720` (0x800DE0617) and `mov r15,[rsp+0xe0]; cmp r15,2; jb 0x800DE0713` (0x800DE0625/29). Both skip targets 0x800DE0720 AND 0x800DE0713 FIRE; the read path 0x800DE0A02 never does. So the read is gated out by the **bool [rsp+0xf0] and/or count [rsp+0xe0]** that 0x800DD80F0/0x800DD8270 compute FROM the `.resS` entry descriptor (0x800DE0510 args: rcx=entry, uses [entry+0x40]/[entry+0x50]). That flag/count being wrong is an EMULATOR-VISIBLE input the descriptor-builder reads wrong — the fix point.
+
+**NEXT:** disassemble 0x800DD80F0 (and 0x800DD8270) to see how [rsp+0xd0-struct]+0x20 (=[rsp+0xf0] bool) and +0x10 (=[rsp+0xe0] count) are derived from the entry ([entry+0x40]/[entry+0x50]) — i.e., which file-stat / dependency-count / streaming field SharpEmu supplies wrong so the descriptor says "nothing to read". Use SHARPEMU_GUEST_HOOK on 0x800DD80F0's interior + SHARPEMU_STALL_DUMP_RANGE for its code. The null-singleton / early-exit / [op+0x58]/[op+0x118] theories are all now moot.
+
+### 2026-07-22 (cont.) — TRACED to root INPUT: the `.resS` read-block list is EMPTY (count 0). The gate keys on an upstream-built container, not a live file-stat.
+
+Decoded 0x800DD80F0(rdi=srcObj, rsi=&outDescriptor): `mov r14,[rdi+0x30]; test r14,r14; je (empty path)`. So the descriptor COUNT ([rsp+0xe0]=[out+0x10]) is just a COPY of `srcObj[0x30]` (it memcpy's `srcObj[0x30]` items of 0x38 bytes from `srcObj[0x20]`, extracting {+0x28,+0x30} per item). Live capture (SHARPEMU_GUEST_HOOK 0x800DD80F0/0x800DD813E/0x800DD81C0): the **zero-path 0x800DD81C0 fires with r14=0** → **srcObj[0x30] == 0**. srcObj = 0x6032B2E90.
+
+Submit-block arg decode (dump 0x800B02819+0x120): the gate finds `r14 = entry` (the type-0x801F43D38 container). Then two vtable calls on the MANAGER (r12=[rbp-0x1e0]=0x60053DB10): 0x800B028CE `call [mgr+0x10]`=0x800DE0490(rdi=mgr,esi=int,rdx=entry,rcx=&local); 0x800B028E4 `call [mgr+0x28]`=0x800DE0510(rdi=mgr,esi=int,rdx=&local, **rcx=[entry+0x80]**). So 0x800DE0510's `srcObj` = **entry[0x80]** = 0x6032B2E90 — a sub-container whose item-count [0x30]=0.
+
+0x800DE0490 (dumped, short): `mov edi,esi` (discards mgr), ignores rdx(entry); it's a canary-guarded scoped call pair to 0x800DD5B20/0x800DD5E30 on locals (a lock/profiler-marker RAII) — **NOT the block-list populator**. So entry[0x80]'s block list is built UPSTREAM (Perform dep-resolution 0x800B01C0D+ / the .assets serialized-file metadata parse), and under SharpEmu it comes out EMPTY.
+
+**Refined root cause:** the guest's own parse produced ZERO `.resS` streaming ranges for this dependency — i.e. SharpEmu fed the guest wrong bytes for the .assets streaming/StreamingInfo table (or the parse consumed a wrong size/offset), so entry[0x80] has 0 items → 0x800DE0510 issues no read. This supersedes "submit never runs". **NEXT:** find who writes entry[0x80] (the srcObj[0x20]/[0x30] container) during dep-resolution and what .assets bytes it consumed — re-examine the sharedassets0.assets metadata read (the "metadata reads fully / byte-faithful" claim needs re-checking against the actual streaming-table parse). New tool for all of this: SHARPEMU_GUEST_HOOK.
+
+### 2026-07-22 (cont.) — GENERALIZED ROOT: NO Unity asset file is EVER READ. entry[0x80] is empty because sharedassets0.assets's metadata is never read. The async read subsystem issues zero asset reads.
+
+`SHARPEMU_LOG_IO=1 SHARPEMU_LOG_OPEN=1` on metal_slug (whole run): the Unity serialized files (globalgamemanagers, globalgamemanagers.assets, **sharedassets0.assets**) are OPENED and STAT'd but get **ZERO read/lseek/pread/aio ops** (sharedassets0.assets: exactly 2 ops = open fd=12 + stat, no read). Across the ENTIRE run there are only **5 `read` ops total** — all on IL2CPP/JSON (`global-metadata.dat`, `ScriptingAssemblies.json`, `RuntimeInitializeOnLoads.json`, fd:3, fd:7) — and **0 pread, 0 aio, 0 mmap**. So the earlier "metadata reads byte-faithful" claim was about IL2CPP `global-metadata.dat` (a sync read that works), NOT the Unity `.assets` (which is never read).
+
+Ruled out wrong-stat: `sceKernelStat` fills `st_size` from `new FileInfo(hostPath).Length` (KernelMemoryCompatExports.cs:7532/7565, StSizeOffset=72), so sharedassets0.assets reports its true 42992 bytes — the size is CORRECT. So the guest gets a valid size and STILL never reads.
+
+**Reframed bug:** the whole Unity async file-read subsystem (`AsyncReadManager` → `Loading.AsyncRead` worker, ctx 0x600E40060 / request-sema 0x600E40110) issues NO asset read at all. entry[0x80] (the .resS block list) is empty specifically because sharedassets0.assets's serialized-file metadata — which is what populates those byte-ranges — is never read. The `.resS` empty-block skip in 0x800DE0510 is a DOWNSTREAM symptom of this. The consumer `Loading.AsyncRead` parks on 0x600E40110 forever (0 wakes); the PRODUCER that should enqueue a read job + post 0x600E40110 never runs (matches the prior "producer never runs" census, now generalized to ALL asset reads, not just .resS). **NEXT:** trace the AsyncReadManager enqueue/post path (who pushes to 0x600E40060+0x1e0 and posts 0x600E40110) with SHARPEMU_GUEST_HOOK to find why no read job is ever produced — is the producer never scheduled, or does it run but the enqueue/post get dropped? This is the true fix locus and should unblock all Unity titles at once.
+
+### 2026-07-22 (cont.) — ANSWERED: the producer NEVER RUNS (never posts). NOT an emulator dropped-wakeup. No async asset read is ever requested.
+
+`SHARPEMU_LOG_SYNCADDR=1` on metal_slug: the sync machinery WORKS (38 wakes total across the run — addr 0x6031139A0 woken 14×, 0x608ABA518 woken 1×, the 0x600716xxx GC semas woken, etc.). The `wake` trace logs EVERY guest `sceKernelSyncOnAddressWake` at the HLE entry regardless of delivery. For the Loading.AsyncRead request-sema **0x600E40110: wait-block=1 (infinite), wake=0**. So the guest NEVER calls Wake on it → the producer that enqueues a read job + posts 0x600E40110 is **never reached**. This is NOT an emulator lost-wakeup (those work fine 38× elsewhere). Meanwhile the main thread spins on 0x608ABA518 (WaitTimeout 518) **42,914×**.
+
+Consumer decoded (dump 0x800937200): the Loading.AsyncRead worker = AsyncReadManager at r15=0x600E40060; loop `lock xadd [r15+0xa8],-1` (work counter); if empty `mov rbx,[r15+0xa0]` (the sema obj) `lock xadd [rbx+0x8],-1`; if no token `call 0x8019b2050` → SyncOnAddressWait on 0x600E40110 (@ret 0x800937337). The mirror PRODUCER (`lock xadd [rbx+0x8],+1` then Wake) never executes.
+
+**Full causal chain (confirmed):** no guest Wake(0x600E40110) → no read job enqueued → sharedassets0.assets metadata never read → entry[0x80] block list empty → 0x800DE0510 skips the .resS read → op wedged at state 2 → main spins WaitTimeout(518) forever. So the real defect is UPSTREAM of the AsyncReadManager: **the guest never REQUESTS any async asset read.** The op Performs once (reaching the .resS submit with empty blocks) but the earlier phase that should schedule the serialized-file metadata read never issues it — a chicken-and-egg where the op waits on a dependency-completion flag (poller 0x800B119D0) whose read is never initiated. **NEXT:** find where the metadata/serialized-file async read is supposed to be INITIATED (the op's early state-0/1 handling, or the SerializedFile open→schedule-read path after the fd=12 open+stat of sharedassets0.assets), and why SharpEmu never reaches it. That is the fix locus.
+
+### 2026-07-22 (cont.) — the AsyncReadManager OPENS + caches each asset file handle (inside Perform's dep-resolution) but issues NO read request. Perform's state arms are pure logging.
+
+Perform state jump table (dump 0x800B02D00): arms state0=0x800B02D6B / state1=0x800B02D44 / state2=0x800B02D98 are all just progress-logging (0x800535680/0x800B02EB0/0x800ADF2B0) + container-integrate `0x800D4E2D0(&op[0xd8])`. They do NOT schedule a read.
+
+Open caller found: ALL Unity asset files (globalgamemanagers, .assets, sharedassets0.assets, level0) open from the same File::Open, caller ret=0x801469F2F (stores fd into [fileObj+0x428]). rbp frame-walk via SHARPEMU_GUEST_HOOK 0x801469F36 gives the load stack:
+`Perform 0x800B01BD3 → 0x800D37559 → 0x800D44466 → 0x800B17916 → 0x800B1687E → 0x800939502 → 0x800938DCC → File::Open`.
+So the open runs SYNCHRONOUSLY inside Perform, THROUGH the AsyncReadManager (0x800938xxx/0x800939xxx). Disasm 0x800938DCC: `call 0x800BD5B10`(=File::Open→bool al); on success it only **registers the fd/handle** into manager tables ([rbx+r13*4+0x418], [rbx+…+0x288]) — OPEN + CACHE HANDLE, no read. stat is fully correct (size/blocks/blksize/mode); no file-backed mmap export; 0 read/pread/aio on the fds.
+
+**So:** the AsyncReadManager opens+caches every asset handle during Perform, but the READ REQUEST (enqueue job + post 0x600E40110) is never issued — the guest never even requests the serialized-file HEADER read (the first read that would let it discover objects and populate entry[0x80]). **NEXT:** trace the dep-resolution callers 0x800B1687E / 0x800B17916 (just above the AsyncReadManager open) — after caching the handle, that's where the header/metadata read should be enqueued + 0x600E40110 posted; find the branch/flag that skips it (likely another empty-descriptor/emulator-visible skip, same shape as the 0x800DE0510 empty-count gate). Fix locus. All tracing via SHARPEMU_GUEST_HOOK + SHARPEMU_STALL_DUMP_RANGE.
+
+### 2026-07-22 (cont.) — ⚠️ CORRECTION: the Unity asset metadata IS read (via pread, which SHARPEMU_LOG_IO does NOT trace). The "no asset reads / metadata never read" conclusion above is WRONG (a logging gap).
+
+`pread`/`sceKernelPread` (KernelFileExtendedExports.cs:47-53) never called LogIoTrace, so SHARPEMU_LOG_IO's "read"-only counts missed them. Added a temp `SHARPEMU_LOG_PREAD=1` trace (since reverted): the Unity serialized files ARE fully pread — fd=8 globalgamemanagers (full), fd=10 globalgamemanagers.assets (0xA5494 full), **fd=12 sharedassets0.assets off=0x0 req=0xA7F0 read=0xA7F0 (full 42992, read TWICE)**, fd=13 level0 (0x2888 full). read==requested for all, pread writes them into guest memory fine.
+
+**ORDER (SHARPEMU_LOG_PREAD + SHARPEMU_GUEST_HOOK 0x800DE0510/0x800DD81C0):** fd=12 sharedassets0.assets pread (full) happens FIRST (log line 1860/1865), THEN the .resS submit 0x800DE0510 seq=1 (rcx=entry[0x80]=0x6032B2E90, entry r14=0x6032B2E10), THEN the empty-block path 0x800DD81C0 seq=2 (r14=srcObj[0x30]=0). So the metadata is read+in-memory BEFORE the submit — NOT a timing/never-read issue.
+
+**Corrected model:** the guest reads the full, correct sharedassets0.assets bytes, yet the dep entry 0x6032B2E10's block sub-container entry[0x80] still has count 0 when 0x800DE0510 checks it. So the empty block list is NOT "metadata unread". Remaining possibilities: (a) entry 0x6032B2E10 (type 0x801F43D38) legitimately has 0 .resS blocks and the real 16 MB .resS read belongs to a DIFFERENT container entry / op — re-verify which entry maps to sharedassets0.assets.resS (there were 3 entries [op+0xe8]=3); (b) the parse of the correct bytes builds 0 ranges because an emulator-visible cross-check (not the file bytes) is wrong; (c) the op waits on something OTHER than this entry's .resS read. SOLID facts unchanged: .resS 16 MB async read never issued (0 wakes on 0x600E40110), op wedged at state 2, main spins WaitTimeout(518) 42914×, and Perform reaches+runs the submit. **NEXT (reset with corrected model):** enumerate all 3 container entries ([op+0xd8]=container, [op+0xe8]=3) and their types/block-counts; find which one corresponds to the .resS 16 MB read and whether ITS block list is (correctly) populated — i.e. determine whether 0x6032B2E10's emptiness is the real wedge or a red herring, before deciding the fix.
+
+### 2026-07-22 (cont.) — 3 container entries ENUMERATED. entry[1] (the 0x801F43D38 .resS-streaming type) IS the right entry with an empty block list — NOT a red herring. Entries are transient (freed/zeroed post-Perform).
+
+Located op via SHARPEMU_STALL_SCAN_PTR=0x801D64608 → op=0x6081F6480 ([+0x3b8]=state 2). Dumped op fields: **[op+0xd8]=container 0x6001C0BB0, [op+0xe8]=3**. Container = array of 0x18-byte records {entryPtr@0, id@8, type@0x10}:
+- entry[0]: ptr=0x6032B2C20, id=0x256A, type=**0x801F39670**
+- entry[1]: ptr=0x6032B2E10, id=0x256C, type=**0x801F43D38** ← GATE4 target *(0x801FA7E60); the one 0x800DE0510 processes; its [0x80] sub-container (0x6032B2E90) has count 0.
+- entry[2]: ptr=0x600265B90, id=0x256E, type=**0x801F3D748**
+
+Only entry[1] (type 0x801F43D38) matches the submit's GATE4 type — it IS the streaming/.resS request, so its empty block list is the REAL wedge, not a wrong-entry red herring. entry[0]/entry[2] are other dep types (not the .resS submit target).
+
+**IMPORTANT tooling note:** dumping the entries at stall time (SHARPEMU_STALL_DUMP_RANGE on 0x6032B2C20/0x6032B2E10) returns ALL ZEROS — the entry objects are FREED/zeroed after the Perform pass. They are only live DURING Perform, so inspect them with SHARPEMU_GUEST_HOOK (captured live: 0x800DD80F0 saw srcObj=entry[1][0x80]=0x6032B2E90, [0x30]=0), NOT with stall dumps.
+
+**Where it stands / prime lead:** the .assets (sharedassets0.assets) is fully pread + in memory BEFORE the submit, entry[1] is the correct streaming request, yet entry[1]'s block list is 0. So the step that PARSES the .assets StreamingInfo into entry[1][0x80]'s ranges produces 0 ranges from correct bytes. Prime suspect (reopen a previously-dismissed lead): the guest's own printf **"path /app0/Media/sharedassets0.assets.resS is not considered suitable for apr reads flags:0x0"** — st_flags is set to 0 by TryWriteKernelStat (KernelMemoryCompatExports.cs:7568). If the guest classifies the .resS as non-streamable/non-mappable from st_flags (or st_dev/st_blksize) and therefore builds ZERO streaming ranges, that is an emulator-visible stat field, not a red herring. **NEXT:** decode the guest's "suitable for apr reads" test (find the code that emits that printf and reads the .resS stat flags) and see whether a non-zero st_flags / different stat field makes it build streaming ranges → then entry[1][0x80] would be populated and the .resS read issued. Testable by trying a corrected st_flags value.
+
+### 2026-07-22 (cont.) — "apr reads" suitability = CONFIRMED RED HERRING (again). .resS is stat'd but never opened (a symptom of the empty block list, not a cause). Obvious leads exhausted; strategy reset needed.
+
+Decoded the apr-suitability printf (temp SHARPEMU_LOG_APR in KernelExports.Printf, since reverted): caller ret=**0x80146A307** — inside the File::Open/setup function (same region as File::Open 0x801469F2F; +0x8D8). It fires "not suitable for apr reads flags:0x0" for EVERY file: globalgamemanagers, globalgamemanagers.assets, sharedassets0.assets, level0, unity_builtin_extra, the JSONs. Since globalgamemanagers/level0 ARE read (pread) and globalgamemanagers loads fine (frame 1 renders), "not suitable for apr" just falls back to pread and does NOT block reading. So st_flags=0 / apr-suitability is definitively NOT the cause. (Prior session's "red herring" call was right; my reopening it is closed.)
+
+`.resS` open check (SHARPEMU_LOG_OPEN + SHARPEMU_LOG_IO): sharedassets0.assets.resS is **stat'd (found) but OPENED 0 times**. This is DOWNSTREAM of entry[1] being empty (no ranges ⇒ nothing to stream ⇒ .resS never opened), not a cause.
+
+**State of the hunt (obvious leads exhausted):** SOLID = Perform reaches+runs the submit; entry[1] (type 0x801F43D38, the .resS-streaming request) has 0 blocks; sharedassets0.assets is fully pread (correct bytes) BEFORE the submit; globalgamemanagers (no .resS) parses+loads fine. So sharedassets0.assets's parse yields 0 streaming ranges from correct bytes, while a no-streaming file parses fine. RULED OUT: metadata-unread (it's read), wrong stat size/blocks/blksize/mode (all correct), apr-suitability/st_flags (red herring), Perform-early-exit/submit-never-runs (both false), null singleton (typo), lost-wakeup (machinery works). **STRATEGY RESET for next session (stop linear tracing):** (1) byte-verify the guest's in-memory sharedassets0.assets buffer vs the real 42992-byte file (hook the pread caller / dump the dest buffer) — confirm no corruption; if correct, (2) the parse skips streaming due to a NON-file emulator-visible input — candidates: a platform/graphics-capability/"streaming supported" query the guest consults (Unity gates .resS streaming on platform caps), or a global settings/PlayerSettings flag; find the guest's per-object "has StreamingInfo / use streaming" decision (near where entry[1][0x80] items would be appended) and what emulator-visible value it reads. Tools: SHARPEMU_GUEST_HOOK (live, entries are transient), SHARPEMU_STALL_DUMP_RANGE (code/stable data only). Note: SHARPEMU_LOG_IO does NOT cover pread (gap).
+
+### 2026-07-22 (cont.) — BYTE-VERIFY: the guest's in-memory sharedassets0.assets is BYTE-PERFECT. Emulator read/memory corruption is RULED OUT. The parse produces 0 streaming ranges from correct data ⇒ a guest-logic/capability gate, not the bytes.
+
+Real sharedassets0.assets = valid Unity SerializedFile v22: header fileSize=0xA7F0(42992)✓, metadataSize=0x5DD, dataOffset=0x610, unity "2022.3.29f1"; whole-file sum32=0x286B69. Temp SHARPEMU_VERIFY_PREAD (in KernelPreadCore, since reverted) recomputes, after each pread, the source checksum AND reads the bytes BACK from guest memory: **fd=12 off=0 req=0xA7F0 read=0xA7F0 srcSum=0x286B69 rbSum=0x286B69 firstMismatch=none** (read twice, into 0x60320C290 and 0x609B40010, both perfect). Zero mismatches across all 18 verified preads. So the guest receives the FULL, CORRECT, UNCORRUPTED file in guest memory.
+
+**Conclusion:** option-1 (emulator read/write/memory corruption) is DEAD. The guest parses byte-perfect .assets and still builds 0 .resS streaming ranges in entry[1] ⇒ the parse SKIPS streaming due to a NON-file emulator-visible input (option 2). Unity gates .resS/resource-image streaming on runtime platform + graphics-device capabilities (e.g. texture/mesh streaming support, "supportsAsyncGPUReadback"/resource-image support) or a settings flag. **NEXT:** find the guest's per-object "use streaming / append .resS range" decision (the code that WOULD append items to entry[1][0x80]=srcObj, i.e. the producer of srcObj[0x20]/[0x30]) and the emulator-visible capability/global it reads — that value is the fix point. Approach: hook where srcObj items get appended (breakpoint the streaming-range append path, reachable from the .assets deserialize) OR find the GraphicsDeviceCaps/streaming-support query the guest makes during level load and check SharpEmu's answer. This is the fix locus; not corruption.
+
+### 2026-07-22 (cont.) — the .resS IS real+referenced (loading-screen atlases); the deserializer RAN on byte-perfect data yet built 0 ranges; all relevant buffers are transient. Next work must hook the deserializer LIVE.
+
+File sizes: sharedassets0.assets.resS = **17,301,504 (~16.5 MB)** = the 16 MB stream. `strings sharedassets0.assets` shows it references **sharedassets0.assets.resS** for texture atlases `sactx-…Splashscreen.atlas` and `sactx-…UI_Loading_Saving.atlas` — the LOADING-SCREEN textures (exactly what a frame-1-stuck game waits on). So streaming IS expected here.
+
+Deserializer located via the load chain: File-access/read chain Perform→0x800D37559→0x800D44466→read-loop 0x800B178A0. Disasm at 0x800D44461: `call 0x800B178A0` reads a 0x14-byte record then `movbe` byte-swaps it (SerializedFile is BIG-ENDIAN; guest swaps — SharpEmu need not). So 0x800D44xxx is the object-table/StreamingInfo deserialize.
+
+SHARPEMU_STALL_SCAN_STRING="sharedassets0.assets.resS" over 0x600000000-0x610000000 = **0 occurrences** at stall time — but the .assets buffers were pread into 0x60320C290 / 0x609B40010 (both in-range). So those buffers are FREED after the parse (transient, like the container entries 0x6032Bxxxx). ⇒ the deserializer RAN, consumed the correct bytes, freed them, and produced 0 streaming ranges.
+
+**State:** the wedge is a guest-logic decision inside the SerializedFile deserializer (0x800D44xxx region) that, for byte-perfect .assets referencing .resS atlases, appends 0 ranges to entry[1][0x80]. It is NOT: corruption, unread metadata, wrong stat, apr-suitability, submit-never-runs, null-singleton, or lost-wakeup (all ruled out). Everything (entries, .assets buffer, StreamingInfo) is TRANSIENT — stall-time dumps/scans see zeros. **NEXT (must be LIVE):** SHARPEMU_GUEST_HOOK the deserializer's per-object streaming decision in 0x800D44xxx (hook 0x800D44466 and the branches after the movbe-swapped record read at 0x800B178A0) to catch, per streamed object, whether it reaches the "append .resS range" path and what condition/emulator-visible value gates it away. That gate is the fix. (Frame-walk + register capture from the hook tool is the right instrument since nothing survives to stall time.)
+
+### 2026-07-22 (cont.) — LIVE deserializer hook set up + working. 0x800D44xxx = SerializedFile HEADER parse (per-file, v22), NOT the per-object parse. The streaming decision is one layer deeper.
+
+SHARPEMU_GUEST_HOOK=0x800D44569,0x800D44519 fires cleanly (6 each, no crash). Captured regs at 0x800D44569 (the >0x15 large-record branch): **r13=0x16 (=22, the SerializedFile VERSION) constant across all 6**, and **r12 = the file/data SIZE**: 0xA7F0(=sharedassets0.assets 42992), 0xA5494(=globalgamemanagers.assets metadata), 0x2888(=level0), 0x3C874/0xD5D30/0x8B384 (globalgamemanagers chunks). So 0x800D44xxx is the **SerializedFile header parse, called ONCE PER FILE** (6 files → 6 hits); the 0x30-byte record at 0x44569 is the v22 large-format header (metadataSize/fileSize/dataOffset u64, byte-swapped). seq=10 (r12=0xA7F0) = the sharedassets0.assets header pass. 0x800D44519 is a per-file alloc/log path, not an error.
+
+**So the deserializer level I hooked is the HEADER parse, not where StreamingInfo/streaming-ranges are decided.** The per-object parse (TypeTree walk + StreamingInfo → append .resS range) is DEEPER, in the functions this header-parse calls after reading the header. **NEXT:** from the header-parse function (0x800D44xxx), follow the calls AFTER the header read into the object-table / TypeTree / StreamingInfo processing, and hook THAT per-object streaming decision live (using the sharedassets0.assets pass, identifiable by r12=0xA7F0 / the file context) to catch the gate that skips appending the atlas .resS ranges. The live hook instrument is proven; the target is the per-object streaming decision one layer below the header parse.
+
+**Session summary (tool delivered, bug precisely localized, NOT yet fixed):** Built SHARPEMU_GUEST_HOOK (signal-free live execution logger; 689 tests green) which broke the observation wall and overturned the prior "submit never runs" root cause. Established with evidence: Perform reaches+runs the .resS submit; the read is skipped because entry[1]'s (type 0x801F43D38) block list is empty; the .assets IS fully+correctly pread (byte-verified, no corruption) BEFORE the submit; the .assets references the loading-screen atlases in the 16.5MB .resS; the deserializer runs on byte-perfect data yet appends 0 streaming ranges. RULED OUT: corruption, unread-metadata, wrong-stat, apr-suitability/st_flags, submit-never-runs/early-exit, null-singleton, lost-wakeup. REMAINING: the per-object streaming-range decision inside the SerializedFile deserializer (one layer below 0x800D44xxx) skips the atlas ranges for a reason not yet pinned — a guest-logic/emulator-visible gate. All entries/buffers are transient ⇒ observe LIVE only.
+
+### 2026-07-22 (cont.) — type-ref approach = DEAD END: the only direct lea-ref to entry[1]'s type 0x801F43D38 is a construct path that NEVER RUNS this boot. entry[1] is built via an INDIRECT ref. Recommend a signal-free write-watch as the next instrument.
+
+SHARPEMU_STALL_SCAN_RIPREL=0x801F43D38 → exactly **2 hits**: (a) getter 0x80159B450 (`lea rax,[type]; ret`), (b) 0x80060734D inside a function at 0x800607346 that does `lea rcx,[0x801F43D38]; …; call 0x800824420; mov rbx,[rsp+0x2b8]; test rbx,rbx; je skip` (a type-query→count→loop; if count 0, skip). Hooked it LIVE: 0x8006073B5 (post-call, count!=0 path) and 0x80060739D (mov rbx,count, right after the call) **BOTH never fire** ⇒ this function's query path never executes this boot. So entry[1] (which DOES exist in the container) is constructed via an INDIRECT type reference (type obtained via the getter 0x80159B450 or a data/vtable table, not a direct lea) — the rip-rel-scan-for-type approach cannot find the populator.
+
+**Honest assessment / recommended next instrument:** the current toolkit (execution hooks + stall dumps + rip-rel scan) has localized the bug precisely but cannot pinpoint the entry[1][0x80] populator because (1) the relevant objects/buffers are transient and (2) the type is referenced indirectly. The right next tool is a **SIGNAL-FREE memory write-watch** (extend the SHARPEMU_GUEST_HOOK machinery: instead of an E9 detour at a code address, arm a guarded page / compare-on-import for a data address, or a hook at the vector-append primitive) aimed at the srcObj (=entry[1][0x80]) count field, to catch exactly who writes it — or prove nothing does. Watch it from entry[1] construction (hook the container-build in Perform dep-resolution 0x800B01C0D+ to capture the live srcObj address, then watch srcObj+0x30). Alternatives: reference-emulator (shadPS4) diff of the same level-load, or Unity SerializedFile/StreamingInfo format analysis. Continued blind linear tracing is NOT converging — each layer's direct refs point elsewhere/indirect.
+
+### 2026-07-22 (cont.) — BUILT the signal-free write-watch (SHARPEMU_MEM_POLL + _CHAIN). DEFINITIVE: the .resS block-list COUNT is never written non-zero — the append is NEVER reached.
+
+New tool `MemPollWatch` (src/SharpEmu.HLE/MemPollWatch.cs; 689 tests green): a dedicated host thread that reads guest memory (identity-mapped) and logs every value change — signal-free (no handler, no code patch; immune to the continuation-resume abort). `SHARPEMU_MEM_POLL="0xADDR,..."` watches fixed u64 addresses; `SHARPEMU_MEM_POLL_CHAIN="off1,...,offN"` follows a pointer chain from a base PUBLISHED LIVE (GuestExecLogger.Capture publishes hook-index-0's rdi → so hook Perform entry 0x800B01640 to make the op the base). Commit-gated (VirtualQuery per hop) so a host-thread read of a reserved-but-uncommitted guest page can't abort. Re-resolves each pass to follow transient objects.
+
+Two gotchas found+fixed while using it: (a) host-thread reads of uncommitted guest pages abort → commit-gate; (b) heap layout is NONDETERMINISTIC across runs (srcObj was 0x6032B2E90 in some runs, 0x603284490/0x603284450 in others — perturbed by tool threads) → fixed-address watching is useless; must use the live chain. Also corrected a chain error: **srcObj is EMBEDDED at entry+0x80 (submit does `lea rcx,[r14+0x80]`, NOT a deref)**, so the count is at entry+0x80+0x30 = entry+0xB0.
+
+**RESULT (chain op→[+0xd8]container→[+0x18]entry[1]→watch +0xB0 = srcObj+0x30 count):** resolves live at t≈11.3s (when Perform runs) to value **0, and it NEVER changes for the whole run.** So the .resS block-list count is 0 from construction and is never written non-zero ⇒ **nothing ever appends a range; the append code is NEVER reached** (rigorously, not inferred). This confirms the wedge is a DECISION in the deserializer that skips the per-object streaming-range append for the sharedassets0.assets atlas objects.
+
+**Session close-out (2 tools delivered, bug rigorously localized, NOT fixed):** (1) SHARPEMU_GUEST_HOOK — signal-free live execution logger (broke the observation wall; overturned "submit never runs"). (2) SHARPEMU_MEM_POLL/_CHAIN — signal-free live memory write-watch (confirmed the .resS range-count is never populated). Established with evidence: Perform runs the submit; the .assets is byte-perfect + fully read before the submit; it references the loading-screen atlases in the 16.5MB .resS; the deserializer runs yet the streaming-range append is never reached → block list stays empty → .resS never read → op wedged → main spins forever. RULED OUT: corruption, unread-metadata, wrong-stat, apr-suitability, submit-never-runs/early-exit, null-singleton, lost-wakeup, wrong-entry. REMAINING (fix locus): the deserializer's per-object "append .resS streaming range" decision is gated off for the atlas objects — find that gate (it's NOT reachable via type-0x801F43D38 refs, which are indirect; try hooking the object-loop below the header parse 0x800D44xxx and correlate with the sharedassets0.assets pass, or diff vs a reference emulator). NOTE: SHARPEMU_LOG_IO does not trace pread.
+
+### 2026-07-22 (cont.) — the SerializedFile parse SUCCEEDS for every file (result=0). So it's a POST-PARSE streaming decision, not a parse failure.
+
+The load orchestration at 0x800D37554 does `call 0x800D442E0` (=SerializedFile::Read, which contains the header parse 0x800D44xxx); ret at 0x800D37559 has eax=result. Hooked 0x800D37559 (SHARPEMU_GUEST_HOOK) → **all 6 file parses return eax=0x0 (success)**, sharedassets0.assets included. So the .assets parses cleanly; objects are read. Yet the .resS streaming-range append to srcObj (entry+0x80) still never fires (write-watch proven). ⇒ the gate is a per-object/per-file decision that runs AFTER a successful parse and decides NOT to stream the atlas objects — it is NOT a parse error, NOT missing data, NOT corruption.
+
+**HAND-OFF STATE (after very extensive investigation; 2 tools delivered, bug rigorously localized, NOT fixed):** the exact gate is a post-successful-parse "stream this object from .resS?" decision that skips all sharedassets0.assets atlas objects. Everything upstream is correct (byte-perfect read, successful parse). It's inside the large SerializedFile::Read (0x800D442E0..0x800D44xxx) object handling OR the Perform dep-resolution (0x800B01C0D+) that copies streamed ranges into entry[1]. Both are large; the object-loop head appears to be ~0x800D44326 (body reads a 0x14-byte object record at 0x800D44461, loops via jmp 0x800D44326 at 0x800D44564). RECOMMENDED next moves (in order of expected yield): (1) hook 0x800D44461 (per-object record read) live and filter the sharedassets0.assets pass — capture each object's type/flags to find the one whose "streamed" bit is (wrongly) not set / not acted on; (2) shadPS4 (or other Unity-PS5-capable emulator) reference diff of the SAME level load — compare what capability/global/StreamingInfo path differs; (3) Unity 2022.3 SerializedFile/StreamingInfo format analysis to know exactly which field/flag gates .resS streaming and what emulator-visible value feeds it. Blind linear tracing across this session did NOT reach the gate — a reference diff or format spec is likely the fastest path now.
+
+### 2026-07-22 (cont.) — GROUND TRUTH: parsed sharedassets0.assets myself; the .resS has exactly 2 StreamingInfo ranges (2 Texture2D atlases) totalling the whole 16.5MB. The guest should build srcObj count=2 with these; it builds 0.
+
+Parsed sharedassets0.assets (Unity SerializedFile v22, unity "2022.3.29f1") by scanning for the StreamingInfo path string "sharedassets0.assets.resS" (each streamed object stores {u64 offset, u32 size, unity-string path} just before its path; metadata is LITTLE-endian, header is big-endian). Two entries, validated (their sizes = exact uncompressed atlas dims, and they tile the whole .resS with no gap):
+- #1 (Splashscreen atlas, 2048x2048x4): .resS **offset=0x0 size=0x1000000 (16 MB)**  — StreamingInfo @ .assets off ~0x7D8
+- #2 (UI_Loading_Saving atlas, 256x512x4): .resS **offset=0x1000000 size=0x80000 (512 KB)** — StreamingInfo @ ~0x8AC
+Sum = 0x1080000 = 17,301,504 = exact sharedassets0.assets.resS size. So the "16 MB .resS read" = the Splashscreen atlas; both are the LOADING-SCREEN textures.
+
+**So the expected output is unambiguous:** srcObj should get count=2 with these two {offset,size} ranges (from two Texture2D objects whose m_StreamData.path = sharedassets0.assets.resS). The guest instead produces count=0 → the gate skips BOTH streamed Texture2D atlas objects despite byte-perfect data. This is the exact behavior to reproduce/fix. libil2cpp-master (sibling dir) is only the IL2CPP scripting runtime (no engine SerializedFile/StreamingInfo code — 0 refs), so it does not contain this gate; the gate is Unity engine (native) Texture2D/StreamingInfo handling. NEXT (unchanged, now with exact ranges as ground truth): find why the engine's per-Texture2D "read m_StreamData from .resS" path is skipped — the StreamingInfo structs are at .assets buffer offsets ~0x7D8/~0x8AC, so a data-read hook there (or the Texture2D deserialize) would catch the decision; or diff vs shadPS4.
+
+### 2026-07-22 (cont.) — traced the .resS streaming resolution; every checkpoint PASSES. The gate is buried in Unity's engine virtual file/stream abstraction. In-tracer descent has stopped converging.
+
+Found the streaming-resolution code via the .resS stat caller (temp SHARPEMU_LOG_STATCALLER in KernelStat, reverted): ALL .resS stats come from ret=0x80146B39F, inside a **FileExists(.resS)** helper (0x80146B2xx): it stats the path, returns `(stat ok) && ((st_mode & 0xF000) != 0x4000)` = "exists and not a directory". SharpEmu's st_mode for a regular file = 0x81FF (&0xF000=0x8000≠0x4000), so **FileExists correctly returns TRUE** for sharedassets0.assets.resS — NOT the gate. Frame walk (SHARPEMU_GUEST_HOOK 0x80146B39F) gives the caller chain: `0x800BD40F9 → 0x800D373B0 → 0x800D3C3BF → 0x800D3CD98 → 0x800D3CB11 → …` (all SerializedFile-load region). FileExists is invoked via `call [rax+0x80]` (a vtable method on a stream object at [rbp-0x40]) at 0x800BD40F3 — i.e. this is the engine's VIRTUAL FILE/STREAM abstraction, dispatching through vtable slots (+0x80, +0xa8).
+
+**Pattern across this whole session:** every concrete checkpoint I reach in the .resS path evaluates CORRECTLY under SharpEmu — read (byte-perfect), stat (correct size/mode), parse (eax=0 success), FileExists (TRUE) — yet the per-object streaming-range append (srcObj+0x30, watched live) is never reached and stays 0. The actual gate is several virtual-dispatch levels deep in Unity engine (native) code that is NOT in any source on disk (libil2cpp is scripting-only).
+
+**HONEST CONCLUSION for this session:** exhaustive in-tracer descent has NOT isolated the single gate — it keeps landing on correct behavior. Two novel tools were built and proven (SHARPEMU_GUEST_HOOK signal-free exec logger; SHARPEMU_MEM_POLL/_CHAIN signal-free write-watch), the prior wrong root cause was overturned, and the bug was localized to "the engine skips the per-Texture2D .resS streaming-range append despite all inputs being correct," with exact ground-truth ranges known (Splashscreen 16MB @0x0, UI_Loading 512KB @0x1000000). RECOMMENDED (in-tracer descent is exhausted): (a) shadPS4 (or other Unity-PS5 emulator) behavior diff of the same metal_slug level load — the fastest way to see which emulator-visible value/call differs at the streaming decision; (b) obtain Unity 2022.3 engine (not IL2CPP) serialization/streaming source or a format+behavior reference (AssetRipper/AssetsTools.NET model the StreamingInfo path but not the runtime read decision). The two tools + the ground truth make either approach much faster next session.
+
+### 2026-07-23 — shadPS4 route CLOSED (PS4 build uses data.unity3d, different packaging). Back on disassembly: the FileExists chain was a RED HERRING (a working streaming system); the 16 MB .resS read is DEFERRED/on-demand (integration/GPU-upload-triggered) — likely UNIFIES Class A (.resS) and Class B (GPU).
+
+shadPS4 dead-end: extracted the PS4 build (ShadPs4Plus-PkgExtractor CLI → CUSA46824/). It uses **Media/data.unity3d** (compressed UnityFS bundle, same Unity 2022.3.29f1) + Addressables .bundle — NOT loose sharedassets0.assets+.resS. So shadPS4 can't reference the PS5 loose-.resS path. (All other PS5 games checked — cult/cat_quest_3/subnautica/caveman — ALSO use loose .resS, no data.unity3d, so the loose-.resS path is the common PS5 packaging worth fixing.)
+
+Disassembly (resumed): traced the .resS stat caller → FileExists helper 0x80146B2xx (returns TRUE correctly) → path-build 0x800D373xx → streaming-setup loop 0x800D3CA80 (calls 0x800D3CB80 per file → returns a stream obj; then 0x800D3AD20 to process). 0x800D3AD20 gate `cmp [rbx+0x11c],0; je skip` — but it PROCESSES (fires 23×, one-time, context rbx=0x6007536C0, never skips). Its read-submit 0x800D39F80 DRAINS a pending-read list [r14+0x110]/count[r14+0x118] via per-entry 0x800D4E3F0 (drain-loop body 0x800D3A035 fires 40×). So this streaming system REGISTERS + ISSUES reads — but they are the SMALL metadata reads that already succeed via pread (globalgamemanagers/sharedassets0.assets), NOT the 16 MB .resS. **⇒ the 0x800D3AD20/0x800D39F80/context-0x6007536C0 chain is a WORKING streaming system, reached by following FileExists — a RED HERRING for our wedge.**
+
+**Reframe (important):** the 16 MB sharedassets0.assets.resS read is a SEPARATE, deferred/on-demand read, triggered when the Texture2D atlas is actually integrated/uploaded (GPU). The op (PreloadLevelOperation) wedges at state 2 BEFORE integrating (main-integrate 0x800B02C80 → readiness gate 0x800B00BB0(&op[0x98]) returns not-ready), so the atlas is never integrated → its .resS data read never triggers. This likely makes Class A (.resS) and Class B (GPU-driven data-flow, caveman_ninja) the SAME root: the streamed-texture data read is driven by the GPU texture-upload/integration path, which is stalled. **NEXT (refocused on the REAL path):** the op's integration/readiness gate — decode main-integrate 0x800B02C80 and the readiness predicate 0x800B00BB0(&op[0x98]): what completion flag it polls, who sets it, and whether the texture-upload (GPU) that would set it (and trigger the .resS read) ever runs. Stop chasing the loose-file FileExists chain (works). SHARPEMU_GUEST_HOOK + write-watch remain the instruments.

@@ -978,9 +978,58 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetModuleInfoForUnwind(CpuContext ctx)
     {
-        var queriedAddress = ctx[CpuRegister.Rdi];
-        var flags = unchecked((int)ctx[CpuRegister.Rsi]);
-        var outInfoAddress = ctx[CpuRegister.Rdx];
+        return GetModuleInfoForUnwindCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            unchecked((int)ctx[CpuRegister.Rsi]),
+            ctx[CpuRegister.Rdx]);
+    }
+
+    // libSceSysmodule exposes the same module-info-for-unwind query as libKernel's
+    // sceKernelGetModuleInfoForUnwind (identical 0x130-byte struct, same
+    // addr/flags/out-info argument layout) — the C++ runtime uses whichever is
+    // linked for exception unwinding. Delegate to the shared core so both stay in
+    // lock-step. Previously unresolved, which left the unwinder without the
+    // eh_frame ranges for the module containing a faulting/throwing address.
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx)
+    {
+        return GetModuleInfoForUnwindCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            unchecked((int)ctx[CpuRegister.Rsi]),
+            ctx[CpuRegister.Rdx]);
+    }
+
+    // The guest C-runtime unwinder calls _is_signal_return(pc) to detect a kernel
+    // signal-return trampoline frame (so it can flag a signal frame and pull the full
+    // register set from the ucontext). SharpEmu delivers faults host-side (see
+    // DirectExecutionBackend.PosixSignals) and never injects a guest-visible
+    // signal-trampoline frame — async guest-exception delivery uses a normal
+    // import-frame continuation, not a signal frame — so no guest return address is
+    // ever a signal return. Report 0 (ordinary frame) for every pc. Previously
+    // unresolved, which stalled the unwinder's per-frame signal-frame probe.
+    [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "_is_signal_return",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libkernel")]
+    public static int IsSignalReturn(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int GetModuleInfoForUnwindCore(
+        CpuContext ctx,
+        ulong queriedAddress,
+        int flags,
+        ulong outInfoAddress)
+    {
         if (outInfoAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;

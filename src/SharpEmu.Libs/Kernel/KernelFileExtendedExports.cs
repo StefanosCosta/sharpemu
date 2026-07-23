@@ -590,6 +590,11 @@ public static partial class KernelMemoryCompatExports
                 BinaryPrimitives.WriteInt64LittleEndian(result[0..], transferred);
                 BinaryPrimitives.WriteUInt32LittleEndian(result[8..], AioStateCompleted);
                 _ = ctx.Memory.TryWrite(resultPtr, result);
+
+                // A thread may park in sceKernelSyncOnAddressWait on this result slot waiting for
+                // completion; writing the state word alone never wakes a futex waiter, so post the
+                // wake on the slot we just wrote.
+                KernelSyncOnAddressCompatExports.SignalAddressWaiters(resultPtr);
             }
         }
 

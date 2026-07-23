@@ -15,6 +15,7 @@ public readonly struct DecodedInst
         FlowControl flowControl,
         ulong? nearBranchTarget,
         ulong? memoryAddress,
+        bool isRipRelative,
         byte[] bytes)
     {
         Rip = rip;
@@ -24,6 +25,7 @@ public readonly struct DecodedInst
         FlowControl = flowControl;
         NearBranchTarget = nearBranchTarget;
         MemoryAddress = memoryAddress;
+        IsRipRelative = isRipRelative;
         Bytes = bytes;
     }
 
@@ -40,6 +42,14 @@ public readonly struct DecodedInst
     public ulong? NearBranchTarget { get; }
 
     public ulong? MemoryAddress { get; }
+
+    /// <summary>
+    /// True when the instruction has a RIP-relative memory operand (<c>[rip+disp]</c>).
+    /// Such an instruction is position-dependent: relocating its bytes verbatim to a
+    /// different address changes what it references, so a code-detour relocator must
+    /// reject it (or fix up the displacement) rather than copy it.
+    /// </summary>
+    public bool IsRipRelative { get; }
 
     public byte[] Bytes { get; }
 }

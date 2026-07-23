@@ -211,7 +211,28 @@ public static class KernelSyncOnAddressCompatExports
         // sceKernelSignalSema's unbounded-signal handling elsewhere in this file's
         // sibling exports).
         var maxCount = count < 0 ? int.MaxValue : count;
-        var woke = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(address), maxCount);
+        var woke = SignalAddressWaiters(address, maxCount);
+
+        if (_traceSyncAddr) TraceSyncAddr($"wake addr=0x{address:X16} count={count} cooperative_woken={woke} {FormatCallSite(ctx)}");
+        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+    }
+
+    /// <summary>
+    /// Posts the producer half of the sync-on-address (futex) protocol: wakes any thread
+    /// parked in <see cref="SyncOnAddressWait"/> on <paramref name="address"/>. Extracted from
+    /// <see cref="SyncOnAddressWake"/> so I/O-completion paths that write a value a waiter is
+    /// polling (an AMPR write-address completion, an AIO result store) can post the matching wake
+    /// — writing the watched memory alone never releases a parked waiter. Spurious wakes are
+    /// harmless: the waiter re-checks its pattern and re-parks. A zero address is a no-op.
+    /// </summary>
+    internal static int SignalAddressWaiters(ulong address, int maxCount = int.MaxValue)
+    {
+        if (address == 0)
+        {
+            return 0;
+        }
+
+        var woke = GuestThreadExecution.Scheduler?.WakeBlockedThreads(GetWakeKey(address), maxCount) ?? 0;
 
         // Bumped before pulsing so a host-thread waiter's generation recheck (either already
         // under the gate's lock, or about to enter it) always observes this wake, even if it
@@ -226,8 +247,7 @@ public static class KernelSyncOnAddressCompatExports
             }
         }
 
-        if (_traceSyncAddr) TraceSyncAddr($"wake addr=0x{address:X16} count={count} cooperative_woken={woke} {FormatCallSite(ctx)}");
-        return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+        return woke;
     }
 
     private static int SetReturn(CpuContext ctx, OrbisGen2Result result)

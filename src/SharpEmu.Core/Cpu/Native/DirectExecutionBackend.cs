@@ -762,6 +762,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly nint ImportGatewayPtr = ResolveWin64CallbackPtr(
 		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance));
 
+	// Signal-free guest execution logger (SHARPEMU_GUEST_HOOK). A planted E9 detour
+	// enters a per-hook trampoline in ordinary preemptive guest context and calls this
+	// gateway (Win64 ABI, like the import gateway) to record the register snapshot.
+	private delegate void GuestHookGatewayDelegate(nint backendHandle, int hookIndex, nint snapshotPtr);
+	private static readonly GuestHookGatewayDelegate GuestHookGatewayDelegateInstance = GuestHookGatewayManaged;
+	private static readonly nint HookGatewayPtr = ResolveWin64CallbackPtr(
+		Marshal.GetFunctionPointerForDelegate(GuestHookGatewayDelegateInstance));
+
 	// Emitted trampolines call managed callbacks with the Win64 ABI. On
 	// Windows the runtime already compiles them that way; on POSIX .NET they
 	// are SysV, so route through a Win64->SysV thunk.
@@ -1193,6 +1201,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			CreateTlsHandler();
 			PatchTlsPatterns();
+			InstallGuestExecHooks();
+			SharpEmu.HLE.MemPollWatch.Start();
 			return ExecuteEntry(context, entryPoint, out result);
 		}
 		catch (Exception ex)
@@ -2570,6 +2580,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return null;
 	}
 
+	// Allocate a trampoline page strictly BELOW the given anchor (a stable in-image address)
+	// but within rel32 of it. Anchoring on the hook address — NOT the entry point, which can
+	// sit past the image near the PRX-module region — keeps the page in the gap between the
+	// guest image base and the guest thread stacks. The guest module loader maps PRX modules
+	// ABOVE the image, so an above-image page gets clobbered/reprotected mid-run (a DEP fault
+	// when the detour later jumps into it); the below-image gap is never targeted by
+	// guest/module allocations, so a write-once detour there survives for the whole run.
+	private unsafe void* TryAllocateBelowAnchor(ulong anchor, nuint size)
+	{
+		ulong baseAddress = anchor & 0xFFFFFFFFFFFF0000uL;
+		// Start ~128 MB below the anchor: the guest allocator grows DOWNWARD from just below
+		// the image base and will clobber a page only a few MB below it, but does not reach
+		// this far (the surviving TLS-handler page sits ~16 MB below the base). Scan 128 MB ..
+		// 1.5 GB below, in 16 MB steps — all comfortably within an E9 rel32 reach.
+		for (long delta = 0x8000000L; delta <= 0x60000000L; delta += 0x1000000L)
+		{
+			if (TryAllocAt(baseAddress, -delta, size, out var memory))
+			{
+				return memory;
+			}
+		}
+		return null;
+	}
+
 	private unsafe static bool TryAllocAt(ulong baseAddress, long signedDelta, nuint size, out void* memory)
 	{
 		memory = null;
@@ -2982,6 +3016,210 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)instructionLength);
 		}
 		return true;
+	}
+
+	// Sibling of PatchCallSite that writes an E9 rel32 (jmp) rather than E8 (call), so
+	// the guest stack/red zone is untouched at the detour — used by the signal-free guest
+	// execution logger (SHARPEMU_GUEST_HOOK). The trampoline itself re-executes the
+	// clobbered instructions and jmps back, so control returns transparently.
+	private unsafe bool PatchJmpSite(nint address, int clobberedLen, nint target)
+	{
+		if (clobberedLen < 5)
+		{
+			return false;
+		}
+		uint flNewProtect = default(uint);
+		if (!VirtualProtect((void*)address, (nuint)clobberedLen, 64u, &flNewProtect))
+		{
+			return false;
+		}
+		try
+		{
+			long rel = target - (address + 5);
+			if (rel < int.MinValue || rel > int.MaxValue)
+			{
+				Console.Error.WriteLine($"[HOOK][WARNING] jmp patch out of rel32 range at 0x{address:X16}");
+				return false;
+			}
+			*(byte*)address = 0xE9;
+			*(int*)(address + 1) = (int)rel;
+			for (int i = 5; i < clobberedLen; i++)
+			{
+				*(byte*)(address + i) = 0x90;
+			}
+		}
+		finally
+		{
+			VirtualProtect((void*)address, (nuint)clobberedLen, flNewProtect, &flNewProtect);
+			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)clobberedLen);
+		}
+		return true;
+	}
+
+	// Builds a per-hook trampoline for the signal-free execution logger. Mirrors
+	// CreateImportHandlerTrampoline's guest-state-save / host-RSP-switch / Win64-gateway-call
+	// structure, but is fully transparent: it snapshots ALL guest GPRs + RFLAGS onto a stack
+	// frame, calls GuestHookGatewayManaged (which records the snapshot), restores state
+	// byte-for-byte, re-executes a verbatim copy of the clobbered original instructions, then
+	// jmps back to hookAddress + clobberedLen. The snapshot frame layout MUST match
+	// GuestExecLogger's *Off constants. Returns 0 on failure.
+	private unsafe nint CreateGuestHookTrampoline(int hookIndex, ulong hookAddress, byte[] relocatedBytes, int clobberedLen)
+	{
+		// Below the image (see TryAllocateBelowAnchor), anchored on the hook address, so a later
+		// PRX module load (mapped above the image) can't clobber it.
+		void* ptr = TryAllocateBelowAnchor(hookAddress, 512u);
+		if (ptr == null)
+		{
+			return 0;
+		}
+		_guestHookTrampolines.Add((nint)ptr);
+		try
+		{
+			byte* p = (byte*)ptr;
+			int n = 0;
+
+			// --- Entry: guest state fully live, flags = guest's, rsp = original guest rsp ---
+			// lea rsp,[rsp-0x100]  (skip red zone; LEA => no flags touched)
+			p[n++] = 0x48; p[n++] = 0x8D; p[n++] = 0xA4; p[n++] = 0x24; *(uint*)(p + n) = 0xFFFFFF00u; n += 4;
+			p[n++] = 0x9C;                                        // pushfq
+			p[n++] = 0x50; p[n++] = 0x51; p[n++] = 0x52; p[n++] = 0x53; // push rax,rcx,rdx,rbx
+			p[n++] = 0x55; p[n++] = 0x56; p[n++] = 0x57;               // push rbp,rsi,rdi
+			p[n++] = 0x41; p[n++] = 0x50;                        // push r8
+			p[n++] = 0x41; p[n++] = 0x51;                        // push r9
+			p[n++] = 0x41; p[n++] = 0x52;                        // push r10
+			p[n++] = 0x41; p[n++] = 0x53;                        // push r11
+			p[n++] = 0x41; p[n++] = 0x54;                        // push r12
+			p[n++] = 0x41; p[n++] = 0x55;                        // push r13
+			p[n++] = 0x41; p[n++] = 0x56;                        // push r14
+			p[n++] = 0x41; p[n++] = 0x57;                        // push r15
+			p[n++] = 0x49; p[n++] = 0x89; p[n++] = 0xE4;         // mov r12, rsp  (frame-low; r12 guest val already saved)
+
+			// --- Resolve host RSP slot (TlsGetValue) on the guest stack, exactly as imports do ---
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xEC; p[n++] = 0x28; // sub rsp,0x28
+			p[n++] = 0xB9; *(uint*)(p + n) = _hostRspSlotTlsIndex; n += 4; // mov ecx, tlsIndex
+			p[n++] = 0x48; p[n++] = 0xB8; *(long*)(p + n) = _tlsGetValueAddress; n += 8; // mov rax, TlsGetValue
+			p[n++] = 0xFF; p[n++] = 0xD0;                        // call rax
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xC4; p[n++] = 0x28; // add rsp,0x28
+			p[n++] = 0x49; p[n++] = 0x89; p[n++] = 0xC3;         // mov r11, rax
+			p[n++] = 0x48; p[n++] = 0x85; p[n++] = 0xC0;         // test rax, rax
+			p[n++] = 0x74; int jzRel8At = n; p[n++] = 0x00;      // jz -> restore (bare thread: skip capture)
+
+			// --- Switch to host stack + call the managed gateway ---
+			p[n++] = 0x49; p[n++] = 0x8B; p[n++] = 0x23;         // mov rsp,[r11]
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xEC; p[n++] = 0x38; // sub rsp,0x38
+			p[n++] = 0x4C; p[n++] = 0x89; p[n++] = 0x64; p[n++] = 0x24; p[n++] = 0x28; // mov [rsp+0x28], r12
+			p[n++] = 0x48; p[n++] = 0xB9; *(long*)(p + n) = _selfHandlePtr; n += 8;    // mov rcx, selfHandle
+			p[n++] = 0xBA; *(int*)(p + n) = hookIndex; n += 4;   // mov edx, hookIndex
+			p[n++] = 0x4D; p[n++] = 0x89; p[n++] = 0xE0;         // mov r8, r12  (snapshot frame-low)
+			p[n++] = 0x48; p[n++] = 0xB8; *(long*)(p + n) = (long)HookGatewayPtr; n += 8; // mov rax, HookGatewayPtr
+			p[n++] = 0xFF; p[n++] = 0xD0;                        // call rax
+			p[n++] = 0x4C; p[n++] = 0x8B; p[n++] = 0x64; p[n++] = 0x24; p[n++] = 0x28; // mov r12,[rsp+0x28]
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xC4; p[n++] = 0x38; // add rsp,0x38
+
+			// --- Restore label ---
+			int restoreAt = n;
+			p[jzRel8At] = (byte)(restoreAt - (jzRel8At + 1)); // backpatch jz rel8
+
+			// Restore guest state. Every flags-clobbering step above precedes this popfq,
+			// so the flags a relocated cmp/arith produces (and the flags the guest resumes
+			// with) are the guest's own.
+			p[n++] = 0x4C; p[n++] = 0x89; p[n++] = 0xE4;         // mov rsp, r12  (-> frame-low)
+			p[n++] = 0x41; p[n++] = 0x5F;                        // pop r15
+			p[n++] = 0x41; p[n++] = 0x5E;                        // pop r14
+			p[n++] = 0x41; p[n++] = 0x5D;                        // pop r13
+			p[n++] = 0x41; p[n++] = 0x5C;                        // pop r12
+			p[n++] = 0x41; p[n++] = 0x5B;                        // pop r11
+			p[n++] = 0x41; p[n++] = 0x5A;                        // pop r10
+			p[n++] = 0x41; p[n++] = 0x59;                        // pop r9
+			p[n++] = 0x41; p[n++] = 0x58;                        // pop r8
+			p[n++] = 0x5F; p[n++] = 0x5E; p[n++] = 0x5D;         // pop rdi,rsi,rbp
+			p[n++] = 0x5B; p[n++] = 0x5A; p[n++] = 0x59; p[n++] = 0x58; // pop rbx,rdx,rcx,rax
+			p[n++] = 0x9D;                                       // popfq
+			p[n++] = 0x48; p[n++] = 0x8D; p[n++] = 0xA4; p[n++] = 0x24; *(uint*)(p + n) = 0x00000100u; n += 4; // lea rsp,[rsp+0x100]
+
+			// --- Relocated clobber (verbatim; validated position-independent) ---
+			for (int i = 0; i < relocatedBytes.Length; i++)
+			{
+				p[n++] = relocatedBytes[i];
+			}
+
+			// --- jmp rel32 back to hookAddress + clobberedLen ---
+			p[n++] = 0xE9;
+			long back = (long)(hookAddress + (ulong)clobberedLen) - ((long)(nint)p + n + 4);
+			if (back < int.MinValue || back > int.MaxValue)
+			{
+				Console.Error.WriteLine($"[HOOK][WARNING] trampoline jmp-back out of rel32 range for 0x{hookAddress:X16}");
+				return 0;
+			}
+			*(int*)(p + n) = (int)back; n += 4;
+
+			Debug.Assert(n <= 512, "Guest hook trampoline exceeded its allocation.");
+			uint prot = default(uint);
+			VirtualProtect(ptr, 512u, 32u, &prot);
+			FlushInstructionCache(GetCurrentProcess(), ptr, 512u);
+			return (nint)ptr;
+		}
+		catch
+		{
+			return 0;
+		}
+	}
+
+	// Installs the signal-free execution-logger detours once, single-threaded, before guest
+	// threads spin up (called right after PatchTlsPatterns). Inert unless SHARPEMU_GUEST_HOOK
+	// is set. Write-once: each site gets a single E9 and is never mutated again, so it is safe
+	// even on hot multi-threaded code (no cross-modifying-code hazard).
+	// Hook trampolines live in their OWN list, NOT _importHandlerTrampolines: the setup path
+	// can run more than once, and each SetupImportStubs frees every _importHandlerTrampolines
+	// entry — which would free a hook trampoline out from under its still-installed E9 detour
+	// (a later re-run skips re-arming because the site already holds the jmp), leaving the
+	// detour pointing at a freed page. These are never freed until teardown.
+	private readonly List<nint> _guestHookTrampolines = new List<nint>();
+
+	private unsafe void InstallGuestExecHooks()
+	{
+		if (!SharpEmu.HLE.GuestExecLogger.Enabled)
+		{
+			return;
+		}
+
+		var addresses = SharpEmu.HLE.GuestExecLogger.Addresses;
+		for (int i = 0; i < addresses.Count; i++)
+		{
+			ulong addr = addresses[i];
+
+			// Only patch a committed, non-free region — a bogus user-supplied address must
+			// never fault the setup path.
+			if (VirtualQuery((void*)addr, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				mbi.State == 65536u)
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: address not mapped");
+				continue;
+			}
+
+			var site = new ReadOnlySpan<byte>((void*)addr, 24);
+			if (!SharpEmu.Core.Cpu.Disasm.GuestHookRelocator.TryPlan(site, addr, out int clobberedLen, out byte[] reloc, out string? reject))
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: {reject}");
+				continue;
+			}
+
+			nint tramp = CreateGuestHookTrampoline(i, addr, reloc, clobberedLen);
+			if (tramp == 0)
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: trampoline alloc failed");
+				continue;
+			}
+
+			if (PatchJmpSite((nint)addr, clobberedLen, tramp))
+			{
+				Console.Error.WriteLine($"[HOOK][INFO] armed 0x{addr:X} -> tramp 0x{tramp:X16} clobber={clobberedLen}");
+			}
+			else
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: patch failed");
+			}
+		}
 	}
 
 	private unsafe void TryPreReservePrtAperture(ulong baseAddress, ulong size)

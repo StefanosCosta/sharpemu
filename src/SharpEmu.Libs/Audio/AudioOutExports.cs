@@ -55,7 +55,7 @@ public static class AudioOutExports
         public int Channels { get; }
         public int BytesPerSample { get; }
         public bool IsFloat { get; }
-        public IHostAudioStream? Backend { get; }
+        public IHostAudioStream? Backend { get; private set; }
         public volatile float Volume = 1.0f;
         public int BufferByteLength =>
             checked((int)BufferLength * Channels * BytesPerSample);
@@ -81,6 +81,17 @@ public static class AudioOutExports
             {
                 Thread.Sleep(TimeSpan.FromSeconds((double)delay / Stopwatch.Frequency));
             }
+        }
+
+        // Host shutdown: release the ALSA/host stream but keep the port alive so
+        // sceAudioOutOutput still takes the null-backend PaceSilence path. Dropping
+        // the port entirely would let Output return instantly with no pacing,
+        // removing the backpressure that drains a guest audio engine's ring buffer
+        // (FMOD's producer semaphore then saturates and its thread busy-spins).
+        public void EnterShutdownPacing()
+        {
+            Backend?.Dispose();
+            Backend = null;
         }
 
         public void Dispose() => Backend?.Dispose();
@@ -353,12 +364,12 @@ public static class AudioOutExports
     public static void ShutdownAllPorts()
     {
         Volatile.Write(ref _shutdown, true);
-        foreach (var handle in Ports.Keys)
+        // Keep the ports registered but release their host backends: a guest audio
+        // thread still draining its last buffers then keeps pacing through the
+        // null-backend PaceSilence path instead of spinning on an unpaced Output.
+        foreach (var port in Ports.Values)
         {
-            if (Ports.TryRemove(handle, out var port))
-            {
-                port.Dispose();
-            }
+            port.EnterShutdownPacing();
         }
     }
 

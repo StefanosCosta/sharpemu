@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
@@ -118,6 +120,20 @@ public sealed unsafe partial class DirectExecutionBackend
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
 		SharpEmu.HLE.GuestSingleStepTracer.WarmUp();
 		SharpEmu.HLE.GuestAddrWriteCatcher.WarmUp();
+		SharpEmu.HLE.GuestRipBreakpoint.WarmUp();
+
+		// A code-trap tool (INT3 breakpoint / single-step) plants a SIGTRAP that can
+		// fire while a guest thread runs on a freshly continuation-resumed runner
+		// thread. The Core continuation-resume chain is never in ModuleManager's
+		// HLE-only warm sweep, so its first resume JITs lazily; if a SIGTRAP intersects
+		// a still-cold method there the JIT runs in the signal frame and fail-fasts
+		// ("UnmanagedCallersOnly method from managed code"). Pre-JIT the chain when a
+		// trap tool is active so no such method is cold under the signal. Gated, so a
+		// normal run's warm set is unchanged.
+		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled || SharpEmu.HLE.GuestSingleStepTracer.Enabled)
+		{
+			WarmUpContinuationResumeChain();
+		}
 
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
@@ -190,6 +206,51 @@ public sealed unsafe partial class DirectExecutionBackend
 		finally
 		{
 			_posixSignalWarmup = false;
+		}
+	}
+
+	/// <summary>
+	/// Pre-JIT the guest-thread continuation-resume chain so none of it compiles
+	/// lazily on a runner thread while a code-trap SIGTRAP is pending. Only invoked
+	/// when a breakpoint/single-step tool is enabled (a diagnostic run); a normal run
+	/// leaves these methods to JIT on first use as before. Best-effort: a failed
+	/// PrepareMethod (e.g. an unexpected overload/signature) is swallowed so it can
+	/// never break handler installation.
+	/// </summary>
+	private static void WarmUpContinuationResumeChain()
+	{
+		var t = typeof(DirectExecutionBackend);
+		string[] names =
+		{
+			// Fresh guest-thread entry path (RunGuestThread → ExecuteGuestThreadEntry)
+			// AND the blocked-continuation resume path — a SIGTRAP can interrupt guest
+			// code entered via either, so warm both entry chains, not just continuation.
+			nameof(ExecuteGuestThreadEntry),
+			nameof(ExecuteBlockedGuestThreadContinuation),
+			nameof(ApplyGuestContinuation),
+			nameof(ExecuteGuestContinuationEntry),
+			nameof(CallNativeEntry),
+			nameof(RestoreActiveExecutionThread),
+			nameof(BindTlsBase),
+			nameof(EmitHostNonvolatileXmmSave),
+		};
+		foreach (var name in names)
+		{
+			foreach (var m in t.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+			{
+				if (m.Name != name || m.IsGenericMethodDefinition)
+				{
+					continue;
+				}
+				try
+				{
+					RuntimeHelpers.PrepareMethod(m.MethodHandle);
+				}
+				catch
+				{
+					// Warming is best-effort; never let it abort handler setup.
+				}
+			}
 		}
 	}
 

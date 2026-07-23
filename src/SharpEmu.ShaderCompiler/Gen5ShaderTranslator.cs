@@ -80,7 +80,7 @@ public static class Gen5ShaderTranslator
     public static bool IsScalarConsumed(ulong[] mask, uint register) =>
         register < 256 && (mask[register >> 6] & (1UL << (int)(register & 63))) != 0;
 
-    private const int MaxInstructions = 4096;
+    private const int MaxInstructions = 16384;
     private const uint PsUserDataRegister = 0x0C;
     private const uint VsUserDataRegister = 0x4C;
     private const uint GsUserDataRegister = 0x8C;
@@ -303,6 +303,23 @@ public static class Gen5ShaderTranslator
             (rsrc2 & (1u << 27)) != 0)
         {
             count |= 0x20;
+        }
+
+        // Primary SH defaults leave SPI_SHADER_PGM_RSRC2_PS at 0. Draws that
+        // still wrote USER_DATA_n via SetShReg would otherwise translate with
+        // an empty SRT window (Astro title PS → Address-0 descriptors →
+        // device lost). Recover the window from contiguous live registers.
+        if (count == 0 &&
+            userDataBaseRegister is not ComputeUserDataRegister)
+        {
+            var probed = 0;
+            while (probed < MaximumHardwareUserSgprs &&
+                   shaderRegisters.ContainsKey(userDataBaseRegister + (uint)probed))
+            {
+                probed++;
+            }
+
+            count = probed;
         }
 
         if (userDataBaseRegister is not (PsUserDataRegister or

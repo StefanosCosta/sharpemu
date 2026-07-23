@@ -54,6 +54,14 @@ internal sealed record VulkanOffscreenGuestDraw(
     bool PublishTarget,
     ulong ShaderAddress);
 
+internal sealed record VulkanOffscreenColorClear(
+    IReadOnlyList<GuestRenderTarget> Targets,
+    float Red,
+    float Green,
+    float Blue,
+    float Alpha,
+    ulong ShaderAddress);
+
 internal sealed record VulkanComputeGuestDispatch(
     ulong ShaderAddress,
     byte[] ComputeSpirv,
@@ -1267,6 +1275,67 @@ internal static unsafe class VulkanVideoPresenter
         }
     }
 
+    /// <summary>
+    /// Apply a solid color clear to offscreen guest render targets without a
+    /// graphics pipeline. Used for empty-SRT procedural clear draws that
+    /// otherwise lose the device on QueueSubmit with Address-0 descriptors.
+    /// </summary>
+    internal static void SubmitOffscreenColorClear(
+        IReadOnlyList<GuestRenderTarget> targets,
+        float red,
+        float green,
+        float blue,
+        float alpha,
+        ulong shaderAddress = 0)
+    {
+        if (targets.Count == 0 ||
+            targets.Count > 8 ||
+            AnyRenderTargetInvalid(targets))
+        {
+            return;
+        }
+
+        var firstTarget = targets[0];
+        if (RenderTargetsMismatchedOrAliased(targets, firstTarget))
+        {
+            Console.Error.WriteLine(
+                "[LOADER][WARN] Vulkan skipped MRT color clear with mismatched dimensions or aliased targets.");
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_closed)
+            {
+                return;
+            }
+
+            foreach (var target in targets)
+            {
+                var guestTextureFormat = GetGuestTextureFormat(
+                    target.Format,
+                    target.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    _availableGuestImages[target.Address] = guestTextureFormat;
+                }
+            }
+
+            var workSequence = EnqueueGuestWorkLocked(
+                new VulkanOffscreenColorClear(
+                    targets.ToArray(),
+                    red,
+                    green,
+                    blue,
+                    alpha,
+                    shaderAddress));
+            foreach (var target in targets)
+            {
+                _guestImageWorkSequences[target.Address] = workSequence;
+            }
+        }
+    }
+
     internal static void SubmitGuestImageWrite(ulong address, byte[] pixels)
     {
         lock (_gate)
@@ -2274,7 +2343,6 @@ internal static unsafe class VulkanVideoPresenter
                 if (IsGuestWorkCompletedLocked(pending.RequiredGuestWorkSequence))
                 {
                     presentation = _pendingGuestImagePresentations.Dequeue();
-                    TryReplaceWithBinkFrame(ref presentation);
                     return true;
                 }
 
@@ -2307,27 +2375,8 @@ internal static unsafe class VulkanVideoPresenter
             }
 
             presentation = latest;
-            TryReplaceWithBinkFrame(ref presentation);
             return true;
         }
-    }
-
-    private static void TryReplaceWithBinkFrame(ref Presentation presentation)
-    {
-        if (!Bink2MovieBridge.TryDecodeNextFrame(out var pixels, out var width, out var height))
-        {
-            return;
-        }
-
-        presentation = new Presentation(
-            pixels,
-            width,
-            height,
-            presentation.Sequence,
-            GuestDrawKind.None,
-            TranslatedDraw: null,
-            presentation.RequiredGuestWorkSequence,
-            IsSplash: false);
     }
 
     private static readonly HashSet<long> _tracedGuestImagePresentRejections = new();
@@ -2894,6 +2943,40 @@ internal static unsafe class VulkanVideoPresenter
         private VkBuffer _stagingBuffer;
         private DeviceMemory _stagingMemory;
         private ulong _stagingSize;
+        private VkBuffer[] _frameUploadBuffers = [];
+        private DeviceMemory[] _frameUploadMemory = [];
+        private nint[] _frameUploadMapped = [];
+        private Image _hostMovieImage;
+        private DeviceMemory _hostMovieImageMemory;
+        private ImageView _hostMovieImageView;
+        private uint _hostMovieImageWidth;
+        private uint _hostMovieImageHeight;
+        private Format _hostMovieImageFormat;
+        private uint _hostMovieImageDstSelect;
+        private bool _hostMovieImageInitialized;
+        private Image _hostMovieChromaImage;
+        private DeviceMemory _hostMovieChromaImageMemory;
+        private ImageView _hostMovieChromaImageView;
+        private uint _hostMovieChromaImageWidth;
+        private uint _hostMovieChromaImageHeight;
+        private uint _hostMovieChromaImageDstSelect;
+        private bool _hostMovieChromaImageInitialized;
+        private byte[]? _hostMovieFramePixels;
+        private byte[]? _hostMovieLumaPixels;
+        private byte[]? _hostMovieChromaPixels;
+        private uint _hostMovieFrameWidth;
+        private uint _hostMovieFrameHeight;
+        private long _hostMovieFrameSerial;
+        private long _hostMovieConvertedFrameSerial = -1;
+        private long _hostMovieLumaUploadedFrameSerial = -1;
+        private long _hostMovieChromaUploadedFrameSerial = -1;
+        private string? _hostMovieFramePath;
+        private ulong _hostMovieLumaTextureAddress;
+        private ulong _hostMovieChromaTextureAddress;
+        private uint _hostMovieLumaDstSelect;
+        private uint _hostMovieChromaDstSelect;
+        private readonly HashSet<string> _tracedHostMovieTextureBindings =
+            new(StringComparer.Ordinal);
         // Perf overlay: CPU-rasterized panel copied through per-slot staging
         // buffers into one image, then blitted onto the swapchain.
         private Image _overlayImage;
@@ -2919,6 +3002,13 @@ internal static unsafe class VulkanVideoPresenter
         private readonly System.Collections.Concurrent.ConcurrentQueue<GuestImageResource> _pendingAliasImageDumps = new();
         private bool _deviceLost;
         private bool _deviceLostLogged;
+        // Last guest work the render thread entered; included in device-lost
+        // reports so QueueSubmit faults name the offending dispatch/draw.
+        private string _activeGuestWorkLabel = string.Empty;
+        // Survives the per-work finally clear: batched submits often flush
+        // after the label is reset (queue switch / end-of-drain).
+        private string _lastGuestWorkLabel = string.Empty;
+        private string _lastSubmitDebugName = string.Empty;
         private int _directPresentationCount;
         private readonly Dictionary<ulong, long> _presentedGuestImageTraceCounts = new();
         private readonly Dictionary<ulong, GuestImageResource> _guestImages = new();
@@ -3086,6 +3176,9 @@ internal static unsafe class VulkanVideoPresenter
             public bool OwnsStorage;
             public bool IsStorage;
             public bool Cached;
+            public bool IsHostMovie;
+            public int HostMoviePlane = -1;
+            public long HostMovieFrameSerial;
             public ulong CpuContentFingerprint;
             public bool UpdatesCpuContent;
             public GuestSampler SamplerState;
@@ -4387,6 +4480,7 @@ internal static unsafe class VulkanVideoPresenter
             var surfaceFormat = ChooseSurfaceFormat(formats);
             _swapchainFormat = surfaceFormat.Format;
             _extent = ChooseExtent(capabilities);
+            Bink2MovieBridge.SetPresentationSize(_extent.Width, _extent.Height);
             var presentMode = ChoosePresentMode();
             var imageCount = capabilities.MinImageCount + 1;
             if (capabilities.MaxImageCount != 0)
@@ -4533,6 +4627,7 @@ internal static unsafe class VulkanVideoPresenter
             _presentationCommandBuffer = _commandBuffer;
 
             CreateStagingBuffer((ulong)_extent.Width * _extent.Height * 4);
+            CreateFrameUploadBuffers(_stagingSize);
             CreateOverlayResources();
         }
 
@@ -4924,9 +5019,14 @@ internal static unsafe class VulkanVideoPresenter
                     CommandBufferCount = 1,
                     PCommandBuffers = &commandBuffer,
                 };
+                var submitContext = ResolveGuestSubmitContext(resources);
+                _lastSubmitDebugName = submitContext;
+                var submitLabel = string.IsNullOrEmpty(submitContext)
+                    ? "vkQueueSubmit(guest)"
+                    : $"vkQueueSubmit(guest) during {submitContext}";
                 Check(
                     _vk.QueueSubmit(_queue, 1, &submitInfo, fence),
-                    "vkQueueSubmit(guest)");
+                    submitLabel);
             }
             catch
             {
@@ -5079,6 +5179,17 @@ internal static unsafe class VulkanVideoPresenter
                 if (result == Result.ErrorDeviceLost)
                 {
                     _deviceLost = true;
+                    if (!_deviceLostLogged)
+                    {
+                        _deviceLostLogged = true;
+                        var work = !string.IsNullOrEmpty(_lastGuestWorkLabel)
+                            ? $"last_work={_lastGuestWorkLabel}"
+                            : "work=<none>";
+                        Console.Error.WriteLine(
+                            "[LOADER][ERROR] Vulkan device lost; dropping subsequent guest GPU work. " +
+                            $"{work} last_submit={oldest.DebugName} " +
+                            "vkWaitForFences(guest) failed with ErrorDeviceLost.");
+                    }
                 }
                 else
                 {
@@ -6135,10 +6246,15 @@ internal static unsafe class VulkanVideoPresenter
                     }
                 }
 
+                var hostMovieTextures = FindHostMovieTextureBindings(draw.Textures);
                 for (var index = 0; index < draw.Textures.Count; index++)
                 {
                     var texture = draw.Textures[index];
-                    var resolved = ResolveTextureResource(texture);
+                    var resolved = index == hostMovieTextures.Luma
+                        ? CreateHostMovieTextureResource(texture, plane: 0)
+                        : index == hostMovieTextures.Chroma
+                            ? CreateHostMovieTextureResource(texture, plane: 1)
+                            : ResolveTextureResource(texture);
                     var feedbackTarget = !texture.IsStorage
                         ? feedbackTargets?.FirstOrDefault(target =>
                             ReferenceEquals(resolved.GuestImage, target))
@@ -6992,6 +7108,343 @@ internal static unsafe class VulkanVideoPresenter
                 _vk.DestroyShaderModule(_device, computeModule, null);
             }
         }
+
+        private void PumpHostMovieFrame()
+        {
+            if (!Bink2MovieBridge.TryDecodeNextFrame(
+                    advanceClock: _hostMovieLumaTextureAddress != 0 &&
+                                  _hostMovieChromaTextureAddress != 0,
+                    out var pixels,
+                    out var width,
+                    out var height,
+                    out var advanced,
+                    out var frameSerial,
+                    out var hostPath))
+            {
+                // Keep the last decoded image until a replacement arrives.
+                // Movie sessions are queued asynchronously; clearing here
+                // exposes the guest decoder's neutral surfaces between the
+                // final frame of one movie and the first frame of the next.
+                return;
+            }
+
+            if (!string.Equals(
+                    _hostMovieFramePath,
+                    hostPath,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _hostMovieFramePath = hostPath;
+                _hostMovieLumaTextureAddress = 0;
+                _hostMovieChromaTextureAddress = 0;
+                _hostMovieLumaDstSelect = 0;
+                _hostMovieChromaDstSelect = 0;
+                _hostMovieConvertedFrameSerial = -1;
+                _hostMovieLumaUploadedFrameSerial = -1;
+                _hostMovieChromaUploadedFrameSerial = -1;
+            }
+
+            if (!advanced && _hostMovieFramePixels is not null)
+            {
+                return;
+            }
+
+            _hostMovieFramePixels = pixels;
+            _hostMovieFrameWidth = width;
+            _hostMovieFrameHeight = height;
+            _hostMovieFrameSerial = frameSerial;
+        }
+
+        private readonly record struct HostMovieTextureBindings(int Luma, int Chroma)
+        {
+            public static HostMovieTextureBindings None { get; } = new(-1, -1);
+        }
+
+        private HostMovieTextureBindings FindHostMovieTextureBindings(
+            IReadOnlyList<GuestDrawTexture> textures)
+        {
+            if (_hostMovieFramePixels is null ||
+                _hostMovieFrameWidth == 0 ||
+                _hostMovieFrameHeight == 0)
+            {
+                return HostMovieTextureBindings.None;
+            }
+
+            if (_hostMovieLumaTextureAddress != 0 &&
+                _hostMovieChromaTextureAddress != 0)
+            {
+                var lumaIndex = -1;
+                var chromaIndex = -1;
+                for (var index = 0; index < textures.Count; index++)
+                {
+                    if (textures[index].Address == _hostMovieLumaTextureAddress)
+                    {
+                        lumaIndex = index;
+                    }
+                    else if (textures[index].Address == _hostMovieChromaTextureAddress)
+                    {
+                        chromaIndex = index;
+                    }
+                }
+
+                if (lumaIndex >= 0 && chromaIndex >= 0)
+                {
+                    return RememberHostMovieTextureMappings(
+                        textures,
+                        lumaIndex,
+                        chromaIndex);
+                }
+
+                // Bluepoint alternates decoder output between multiple Y/UV
+                // surface pairs. Fall through and discover the active pair
+                // instead of sampling the stale guest surface on every other
+                // movie draw.
+            }
+
+            var bestLumaIndex = -1;
+            var bestChromaIndex = -1;
+            ulong bestArea = 0;
+            for (var lumaIndex = 0; lumaIndex < textures.Count; lumaIndex++)
+            {
+                var luma = textures[lumaIndex];
+                if (!IsHostMovieLumaCandidate(luma))
+                {
+                    continue;
+                }
+
+                for (var chromaIndex = 0; chromaIndex < textures.Count; chromaIndex++)
+                {
+                    var chroma = textures[chromaIndex];
+                    if (!IsHostMovieChromaCandidate(luma, chroma))
+                    {
+                        continue;
+                    }
+
+                    var area = (ulong)luma.Width * luma.Height;
+                    if (bestLumaIndex < 0 || area > bestArea)
+                    {
+                        bestLumaIndex = lumaIndex;
+                        bestChromaIndex = chromaIndex;
+                        bestArea = area;
+                    }
+                }
+            }
+
+            if (bestLumaIndex < 0 || bestChromaIndex < 0)
+            {
+                return HostMovieTextureBindings.None;
+            }
+
+            var lumaTexture = textures[bestLumaIndex];
+            var chromaTexture = textures[bestChromaIndex];
+            _hostMovieLumaTextureAddress = lumaTexture.Address;
+            _hostMovieChromaTextureAddress = chromaTexture.Address;
+            _hostMovieLumaDstSelect = lumaTexture.DstSelect;
+            _hostMovieChromaDstSelect = chromaTexture.DstSelect;
+            var traceKey =
+                $"{_hostMovieFramePath}|{lumaTexture.Address:X16}|{chromaTexture.Address:X16}";
+            if (_tracedHostMovieTextureBindings.Add(traceKey))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][INFO] Bink2 YUV textures bound: " +
+                    $"{Path.GetFileName(_hostMovieFramePath)} " +
+                    $"y={bestLumaIndex}:0x{lumaTexture.Address:X16}:" +
+                    $"{lumaTexture.Width}x{lumaTexture.Height}:dst=0x{lumaTexture.DstSelect:X} " +
+                    $"uv={bestChromaIndex}:0x{chromaTexture.Address:X16}:" +
+                    $"{chromaTexture.Width}x{chromaTexture.Height}:dst=0x{chromaTexture.DstSelect:X} " +
+                    $"host={_hostMovieFrameWidth}x{_hostMovieFrameHeight}.");
+            }
+
+            return new HostMovieTextureBindings(bestLumaIndex, bestChromaIndex);
+        }
+
+        private HostMovieTextureBindings RememberHostMovieTextureMappings(
+            IReadOnlyList<GuestDrawTexture> textures,
+            int lumaIndex,
+            int chromaIndex)
+        {
+            _hostMovieLumaDstSelect = textures[lumaIndex].DstSelect;
+            _hostMovieChromaDstSelect = textures[chromaIndex].DstSelect;
+            return new HostMovieTextureBindings(lumaIndex, chromaIndex);
+        }
+
+        private bool IsHostMovieLumaCandidate(GuestDrawTexture texture)
+        {
+            if (texture.Address == 0 ||
+                texture.IsStorage ||
+                texture.IsFallback ||
+                texture.ArrayedView ||
+                texture.ArrayLayers > 1 ||
+                texture.Format != 1 ||
+                texture.NumberType != 0 ||
+                texture.Width < 1280 ||
+                texture.Height < 720)
+            {
+                return false;
+            }
+
+            var guestAspect = (ulong)texture.Width * _hostMovieFrameHeight;
+            var hostAspect = (ulong)texture.Height * _hostMovieFrameWidth;
+            var difference = guestAspect > hostAspect
+                ? guestAspect - hostAspect
+                : hostAspect - guestAspect;
+            return difference * 100 <= Math.Max(guestAspect, hostAspect) * 2;
+        }
+
+        private static bool IsHostMovieChromaCandidate(
+            GuestDrawTexture luma,
+            GuestDrawTexture chroma)
+        {
+            return chroma.Address != 0 &&
+                   chroma.Address != luma.Address &&
+                   !chroma.IsStorage &&
+                   !chroma.IsFallback &&
+                   !chroma.ArrayedView &&
+                   chroma.ArrayLayers <= 1 &&
+                   chroma.Format == 3 &&
+                   chroma.NumberType == 0 &&
+                   luma.Width == chroma.Width * 2 &&
+                   luma.Height == chroma.Height * 2;
+        }
+
+        private TextureResource CreateHostMovieTextureResource(
+            GuestDrawTexture texture,
+            int plane)
+        {
+            EnsureHostMovieYuvFrame();
+            var isLuma = plane == 0;
+            var pixels = isLuma ? _hostMovieLumaPixels! : _hostMovieChromaPixels!;
+            var width = isLuma
+                ? _hostMovieFrameWidth
+                : (_hostMovieFrameWidth + 1) / 2;
+            var height = isLuma
+                ? _hostMovieFrameHeight
+                : (_hostMovieFrameHeight + 1) / 2;
+            EnsureHostMovieImages(
+                _hostMovieFrameWidth,
+                _hostMovieFrameHeight,
+                _hostMovieLumaDstSelect,
+                (_hostMovieFrameWidth + 1) / 2,
+                (_hostMovieFrameHeight + 1) / 2,
+                _hostMovieChromaDstSelect);
+
+            var uploadedFrameSerial = isLuma
+                ? _hostMovieLumaUploadedFrameSerial
+                : _hostMovieChromaUploadedFrameSerial;
+            var needsUpload = uploadedFrameSerial != _hostMovieFrameSerial;
+            VkBuffer stagingBuffer = default;
+            DeviceMemory stagingMemory = default;
+            if (needsUpload)
+            {
+                (stagingBuffer, stagingMemory) = CreateTextureStagingBuffer(
+                    pixels,
+                    $"Bink2 frame {_hostMovieFrameSerial} plane {plane} staging");
+            }
+
+            return new TextureResource
+            {
+                Address = texture.Address,
+                StagingBuffer = stagingBuffer,
+                StagingMemory = stagingMemory,
+                Image = isLuma ? _hostMovieImage : _hostMovieChromaImage,
+                View = isLuma ? _hostMovieImageView : _hostMovieChromaImageView,
+                Width = width,
+                Height = height,
+                RowLength = width,
+                DstSelect = texture.DstSelect,
+                NeedsUpload = needsUpload,
+                IsHostMovie = true,
+                HostMoviePlane = plane,
+                HostMovieFrameSerial = _hostMovieFrameSerial,
+                SamplerState = texture.Sampler,
+            };
+        }
+
+        private void EnsureHostMovieYuvFrame()
+        {
+            if (_hostMovieConvertedFrameSerial == _hostMovieFrameSerial)
+            {
+                return;
+            }
+
+            var bgra = _hostMovieFramePixels ??
+                throw new InvalidOperationException("Host movie frame is unavailable.");
+            var width = checked((int)_hostMovieFrameWidth);
+            var height = checked((int)_hostMovieFrameHeight);
+            var chromaWidth = (width + 1) / 2;
+            var chromaHeight = (height + 1) / 2;
+            if (_hostMovieLumaPixels?.Length != width * height)
+            {
+                _hostMovieLumaPixels = GC.AllocateUninitializedArray<byte>(width * height);
+            }
+            if (_hostMovieChromaPixels?.Length != chromaWidth * chromaHeight * 2)
+            {
+                _hostMovieChromaPixels =
+                    GC.AllocateUninitializedArray<byte>(chromaWidth * chromaHeight * 2);
+            }
+
+            ConvertBgraToYuv420(
+                bgra,
+                width,
+                height,
+                _hostMovieLumaPixels,
+                _hostMovieChromaPixels);
+            _hostMovieConvertedFrameSerial = _hostMovieFrameSerial;
+        }
+
+        internal static void ConvertBgraToYuv420(
+            ReadOnlySpan<byte> bgra,
+            int width,
+            int height,
+            Span<byte> luma,
+            Span<byte> chroma)
+        {
+            var chromaWidth = (width + 1) / 2;
+            for (var y = 0; y < height; y++)
+            {
+                for (var x = 0; x < width; x++)
+                {
+                    var source = (y * width + x) * 4;
+                    var b = bgra[source];
+                    var g = bgra[source + 1];
+                    var r = bgra[source + 2];
+                    luma[y * width + x] = ClampByte(
+                        (54 * r + 183 * g + 19 * b + 128) >> 8);
+                }
+            }
+
+            for (var y = 0; y < height; y += 2)
+            {
+                for (var x = 0; x < width; x += 2)
+                {
+                    var red = 0;
+                    var green = 0;
+                    var blue = 0;
+                    var samples = 0;
+                    for (var sampleY = y; sampleY < Math.Min(y + 2, height); sampleY++)
+                    {
+                        for (var sampleX = x; sampleX < Math.Min(x + 2, width); sampleX++)
+                        {
+                            var source = (sampleY * width + sampleX) * 4;
+                            blue += bgra[source];
+                            green += bgra[source + 1];
+                            red += bgra[source + 2];
+                            samples++;
+                        }
+                    }
+
+                    red /= samples;
+                    green /= samples;
+                    blue /= samples;
+                    var destination = ((y / 2) * chromaWidth + x / 2) * 2;
+                    chroma[destination] = ClampByte(
+                        ((128 * red - 116 * green - 12 * blue + 128) >> 8) + 128);
+                    chroma[destination + 1] = ClampByte(
+                        ((-29 * red - 99 * green + 128 * blue + 128) >> 8) + 128);
+                }
+            }
+        }
+
+        private static byte ClampByte(int value) => (byte)Math.Clamp(value, 0, 255);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private TextureResource ResolveTextureResource(GuestDrawTexture texture)
@@ -9598,6 +10051,26 @@ internal static unsafe class VulkanVideoPresenter
             _stagingSize = size;
         }
 
+        private void CreateFrameUploadBuffers(ulong size)
+        {
+            _frameUploadBuffers = new VkBuffer[MaxFramesInFlight];
+            _frameUploadMemory = new DeviceMemory[MaxFramesInFlight];
+            _frameUploadMapped = new nint[MaxFramesInFlight];
+            for (var slot = 0; slot < MaxFramesInFlight; slot++)
+            {
+                _frameUploadBuffers[slot] = CreateBuffer(
+                    size,
+                    BufferUsageFlags.TransferSrcBit,
+                    MemoryPropertyFlags.HostVisibleBit | MemoryPropertyFlags.HostCoherentBit,
+                    out _frameUploadMemory[slot]);
+                void* mapped;
+                Check(
+                    _vk.MapMemory(_device, _frameUploadMemory[slot], 0, size, 0, &mapped),
+                    "vkMapMemory(frame upload)");
+                _frameUploadMapped[slot] = (nint)mapped;
+            }
+        }
+
         private uint FindMemoryType(uint typeBits, MemoryPropertyFlags requiredFlags)
         {
             _vk.GetPhysicalDeviceMemoryProperties(_physicalDevice, out var properties);
@@ -9648,6 +10121,8 @@ internal static unsafe class VulkanVideoPresenter
             {
                 return;
             }
+
+            PumpHostMovieFrame();
 
             if (_skipAllCompute ||
                 AddressListContains("SHARPEMU_SKIP_COMPUTE_CS", work.ShaderAddress) ||
@@ -9823,6 +10298,15 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (TryMarkDeviceLost(exception))
                 {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] Vulkan device lost during compute " +
+                        $"cs=0x{work.ShaderAddress:X16} " +
+                        $"groups={work.GroupCountX}x{work.GroupCountY}x{work.GroupCountZ} " +
+                        $"textures={work.Textures.Count} " +
+                        $"globals={work.GlobalMemoryBuffers.Count} " +
+                        $"writes_global={(work.WritesGlobalMemory ? 1 : 0)} " +
+                        $"indirect={(work.IsIndirect ? 1 : 0)} " +
+                        $"spirv={work.ComputeSpirv.Length}");
                     return;
                 }
 
@@ -9923,6 +10407,49 @@ internal static unsafe class VulkanVideoPresenter
                         $"{MaxCredibleGuestWorkgroupsPerDispatch})";
                     return false;
                 }
+            }
+
+            // Empty resource tables with non-trivial SPIR-V usually means the
+            // SRT/EUD walk failed (scalar_pointer_fallback / srt=0). Binding
+            // nothing while the module still declares descriptors is a common
+            // device-loss trigger on the subsequent QueueSubmit.
+            if (work.Textures.Count == 0 &&
+                work.GlobalMemoryBuffers.Count == 0 &&
+                work.ComputeSpirv.Length > 0)
+            {
+                error = "empty-resources";
+                return false;
+            }
+
+            // Address-0 storage is host scratch for legitimate descriptors, but
+            // after an empty SRT walk every binding can collapse to Address-0
+            // fallbacks with no real globals — that path has lost the device
+            // on Astro Bot right after the first presented frame.
+            var hasUsableStorage = false;
+            for (var i = 0; i < work.Textures.Count; i++)
+            {
+                var texture = work.Textures[i];
+                if (texture.IsStorage && texture.Address != 0)
+                {
+                    hasUsableStorage = true;
+                    break;
+                }
+            }
+
+            var hasUsableGlobal = false;
+            for (var i = 0; i < work.GlobalMemoryBuffers.Count; i++)
+            {
+                if (work.GlobalMemoryBuffers[i].BaseAddress != 0)
+                {
+                    hasUsableGlobal = true;
+                    break;
+                }
+            }
+
+            if (!hasUsableStorage && !hasUsableGlobal)
+            {
+                error = "no-usable-resources";
+                return false;
             }
 
             error = string.Empty;
@@ -10732,6 +11259,7 @@ internal static unsafe class VulkanVideoPresenter
                 transientFramebuffer = default;
                 resources.DebugName =
                     $"SharpEmu offscreen mrt={targets.Length} " +
+                    $"ps=0x{work.ShaderAddress:X16} " +
                     $"first=0x{work.Targets[0].Address:X16} " +
                     $"{firstTarget.Width}x{firstTarget.Height}";
 
@@ -11030,6 +11558,12 @@ internal static unsafe class VulkanVideoPresenter
             {
                 if (TryMarkDeviceLost(exception))
                 {
+                    Console.Error.WriteLine(
+                        $"[LOADER][ERROR] Vulkan device lost during offscreen " +
+                        $"vs=0x{work.ShaderAddress:X16} " +
+                        $"mrt={work.Targets.Count} " +
+                        $"textures={work.Draw.Textures.Count} " +
+                        $"vertices={work.Draw.VertexCount}");
                     return;
                 }
 
@@ -11070,6 +11604,133 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     _vk.DestroyRenderPass(_device, transientRenderPass, null);
                 }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void ExecuteOffscreenColorClear(VulkanOffscreenColorClear work)
+        {
+            if (_deviceLost || work.Targets.Count == 0)
+            {
+                return;
+            }
+
+            Interlocked.Increment(ref _perfDrawCount);
+            PerfOverlay.RecordDraw();
+
+            var targetFormats = new VulkanRenderTargetFormat[work.Targets.Count];
+            for (var index = 0; index < targetFormats.Length; index++)
+            {
+                var target = work.Targets[index];
+                if (!TryDecodeRenderTargetFormat(target.Format, target.NumberType, out targetFormats[index]) ||
+                    !SupportsColorAttachment(targetFormats[index].Format))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][WARN] Vulkan skipped color clear for unsupported target " +
+                        $"0x{target.Address:X16} format={target.Format} number_type={target.NumberType}.");
+                    return;
+                }
+            }
+
+            EnsureGuestSubmissionCapacity();
+            var commandBuffer = BeginBatchedGuestCommands();
+            CloseOpenTranslatedRenderPass();
+            var clearValue = new ClearColorValue(work.Red, work.Green, work.Blue, work.Alpha);
+
+            for (var index = 0; index < work.Targets.Count; index++)
+            {
+                var targetDescriptor = work.Targets[index];
+                var image = GetOrCreateGuestImage(
+                    targetDescriptor,
+                    targetFormats[index].Format);
+                if (TakeGuestImageInitialData(targetDescriptor.Address) is { } initialData &&
+                    !image.Initialized &&
+                    (ulong)initialData.Length ==
+                        (ulong)image.Width * image.Height * 4)
+                {
+                    UploadGuestImageInitialData(image, initialData);
+                }
+
+                var toTransferDst = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = image.Initialized ? AccessFlags.ShaderReadBit : 0,
+                    DstAccessMask = AccessFlags.TransferWriteBit,
+                    OldLayout = image.Initialized
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
+                    NewLayout = ImageLayout.TransferDstOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(0, image.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    commandBuffer,
+                    image.Initialized
+                        ? PipelineStageFlags.FragmentShaderBit
+                        : PipelineStageFlags.TopOfPipeBit,
+                    PipelineStageFlags.TransferBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toTransferDst);
+
+                var range = ColorSubresourceRange(0, image.MipLevels);
+                _vk.CmdClearColorImage(
+                    commandBuffer,
+                    image.Image,
+                    ImageLayout.TransferDstOptimal,
+                    &clearValue,
+                    1,
+                    &range);
+
+                var toShaderRead = new ImageMemoryBarrier
+                {
+                    SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = AccessFlags.TransferWriteBit,
+                    DstAccessMask = AccessFlags.ShaderReadBit,
+                    OldLayout = ImageLayout.TransferDstOptimal,
+                    NewLayout = ImageLayout.ShaderReadOnlyOptimal,
+                    SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+                    Image = image.Image,
+                    SubresourceRange = ColorSubresourceRange(0, image.MipLevels),
+                };
+                _vk.CmdPipelineBarrier(
+                    commandBuffer,
+                    PipelineStageFlags.TransferBit,
+                    PipelineStageFlags.FragmentShaderBit,
+                    0,
+                    0,
+                    null,
+                    0,
+                    null,
+                    1,
+                    &toShaderRead);
+                image.Initialized = true;
+
+                var guestTextureFormat = GetGuestTextureFormat(
+                    targetDescriptor.Format,
+                    targetDescriptor.NumberType);
+                if (guestTextureFormat != 0)
+                {
+                    lock (_gate)
+                    {
+                        _availableGuestImages[image.Address] = guestTextureFormat;
+                    }
+                }
+            }
+
+            if (_traceVulkanShaderEnabled)
+            {
+                TraceVulkanShader(
+                    $"vk.offscreen_color_clear mrt={work.Targets.Count} " +
+                    $"ps=0x{work.ShaderAddress:X16} " +
+                    $"rgba=({work.Red:0.###},{work.Green:0.###},{work.Blue:0.###},{work.Alpha:0.###})");
             }
         }
 
@@ -12535,10 +13196,12 @@ internal static unsafe class VulkanVideoPresenter
             EvictDirtyCachedTextures();
             var completedWork = 0;
             HashSet<string>? deferredOrderedQueues = null;
-            var renderWorkDeadline = _renderWorkBudgetTicks > 0
-                ? System.Diagnostics.Stopwatch.GetTimestamp() + _renderWorkBudgetTicks
+            var workBudgetTicks = _renderWorkBudgetTicks;
+            var renderWorkDeadline = workBudgetTicks > 0
+                ? System.Diagnostics.Stopwatch.GetTimestamp() + workBudgetTicks
                 : long.MaxValue;
-            while (completedWork < _maxGuestWorkPerRender)
+            var workLimit = _maxGuestWorkPerRender;
+            while (completedWork < workLimit)
             {
                 // Never block the macOS main thread waiting for in-flight GPU
                 // work to drain. If submission is at capacity (a slow-compute
@@ -12565,6 +13228,8 @@ internal static unsafe class VulkanVideoPresenter
                     // A host command buffer must never contain commands from
                     // two independent guest queues: an ordered action fences
                     // only its own queue's predecessor submissions.
+                    // Keep the previous work label so a device-lost on this
+                    // flush still names the draws that filled the batch.
                     FlushBatchedGuestCommands();
                 }
 
@@ -12579,6 +13244,11 @@ internal static unsafe class VulkanVideoPresenter
                 _enqueueAsImmediateQueueFollowup = true;
                 _immediateFollowupTail = null;
                 var work = pendingGuestWork.Work;
+                _activeGuestWorkLabel = DescribeGuestWork(
+                    work,
+                    pendingGuestWork.Queue,
+                    pendingGuestWork.Sequence);
+                _lastGuestWorkLabel = _activeGuestWorkLabel;
                 var deferGuestWork = false;
 
                 var traceWork = ShouldTracePresentedGuestImageContentsForDiagnostics();
@@ -12595,10 +13265,21 @@ internal static unsafe class VulkanVideoPresenter
                 }
                 try
                 {
+                    // A host-decoded movie only overrides which image gets
+                    // presented (see the presentation selection below); the
+                    // guest's own command stream keeps draining normally.
+                    // Silently discarding these instead of executing them
+                    // leaves guest-visible completion state (labels, buffers,
+                    // job results) permanently unwritten, which desyncs the
+                    // engine's own job system and previously crashed it
+                    // shortly after the movie finished.
                     switch (work)
                     {
                         case VulkanOffscreenGuestDraw offscreenDraw:
                             ExecuteOffscreenDraw(offscreenDraw);
+                            break;
+                        case VulkanOffscreenColorClear colorClear:
+                            ExecuteOffscreenColorClear(colorClear);
                             break;
                         case VulkanComputeGuestDispatch computeDispatch:
                             ExecuteComputeDispatch(computeDispatch);
@@ -12625,6 +13306,7 @@ internal static unsafe class VulkanVideoPresenter
                     }
                     _enqueueAsImmediateQueueFollowup = false;
                     _immediateFollowupTail = null;
+                    _activeGuestWorkLabel = string.Empty;
                     Volatile.Write(ref _executingGuestWorkSequence, 0);
                 }
 
@@ -12672,7 +13354,8 @@ internal static unsafe class VulkanVideoPresenter
             FlushBatchedGuestCommands();
             CollectAbandonedGuestImageVersions();
 
-            if (!TryTakePresentation(_presentedSequence, out var presentation))
+            Presentation presentation;
+            if (!TryTakePresentation(_presentedSequence, out presentation))
             {
 				if (_pendingHostSplashReplay is { } splash)
 				{
@@ -12696,7 +13379,6 @@ internal static unsafe class VulkanVideoPresenter
                 return;
 				}
             }
-
             if (_hostSurface is not null)
             {
                 if (presentation.IsSplash && presentation.Pixels is not null)
@@ -12749,6 +13431,7 @@ internal static unsafe class VulkanVideoPresenter
                 {
                     return;
                 }
+
             }
 
             TranslatedDrawResources? translatedResources = null;
@@ -12876,19 +13559,11 @@ internal static unsafe class VulkanVideoPresenter
 
             if (pixels is not null)
             {
-                // The staging buffer is shared across frame slots; a CPU
-                // pixel upload (splash / host frames) degrades to serial
-                // presentation rather than corrupting an in-flight copy.
-                WaitAllFrameSlots();
-                void* mapped;
-                Check(
-                    _vk.MapMemory(_device, _stagingMemory, 0, (ulong)pixels.Length, 0, &mapped),
-                    "vkMapMemory");
+                var mapped = (void*)_frameUploadMapped[frameSlot];
                 fixed (byte* source = pixels)
                 {
                     System.Buffer.MemoryCopy(source, mapped, pixels.Length, pixels.Length);
                 }
-                _vk.UnmapMemory(_device, _stagingMemory);
             }
 
             Check(_vk.ResetCommandBuffer(_commandBuffer, 0), "vkResetCommandBuffer");
@@ -12902,7 +13577,7 @@ internal static unsafe class VulkanVideoPresenter
             PipelineStageFlags waitStage;
             if (pixels is not null)
             {
-                RecordUpload(imageIndex);
+                RecordUpload(imageIndex, frameSlot);
                 waitStage = PipelineStageFlags.TransferBit;
             }
             else if (presentation.DrawKind == GuestDrawKind.FullscreenBarycentric)
@@ -13424,11 +14099,22 @@ internal static unsafe class VulkanVideoPresenter
                     continue;
                 }
 
+                var hostMovieImageInitialized = texture.HostMoviePlane switch
+                {
+                    0 => _hostMovieImageInitialized,
+                    1 => _hostMovieChromaImageInitialized,
+                    _ => false,
+                };
                 var toTransfer = new ImageMemoryBarrier
                 {
                     SType = StructureType.ImageMemoryBarrier,
+                    SrcAccessMask = texture.IsHostMovie && hostMovieImageInitialized
+                        ? AccessFlags.ShaderReadBit
+                        : 0,
                     DstAccessMask = AccessFlags.TransferWriteBit,
-                    OldLayout = ImageLayout.Undefined,
+                    OldLayout = texture.IsHostMovie && hostMovieImageInitialized
+                        ? ImageLayout.ShaderReadOnlyOptimal
+                        : ImageLayout.Undefined,
                     NewLayout = ImageLayout.TransferDstOptimal,
                     SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
                     DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
@@ -13437,7 +14123,9 @@ internal static unsafe class VulkanVideoPresenter
                 };
                 _vk.CmdPipelineBarrier(
                     _commandBuffer,
-                    PipelineStageFlags.TopOfPipeBit,
+                    texture.IsHostMovie && hostMovieImageInitialized
+                        ? PipelineStageFlags.AllCommandsBit
+                        : PipelineStageFlags.TopOfPipeBit,
                     PipelineStageFlags.TransferBit,
                     0,
                     0,
@@ -13496,6 +14184,19 @@ internal static unsafe class VulkanVideoPresenter
                     // so once this upload is recorded every later draw can
                     // reuse the image without restaging it.
                     texture.NeedsUpload = false;
+                }
+                if (texture.IsHostMovie)
+                {
+                    if (texture.HostMoviePlane == 0)
+                    {
+                        _hostMovieImageInitialized = true;
+                        _hostMovieLumaUploadedFrameSerial = texture.HostMovieFrameSerial;
+                    }
+                    else if (texture.HostMoviePlane == 1)
+                    {
+                        _hostMovieChromaImageInitialized = true;
+                        _hostMovieChromaUploadedFrameSerial = texture.HostMovieFrameSerial;
+                    }
                 }
             }
         }
@@ -14810,7 +15511,176 @@ internal static unsafe class VulkanVideoPresenter
             }
         }
 
-        private void RecordUpload(uint imageIndex)
+        private void EnsureHostMovieImages(
+            uint lumaWidth,
+            uint lumaHeight,
+            uint lumaDstSelect,
+            uint chromaWidth,
+            uint chromaHeight,
+            uint chromaDstSelect)
+        {
+            if (_hostMovieImage.Handle != 0 &&
+                _hostMovieImageWidth == lumaWidth &&
+                _hostMovieImageHeight == lumaHeight &&
+                _hostMovieImageFormat == Format.R8Unorm &&
+                _hostMovieImageDstSelect == lumaDstSelect &&
+                _hostMovieChromaImage.Handle != 0 &&
+                _hostMovieChromaImageWidth == chromaWidth &&
+                _hostMovieChromaImageHeight == chromaHeight &&
+                _hostMovieChromaImageDstSelect == chromaDstSelect)
+            {
+                return;
+            }
+
+            if (_hostMovieImage.Handle != 0 || _hostMovieChromaImage.Handle != 0)
+            {
+                FlushBatchedGuestCommands();
+                WaitForAllGuestSubmissions();
+                DrainFrameSlots();
+                DestroyHostMovieImage();
+            }
+
+            CreateHostMoviePlaneImage(
+                lumaWidth,
+                lumaHeight,
+                Format.R8Unorm,
+                lumaDstSelect,
+                "luma",
+                out _hostMovieImage,
+                out _hostMovieImageMemory,
+                out _hostMovieImageView);
+            CreateHostMoviePlaneImage(
+                chromaWidth,
+                chromaHeight,
+                Format.R8G8Unorm,
+                chromaDstSelect,
+                "chroma",
+                out _hostMovieChromaImage,
+                out _hostMovieChromaImageMemory,
+                out _hostMovieChromaImageView);
+            _hostMovieImageWidth = lumaWidth;
+            _hostMovieImageHeight = lumaHeight;
+            _hostMovieImageFormat = Format.R8Unorm;
+            _hostMovieImageDstSelect = lumaDstSelect;
+            _hostMovieChromaImageWidth = chromaWidth;
+            _hostMovieChromaImageHeight = chromaHeight;
+            _hostMovieChromaImageDstSelect = chromaDstSelect;
+            _hostMovieImageInitialized = false;
+            _hostMovieChromaImageInitialized = false;
+            _hostMovieLumaUploadedFrameSerial = -1;
+            _hostMovieChromaUploadedFrameSerial = -1;
+        }
+
+        private void CreateHostMoviePlaneImage(
+            uint width,
+            uint height,
+            Format format,
+            uint dstSelect,
+            string planeName,
+            out Image image,
+            out DeviceMemory memory,
+            out ImageView view)
+        {
+            var imageInfo = new ImageCreateInfo
+            {
+                SType = StructureType.ImageCreateInfo,
+                ImageType = ImageType.Type2D,
+                Format = format,
+                Extent = new Extent3D(width, height, 1),
+                MipLevels = 1,
+                ArrayLayers = 1,
+                Samples = SampleCountFlags.Count1Bit,
+                Tiling = ImageTiling.Optimal,
+                Usage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
+                SharingMode = SharingMode.Exclusive,
+                InitialLayout = ImageLayout.Undefined,
+            };
+            Check(
+                _vk.CreateImage(_device, &imageInfo, null, out image),
+                $"vkCreateImage(host movie {planeName})");
+            _vk.GetImageMemoryRequirements(_device, image, out var requirements);
+            var allocationInfo = new MemoryAllocateInfo
+            {
+                SType = StructureType.MemoryAllocateInfo,
+                AllocationSize = requirements.Size,
+                MemoryTypeIndex = FindMemoryType(
+                    requirements.MemoryTypeBits,
+                    MemoryPropertyFlags.DeviceLocalBit),
+            };
+            Check(
+                _vk.AllocateMemory(
+                    _device,
+                    &allocationInfo,
+                    null,
+                    out memory),
+                $"vkAllocateMemory(host movie {planeName})");
+            Check(
+                _vk.BindImageMemory(_device, image, memory, 0),
+                $"vkBindImageMemory(host movie {planeName})");
+            var viewInfo = new ImageViewCreateInfo
+            {
+                SType = StructureType.ImageViewCreateInfo,
+                Image = image,
+                ViewType = ImageViewType.Type2D,
+                Format = format,
+                Components = ToVkComponentMapping(dstSelect),
+                SubresourceRange = ColorSubresourceRange(),
+            };
+            Check(
+                _vk.CreateImageView(
+                    _device,
+                    &viewInfo,
+                    null,
+                    out view),
+                $"vkCreateImageView(host movie {planeName})");
+            SetDebugName(ObjectType.Image, image.Handle, $"SharpEmu Bink2 {planeName} image");
+            SetDebugName(ObjectType.ImageView, view.Handle, $"SharpEmu Bink2 {planeName} view");
+        }
+
+        private void DestroyHostMovieImage()
+        {
+            if (_hostMovieImageView.Handle != 0)
+            {
+                _vk.DestroyImageView(_device, _hostMovieImageView, null);
+                _hostMovieImageView = default;
+            }
+            if (_hostMovieImage.Handle != 0)
+            {
+                _vk.DestroyImage(_device, _hostMovieImage, null);
+                _hostMovieImage = default;
+            }
+            if (_hostMovieImageMemory.Handle != 0)
+            {
+                _vk.FreeMemory(_device, _hostMovieImageMemory, null);
+                _hostMovieImageMemory = default;
+            }
+            if (_hostMovieChromaImageView.Handle != 0)
+            {
+                _vk.DestroyImageView(_device, _hostMovieChromaImageView, null);
+                _hostMovieChromaImageView = default;
+            }
+            if (_hostMovieChromaImage.Handle != 0)
+            {
+                _vk.DestroyImage(_device, _hostMovieChromaImage, null);
+                _hostMovieChromaImage = default;
+            }
+            if (_hostMovieChromaImageMemory.Handle != 0)
+            {
+                _vk.FreeMemory(_device, _hostMovieChromaImageMemory, null);
+                _hostMovieChromaImageMemory = default;
+            }
+            _hostMovieImageWidth = 0;
+            _hostMovieImageHeight = 0;
+            _hostMovieImageFormat = Format.Undefined;
+            _hostMovieChromaImageWidth = 0;
+            _hostMovieChromaImageHeight = 0;
+            _hostMovieImageInitialized = false;
+            _hostMovieChromaImageInitialized = false;
+            _hostMovieLumaUploadedFrameSerial = -1;
+            _hostMovieChromaUploadedFrameSerial = -1;
+        }
+
+        private void RecordUpload(uint imageIndex, int frameSlot)
         {
             var oldLayout = _imageInitialized[imageIndex]
                 ? ImageLayout.PresentSrcKhr
@@ -14852,7 +15722,7 @@ internal static unsafe class VulkanVideoPresenter
             };
             _vk.CmdCopyBufferToImage(
                 _commandBuffer,
-                _stagingBuffer,
+                _frameUploadBuffers[frameSlot],
                 _swapchainImages[imageIndex],
                 ImageLayout.TransferDstOptimal,
                 1,
@@ -15407,7 +16277,14 @@ internal static unsafe class VulkanVideoPresenter
         {
             value = value <= 1 && fallback > 1 ? fallback : value;
             minimum = Math.Max(minimum, 1u);
-            maximum = Math.Max(maximum, minimum);
+            // Minimized / unmapped Win32 surfaces often report MaxImageExtent=0.
+            // Clamping the fallback into [1,1] would create a useless 1x1
+            // swapchain; keep the last/default size instead.
+            if (maximum < minimum)
+            {
+                maximum = Math.Max(fallback, minimum);
+            }
+
             return Math.Clamp(value, minimum, maximum);
         }
 
@@ -15692,15 +16569,16 @@ internal static unsafe class VulkanVideoPresenter
                 : (uint)Math.Max(framebufferSize.Y, 0);
             if (surfaceWidth <= 1 || surfaceHeight <= 1)
             {
+                // Minimized / unmapped window reports 0x0. Deferring forever
+                // leaves an OutOfDate swapchain with no presents. ChooseExtent
+                // already clamps 0 to last/default size — recreate with that.
                 if (!_swapchainRecreateDeferred)
                 {
                     _swapchainRecreateDeferred = true;
                     Console.Error.WriteLine(
-                        $"[LOADER][INFO] Vulkan VideoOut deferred swapchain recreation: " +
-                        $"surface={surfaceWidth}x{surfaceHeight}");
+                        "[LOADER][INFO] Vulkan VideoOut swapchain recreate " +
+                        $"using fallback extent (window reported {surfaceWidth}x{surfaceHeight})");
                 }
-
-                return;
             }
 
             _swapchainRecreateDeferred = false;
@@ -15720,7 +16598,26 @@ internal static unsafe class VulkanVideoPresenter
 
         private void DestroySwapchainResources()
         {
+            DestroyHostMovieImage();
             DestroyPresentEncodeImage();
+            for (var slot = 0; slot < _frameUploadBuffers.Length; slot++)
+            {
+                if (_frameUploadMapped.Length > slot && _frameUploadMapped[slot] != 0)
+                {
+                    _vk.UnmapMemory(_device, _frameUploadMemory[slot]);
+                }
+                if (_frameUploadBuffers[slot].Handle != 0)
+                {
+                    _vk.DestroyBuffer(_device, _frameUploadBuffers[slot], null);
+                }
+                if (_frameUploadMemory[slot].Handle != 0)
+                {
+                    _vk.FreeMemory(_device, _frameUploadMemory[slot], null);
+                }
+            }
+            _frameUploadBuffers = [];
+            _frameUploadMemory = [];
+            _frameUploadMapped = [];
             if (_stagingBuffer.Handle != 0)
             {
                 _vk.DestroyBuffer(_device, _stagingBuffer, null);
@@ -15888,12 +16785,84 @@ internal static unsafe class VulkanVideoPresenter
             if (!_deviceLostLogged)
             {
                 _deviceLostLogged = true;
+                var work = !string.IsNullOrEmpty(_activeGuestWorkLabel)
+                    ? $"work={_activeGuestWorkLabel}"
+                    : !string.IsNullOrEmpty(_lastGuestWorkLabel)
+                        ? $"last_work={_lastGuestWorkLabel}"
+                        : "work=<none>";
+                var submit = string.IsNullOrEmpty(_lastSubmitDebugName)
+                    ? string.Empty
+                    : $" last_submit={_lastSubmitDebugName}";
                 Console.Error.WriteLine(
                     "[LOADER][ERROR] Vulkan device lost; dropping subsequent guest GPU work. " +
-                    exception.Message);
+                    $"{work}{submit} {exception.Message}");
             }
 
             return true;
+        }
+
+        private string ResolveGuestSubmitContext(
+            IReadOnlyList<TranslatedDrawResources> resources)
+        {
+            var workLabel = !string.IsNullOrEmpty(_activeGuestWorkLabel)
+                ? _activeGuestWorkLabel
+                : _lastGuestWorkLabel;
+            var resourceName = resources.Count > 0
+                ? resources[0].DebugName
+                : _batchResources.Count > 0
+                    ? _batchResources[0].DebugName
+                    : string.Empty;
+            if (string.IsNullOrEmpty(workLabel))
+            {
+                return string.IsNullOrEmpty(resourceName)
+                    ? string.Empty
+                    : $"batch={resourceName}";
+            }
+
+            return string.IsNullOrEmpty(resourceName)
+                ? workLabel
+                : $"{workLabel} batch={resourceName}";
+        }
+
+        private static string DescribeGuestWork(
+            object work,
+            VulkanGuestQueueIdentity queue,
+            long sequence)
+        {
+            var queuePart =
+                $"queue={queue.Name} submission={queue.SubmissionId} sequence={sequence}";
+            return work switch
+            {
+                VulkanComputeGuestDispatch compute =>
+                    $"compute cs=0x{compute.ShaderAddress:X16} " +
+                    $"groups={compute.GroupCountX}x{compute.GroupCountY}x{compute.GroupCountZ} " +
+                    $"textures={compute.Textures.Count} " +
+                    $"globals={compute.GlobalMemoryBuffers.Count} " +
+                    $"writes_global={(compute.WritesGlobalMemory ? 1 : 0)} " +
+                    $"indirect={(compute.IsIndirect ? 1 : 0)} " +
+                    $"spirv={compute.ComputeSpirv.Length} {queuePart}",
+                VulkanOffscreenGuestDraw draw =>
+                    $"offscreen vs=0x{draw.ShaderAddress:X16} " +
+                    $"mrt={draw.Targets.Count} " +
+                    $"textures={draw.Draw.Textures.Count} " +
+                    $"vertices={draw.Draw.VertexCount} {queuePart}",
+                VulkanOffscreenColorClear clear =>
+                    $"offscreen_clear ps=0x{clear.ShaderAddress:X16} " +
+                    $"mrt={clear.Targets.Count} " +
+                    $"rgba=({clear.Red:0.###},{clear.Green:0.###},{clear.Blue:0.###},{clear.Alpha:0.###}) " +
+                    queuePart,
+                VulkanGuestImageWrite imageWrite =>
+                    $"image_write addr=0x{imageWrite.Address:X16} {queuePart}",
+                VulkanOrderedGuestAction action =>
+                    $"ordered_action name={action.DebugName} {queuePart}",
+                VulkanOrderedGuestFlip flip =>
+                    $"ordered_flip version={flip.Version} " +
+                    $"buf={flip.DisplayBufferIndex} addr=0x{flip.Address:X16} {queuePart}",
+                VulkanOrderedGuestFlipWait wait =>
+                    $"flip_wait version={wait.Version} " +
+                    $"buf={wait.DisplayBufferIndex} {queuePart}",
+                _ => $"{work.GetType().Name} {queuePart}",
+            };
         }
 
         private static void TraceVulkanShader(string message)

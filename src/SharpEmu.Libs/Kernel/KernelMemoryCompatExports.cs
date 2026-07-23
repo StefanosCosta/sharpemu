@@ -99,6 +99,9 @@ public static partial class KernelMemoryCompatExports
     // Stream (not FileStream) so synthetic device fds (e.g. /dev/urandom) can
     // share the same read/write/close/lseek code paths as real files.
     private static readonly Dictionary<int, Stream> _openFiles = new();
+    private static readonly Dictionary<int, Bink2MovieBridge.BinkGuestCompletionShim>
+        _binkGuestCompletionShims = new();
+    private static readonly Dictionary<int, string> _observedBinkGuestFiles = new();
     private static readonly Dictionary<int, OpenDirectory> _openDirectories = new();
     private static readonly object _libcAllocGate = new();
     private static readonly object _memoryGate = new();
@@ -351,13 +354,13 @@ public static partial class KernelMemoryCompatExports
             }
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, address + mappedLength);
-            _mappedRegions[address] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 address,
                 mappedLength,
                 OrbisProtCpuReadWrite,
                 IsFlexible: false,
                 IsDirect: false,
-                DirectStart: 0);
+                DirectStart: 0));
         }
 
         for (ulong offset = 0; offset < mappedLength;)
@@ -383,13 +386,13 @@ public static partial class KernelMemoryCompatExports
 
         lock (_memoryGate)
         {
-            _mappedRegions[address] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 address,
                 length,
                 Protection: 0,
                 IsFlexible: false,
                 IsDirect: false,
-                DirectStart: 0);
+                DirectStart: 0));
         }
     }
 
@@ -1673,6 +1676,14 @@ public static partial class KernelMemoryCompatExports
                 return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
             }
 
+            Bink2MovieBridge.BinkGuestCompletionShim binkCompletionShim = default;
+            var observedBinkMovie = false;
+            var useBinkCompletionShim = access == FileAccess.Read &&
+                Bink2MovieBridge.TryTakeOverGuestMovie(
+                    hostPath,
+                    out binkCompletionShim,
+                    out observedBinkMovie);
+
             if (IsMutatingOpen(flags) && IsReadOnlyGuestMutationPath(guestPath))
             {
                 LogOpenTrace($"_open readonly path='{guestPath}' host='{hostPath}' flags=0x{flags:X8}");
@@ -1721,13 +1732,22 @@ public static partial class KernelMemoryCompatExports
             lock (_fdGate)
             {
                 _openFiles[fd] = stream;
+                if (useBinkCompletionShim)
+                {
+                    _binkGuestCompletionShims[fd] = binkCompletionShim;
+                }
+                if (observedBinkMovie)
+                {
+                    _observedBinkGuestFiles[fd] = hostPath;
+                }
             }
 
-            // Bink is linked directly into some games, so there is no media
-            // import for the HLE codec layer to intercept. The successful
-            // guest file open is the stable boundary at which the optional
-            // host Bink bridge can attach to the same movie.
-            Bink2MovieBridge.ObserveGuestMovie(hostPath);
+            if (useBinkCompletionShim)
+            {
+                LogOpenTrace(
+                    "_open bink-host-shim path='" + guestPath + "' host='" + hostPath +
+                    "' flags=0x" + flags.ToString("X8") + " fd=" + fd);
+            }
 
             if (IsMutatingOpen(flags))
             {
@@ -2313,10 +2333,21 @@ public static partial class KernelMemoryCompatExports
         }
 
         Stream? stream;
+        var notifyBinkClose = false;
+        string? observedBinkPath = null;
         lock (_fdGate)
         {
             if (_openFiles.Remove(fd, out stream))
             {
+                _binkGuestCompletionShims.Remove(fd);
+                if (_observedBinkGuestFiles.Remove(fd, out observedBinkPath))
+                {
+                    notifyBinkClose = !_observedBinkGuestFiles.Values.Any(path =>
+                        string.Equals(
+                            path,
+                            observedBinkPath,
+                            StringComparison.OrdinalIgnoreCase));
+                }
             }
             else if (_openDirectories.Remove(fd))
             {
@@ -2329,6 +2360,10 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
+        if (notifyBinkClose)
+        {
+            Bink2MovieBridge.NotifyGuestMovieClosed(observedBinkPath!);
+        }
         stream.Dispose();
         ctx[CpuRegister.Rax] = 0;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
@@ -2356,9 +2391,12 @@ public static partial class KernelMemoryCompatExports
         }
 
         Stream? stream;
+        Bink2MovieBridge.BinkGuestCompletionShim completionShim = default;
+        var useBinkCompletionShim = false;
         lock (_fdGate)
         {
             _openFiles.TryGetValue(fd, out stream);
+            useBinkCompletionShim = _binkGuestCompletionShims.TryGetValue(fd, out completionShim);
         }
 
         if (stream is null)
@@ -2378,6 +2416,17 @@ public static partial class KernelMemoryCompatExports
 
         var buffer = GC.AllocateUninitializedArray<byte>(requested);
         var read = stream.Read(buffer, 0, requested);
+        if (read > 0 && useBinkCompletionShim)
+        {
+            // The patched NumFrames field is what tells the guest "this
+            // movie is fully consumed" - hold that specific read until the
+            // host has actually finished showing it, so guest-side game
+            // logic can't race ahead of what's still on screen.
+            if (completionShim.Patch(positionBefore, buffer.AsSpan(0, read)))
+            {
+                Bink2MovieBridge.WaitForHostPlaybackToFinish(((FileStream)stream).Name);
+            }
+        }
         if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
@@ -3353,13 +3402,13 @@ public static partial class KernelMemoryCompatExports
             }
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 mappedAddress,
                 length,
                 protection,
                 IsFlexible: false,
                 IsDirect: true,
-                DirectStart: directMemoryStart);
+                DirectStart: directMemoryStart));
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))
@@ -3445,13 +3494,13 @@ public static partial class KernelMemoryCompatExports
 
             _nextVirtualAddress = Math.Max(_nextVirtualAddress, mappedAddress + length);
             _allocatedFlexibleBytes = Math.Min(FlexibleMemorySizeBytes, _allocatedFlexibleBytes + length);
-            _mappedRegions[mappedAddress] = new MappedRegion(
+            ReplaceMappedRegionRangeLocked(new MappedRegion(
                 mappedAddress,
                 length,
                 protection,
                 IsFlexible: true,
                 IsDirect: false,
-                DirectStart: 0);
+                DirectStart: 0));
         }
 
         if (!ctx.TryWriteUInt64(inOutAddressPointer, mappedAddress))

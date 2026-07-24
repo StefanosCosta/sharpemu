@@ -11,8 +11,10 @@ public static class NpUniversalDataSystemExports
     private const int NpUniversalDataSystemErrorInvalidArgument = unchecked((int)0x80553102);
     private static readonly object _eventGate = new();
     private static readonly HashSet<int> _createdEvents = [];
+    private static readonly HashSet<int> _propertyObjects = [];
     private static int _nextHandle = 1;
     private static int _nextEvent = 1;
+    private static int _nextPropertyObject = 1;
 
     [SysAbiExport(
         Nid = "sjaobBgqeB4",
@@ -114,6 +116,78 @@ public static class NpUniversalDataSystemExports
         lock (_eventGate)
         {
             _createdEvents.Remove(eventId);
+        }
+
+        return ctx.SetReturn(0, typeof(long));
+    }
+
+    // Create a property object that the EventPropertyObjectSet* functions below then
+    // populate. The object is caller-owned memory those setters later probe as a
+    // readable pointer, so initialize it here with a tracked non-zero marker id (so an
+    // initialized object is distinguishable from a zeroed buffer and the probes
+    // succeed). The object pointer follows the sibling Set* layout (event, object);
+    // accept it from Rsi, falling back to Rdi, to stay robust to the exact prototype.
+    [SysAbiExport(
+        Nid = "s6W4Zl4Slgk",
+        ExportName = "sceNpUniversalDataSystemCreateEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemCreateEventPropertyObject(CpuContext ctx)
+    {
+        var objectAddress = ctx[CpuRegister.Rsi];
+        if (objectAddress == 0)
+        {
+            objectAddress = ctx[CpuRegister.Rdi];
+        }
+
+        if (objectAddress == 0)
+        {
+            return ctx.SetReturn(NpUniversalDataSystemErrorInvalidArgument, typeof(long));
+        }
+
+        var propertyObjectId = Interlocked.Increment(ref _nextPropertyObject);
+        lock (_eventGate)
+        {
+            _propertyObjects.Add(propertyObjectId);
+        }
+
+        if (ctx.TryWriteInt32(objectAddress, propertyObjectId, checkNil: true))
+        {
+            return ctx.SetReturn(0, typeof(long));
+        }
+
+        lock (_eventGate)
+        {
+            _propertyObjects.Remove(propertyObjectId);
+        }
+
+        return ctx.SetReturn((int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT, typeof(long));
+    }
+
+    // Counterpart to CreateEventPropertyObject: free the property object the game is done
+    // with. Create wrote a tracked marker id into the caller's object memory, so read it
+    // back (Rsi then Rdi, mirroring the sibling's fallback) and drop it from the tracked
+    // set. Teardown is best-effort — an unreadable or already-freed object is not an error,
+    // so always return success, matching DestroyEvent/DestroyHandle.
+    [SysAbiExport(
+        Nid = "kKUH0Viib3c",
+        ExportName = "sceNpUniversalDataSystemDestroyEventPropertyObject",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceNpUniversalDataSystem")]
+    public static int NpUniversalDataSystemDestroyEventPropertyObject(CpuContext ctx)
+    {
+        var objectAddress = ctx[CpuRegister.Rsi];
+        if (objectAddress == 0)
+        {
+            objectAddress = ctx[CpuRegister.Rdi];
+        }
+
+        if (objectAddress != 0 && ctx.TryReadInt32(objectAddress, out var propertyObjectId))
+        {
+            lock (_eventGate)
+            {
+                _propertyObjects.Remove(propertyObjectId);
+            }
         }
 
         return ctx.SetReturn(0, typeof(long));

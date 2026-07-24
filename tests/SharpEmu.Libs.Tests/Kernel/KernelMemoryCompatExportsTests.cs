@@ -4,6 +4,7 @@
 using SharpEmu.HLE;
 using SharpEmu.Libs.Kernel;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using Xunit;
 
@@ -55,9 +56,114 @@ public sealed class KernelMemoryCompatExportsTests
         var result = KernelMemoryCompatExports.PosixOpen(context);
 
         // A libc open() failure must be -1, not the raw 0x8002xxxx sentinel the
-        // guest would otherwise store as a valid fd and later dereference.
+        // guest would otherwise store as a valid fd and later dereference. Guest
+        // libc's File::Open only compares the low 32 bits against -1 (cmp eax,-1);
+        // the raw Orbis result (e.g. ORBIS_GEN2_ERROR_NOT_FOUND = 0x80020002) never
+        // equals that, so a missing file used to be read back as success with a
+        // bogus fd - which regressed deep in IL2CPP metadata symbol loading.
         Assert.Equal(-1, result);
         Assert.Equal(ulong.MaxValue, context[CpuRegister.Rax]);
+    }
+
+    [Fact]
+    public void KernelOpenUnderscore_RandomDeviceReturnsValidFd()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0; // O_RDONLY
+
+        var result = KernelMemoryCompatExports.KernelOpenUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(ulong.MaxValue, context[CpuRegister.Rax]);
+        Assert.True(context[CpuRegister.Rax] > 2); // past stdin/stdout/stderr
+
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Theory]
+    [InlineData("/dev/random")]
+    [InlineData("/dev/srandom")]
+    public void KernelOpenUnderscore_RandomDeviceAliasesReturnValidFd(string devicePath)
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, devicePath);
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+
+        var result = KernelMemoryCompatExports.KernelOpenUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(ulong.MaxValue, context[CpuRegister.Rax]);
+
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Fact]
+    public void KernelReadUnderscore_RandomDeviceReturnsNonZeroRandomBytes()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        const ulong bufferAddress = memoryBase + 0x200;
+        const int length = 64;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var fd = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = fd;
+        context[CpuRegister.Rsi] = bufferAddress;
+        context[CpuRegister.Rdx] = length;
+        var readResult = KernelMemoryCompatExports.KernelReadUnderscore(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, readResult);
+        Assert.Equal((ulong)length, context[CpuRegister.Rax]);
+
+        Span<byte> buffer = stackalloc byte[length];
+        Assert.True(memory.TryRead(bufferAddress, buffer));
+        // Not a randomness test, just confirms real bytes came back rather
+        // than an untouched zero-filled buffer.
+        Assert.Contains(buffer.ToArray(), b => b != 0);
+
+        context[CpuRegister.Rdi] = fd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+    }
+
+    [Fact]
+    public void KernelOpenUnderscore_RandomDeviceRepeatOpenGetsIndependentFds()
+    {
+        const ulong memoryBase = 0x1_0000_0000;
+        const ulong pathAddress = memoryBase + 0x100;
+        var memory = new FakeCpuMemory(memoryBase, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        memory.WriteCString(pathAddress, "/dev/urandom");
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var firstFd = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = pathAddress;
+        context[CpuRegister.Rsi] = 0;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.KernelOpenUnderscore(context));
+        var secondFd = context[CpuRegister.Rax];
+
+        Assert.NotEqual(firstFd, secondFd);
+
+        context[CpuRegister.Rdi] = firstFd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
+        context[CpuRegister.Rdi] = secondFd;
+        KernelMemoryCompatExports.KernelCloseUnderscore(context);
     }
 
     [Fact]
@@ -424,5 +530,160 @@ public sealed class KernelMemoryCompatExportsTests
         var result = KernelMemoryCompatExports.KernelMunmap(context);
 
         Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND, result);
+    }
+
+    [Fact]
+    public void OperatorNew_ReturnsWritableAddressOfRequestedSize()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 64;
+
+        var result = KernelMemoryCompatExports.OperatorNew(context);
+        var address = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, address);
+
+        // The allocation comes from KernelMemoryCompatExports' own Marshal.AllocHGlobal
+        // -backed heap, a real host pointer distinct from FakeCpuMemory's simulated guest
+        // range, so verify it directly via Marshal rather than memory.TryRead/TryWrite.
+        var pointer = unchecked((nint)address);
+        Marshal.WriteByte(pointer, 63, 0xAB);
+        Assert.Equal(0xAB, Marshal.ReadByte(pointer, 63));
+
+        KernelMemoryCompatExports.Free(context);
+    }
+
+    [Fact]
+    public void OperatorNewArray_BehavesLikeOperatorNewForTheSameSize()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 128;
+
+        var result = KernelMemoryCompatExports.OperatorNewArray(context);
+        var address = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, address);
+
+        var pointer = unchecked((nint)address);
+        Marshal.WriteByte(pointer, 127, 0xCD);
+        Assert.Equal(0xCD, Marshal.ReadByte(pointer, 127));
+
+        context[CpuRegister.Rdi] = address;
+        KernelMemoryCompatExports.OperatorDeleteArray(context);
+    }
+
+    [Fact]
+    public void OperatorDelete_NullPointerIsNoOp()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 0;
+
+        var result = KernelMemoryCompatExports.OperatorDelete(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+    }
+
+    [Fact]
+    public void OperatorDeleteSized_IgnoresSizeArgumentAndFreesTheAllocation()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 32;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.OperatorNew(context));
+        var address = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = address;
+        context[CpuRegister.Rsi] = 999; // deliberately mismatched size, must still free correctly
+        var deleteResult = KernelMemoryCompatExports.OperatorDeleteSized(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, deleteResult);
+
+        // Allocating again should succeed cleanly, confirming the heap's internal
+        // bookkeeping for the freed slot wasn't corrupted by the mismatched size.
+        context[CpuRegister.Rdi] = 32;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.OperatorNew(context));
+        Assert.NotEqual(0UL, context[CpuRegister.Rax]);
+        KernelMemoryCompatExports.Free(context);
+    }
+
+    [Fact]
+    public void OperatorDeleteArraySized_FreesAnOperatorNewArrayAllocation()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 48;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.OperatorNewArray(context));
+        var address = context[CpuRegister.Rax];
+
+        context[CpuRegister.Rdi] = address;
+        context[CpuRegister.Rsi] = 48;
+        var deleteResult = KernelMemoryCompatExports.OperatorDeleteArraySized(context);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, deleteResult);
+    }
+
+    [Fact]
+    public void ReallocAlign_NullPointerAllocatesFreshAlignedBlock()
+    {
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 0;
+        context[CpuRegister.Rsi] = 64;
+        context[CpuRegister.Rdx] = 0x40;
+
+        var result = KernelMemoryCompatExports.ReallocAlign(context);
+        var address = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, address);
+        Assert.Equal(0UL, address % 0x40);
+
+        var pointer = unchecked((nint)address);
+        Marshal.WriteByte(pointer, 63, 0xAB);
+        Assert.Equal(0xAB, Marshal.ReadByte(pointer, 63));
+
+        context[CpuRegister.Rdi] = address;
+        KernelMemoryCompatExports.Free(context);
+    }
+
+    [Fact]
+    public void ReallocAlign_GrowsExistingAllocationPreservingContentsAndAlignment()
+    {
+        // Mirrors the guest call shape that used to crash: a dynamic array's
+        // growth path calls reallocalign(old_ptr, bigger_size, alignment) and
+        // then unconditionally writes through the returned pointer. Before this
+        // export existed, the unresolved-import fallback left RAX at 0 and that
+        // write faulted (metal_slug, Access Violation at guest RIP 0x800812114).
+        var memory = new FakeCpuMemory(0x1_0000_0000, 0x1000);
+        var context = new CpuContext(memory, Generation.Gen5);
+        context[CpuRegister.Rdi] = 32;
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, KernelMemoryCompatExports.Malloc(context));
+        var originalAddress = context[CpuRegister.Rax];
+        var originalPointer = unchecked((nint)originalAddress);
+        Marshal.WriteByte(originalPointer, 0, 0x42);
+        Marshal.WriteByte(originalPointer, 31, 0x99);
+
+        context[CpuRegister.Rdi] = originalAddress;
+        context[CpuRegister.Rsi] = 128;
+        context[CpuRegister.Rdx] = 0x40;
+
+        var result = KernelMemoryCompatExports.ReallocAlign(context);
+        var resizedAddress = context[CpuRegister.Rax];
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.NotEqual(0UL, resizedAddress);
+        Assert.Equal(0UL, resizedAddress % 0x40);
+
+        var resizedPointer = unchecked((nint)resizedAddress);
+        Assert.Equal(0x42, Marshal.ReadByte(resizedPointer, 0));
+        Assert.Equal(0x99, Marshal.ReadByte(resizedPointer, 31));
+
+        context[CpuRegister.Rdi] = resizedAddress;
+        KernelMemoryCompatExports.Free(context);
     }
 }

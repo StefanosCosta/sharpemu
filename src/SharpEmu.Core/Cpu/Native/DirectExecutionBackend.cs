@@ -771,6 +771,14 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 	private static readonly nint ImportGatewayPtr = ResolveWin64CallbackPtr(
 		Marshal.GetFunctionPointerForDelegate(ImportGatewayDelegateInstance));
 
+	// Signal-free guest execution logger (SHARPEMU_GUEST_HOOK). A planted E9 detour
+	// enters a per-hook trampoline in ordinary preemptive guest context and calls this
+	// gateway (Win64 ABI, like the import gateway) to record the register snapshot.
+	private delegate void GuestHookGatewayDelegate(nint backendHandle, int hookIndex, nint snapshotPtr);
+	private static readonly GuestHookGatewayDelegate GuestHookGatewayDelegateInstance = GuestHookGatewayManaged;
+	private static readonly nint HookGatewayPtr = ResolveWin64CallbackPtr(
+		Marshal.GetFunctionPointerForDelegate(GuestHookGatewayDelegateInstance));
+
 	// Emitted trampolines call managed callbacks with the Win64 ABI. On
 	// Windows the runtime already compiles them that way; on POSIX .NET they
 	// are SysV, so route through a Win64->SysV thunk.
@@ -1131,8 +1139,18 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		Console.Error.WriteLine($"[LOADER][INFO] RuntimeSymbols: {runtimeSymbols.Count}");
 		Console.Error.WriteLine(_moduleManager.TryGetExport("QrZZdJ8XsX0", out ExportedFunction export) ? ("[LOADER][INFO] ExportCheck fputs: " + export.LibraryName + ":" + export.Name) : "[LOADER][INFO] ExportCheck fputs: MISSING");
 		Console.Error.WriteLine(_moduleManager.TryGetExport("L-Q3LEjIbgA", out ExportedFunction export2) ? ("[LOADER][INFO] ExportCheck map_direct: " + export2.LibraryName + ":" + export2.Name) : "[LOADER][INFO] ExportCheck map_direct: MISSING");
+		foreach (var watchAddress in ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_WRITE_ADDRS")))
+		{
+			SharpEmu.HLE.GuestImageWriteTracker.Track(watchAddress, 8, source: "debug-watch");
+		}
 		_entryPoint = entryPoint;
 		_cpuContext = context;
+		foreach (var (forcedAddress, forcedValue) in ParseForcedByteWrites(Environment.GetEnvironmentVariable("SHARPEMU_FORCE_BYTE_WRITE")))
+		{
+			var forcedOk = context.Memory.TryWrite(forcedAddress, new[] { forcedValue });
+			Console.Error.WriteLine(
+				$"[LOADER][EXPERIMENT] Forced byte write addr=0x{forcedAddress:X16} value=0x{forcedValue:X2} ok={forcedOk}");
+		}
 		_debugHook = executionOptions.DebugHook;
 		_returnFallbackTarget = context[CpuRegister.Rsi];
 		Volatile.Write(ref _globalFallbackTarget, _returnFallbackTarget);
@@ -1211,6 +1229,8 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			}
 			CreateTlsHandler();
 			PatchTlsPatterns();
+			InstallGuestExecHooks();
+			SharpEmu.HLE.MemPollWatch.Start();
 			return ExecuteEntry(context, entryPoint, out result);
 		}
 		catch (Exception ex)
@@ -1726,6 +1746,15 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		{
 			return false;
 		}
+		if (IsThreadIdentityLibcExport(exportName))
+		{
+			// A host pthread_self() can't distinguish between SharpEmu's cooperatively-scheduled
+			// guest threads, which all run inline on the same host thread. Passing this through
+			// via LLE breaks guest code that keys per-thread state (e.g. IL2CPP-style allocator
+			// caches) off the returned identity, so it must always go through the per-guest-thread
+			// -aware HLE path instead.
+			return false;
+		}
 		var value = Environment.GetEnvironmentVariable("SHARPEMU_LLE_LIBC_SAFE_ONLY");
 		if (string.Equals(value, "off", StringComparison.OrdinalIgnoreCase) ||
 			string.Equals(value, "false", StringComparison.OrdinalIgnoreCase) ||
@@ -1754,13 +1783,35 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 
 	private bool CanUseLleLibcAllocatorFamily()
 	{
+		// HLE's aligned-allocation exports (memalign/aligned_alloc/posix_memalign) carve memory
+		// from SharpEmu's own guest heap, which is backed by freshly-committed, demand-paged host
+		// memory that reads as zero on first touch. Guest code that lazily initializes a field
+		// only "if it reads as zero" (a real pattern found in IL2CPP-style per-thread allocator
+		// bucket bookkeeping, observed in Metal Slug Tactics) works by accident under that HLE
+		// heap, but a real host memalign() can return recycled, non-zeroed heap memory instead -
+		// dereferencing the unpopulated field then crashes. IL2CPP presence is auto-detected in
+		// SharpEmuRuntime.LoadAdjacentSceModules (an Il2cpp*-named module on disk is a reliable,
+		// title-agnostic signal for this exact bug class), so this only forces the family to HLE
+		// for titles that actually need it rather than globally. SHARPEMU_FORCE_HLE_LIBC_ALLOCATOR
+		// is a manual escape hatch for a title hitting the same pattern without IL2CPP present.
+		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_DETECTED_IL2CPP"), "1", StringComparison.Ordinal) ||
+			string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_FORCE_HLE_LIBC_ALLOCATOR"), "1", StringComparison.Ordinal))
+		{
+			return false;
+		}
+
+		// Since glibc's malloc/free/calloc/realloc/memalign/aligned_alloc/posix_memalign all
+		// share one underlying heap, mixing LLE for some of these with HLE for others would let
+		// guest code free an HLE-allocated (non-native) pointer through a real host free(),
+		// corrupting the host heap - so the whole family must move together, hence checking all
+		// seven rather than each independently.
 		return HasUsableLleLibcExport("gQX+4GDQjpM", "malloc") &&
-			   HasUsableLleLibcExport("tIhsqj0qsFE", "free") &&
-			   HasUsableLleLibcExport("2X5agFjKxMc", "calloc") &&
-			   HasUsableLleLibcExport("Y7aJ1uydPMo", "realloc") &&
-			   HasUsableLleLibcExport("Ujf3KzMvRmI", "memalign") &&
-			   HasUsableLleLibcExport("2Btkg8k24Zg", "aligned_alloc") &&
-			   HasUsableLleLibcExport("cVSk9y8URbc", "posix_memalign");
+			HasUsableLleLibcExport("tIhsqj0qsFE", "free") &&
+			HasUsableLleLibcExport("2X5agFjKxMc", "calloc") &&
+			HasUsableLleLibcExport("Y7aJ1uydPMo", "realloc") &&
+			HasUsableLleLibcExport("Ujf3KzMvRmI", "memalign") &&
+			HasUsableLleLibcExport("2Btkg8k24Zg", "aligned_alloc") &&
+			HasUsableLleLibcExport("cVSk9y8URbc", "posix_memalign");
 	}
 
 	private bool HasUsableLleLibcExport(string nid, string exportName)
@@ -1805,6 +1856,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			"memmove" or
 			"memset" or
 			"memcmp" => true,
+			_ => false,
+		};
+	}
+
+	private static bool IsThreadIdentityLibcExport(string exportName)
+	{
+		return exportName switch
+		{
+			"pthread_self" or
+			"scePthreadSelf" => true,
 			_ => false,
 		};
 	}
@@ -3101,6 +3162,30 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		return null;
 	}
 
+	// Allocate a trampoline page strictly BELOW the given anchor (a stable in-image address)
+	// but within rel32 of it. Anchoring on the hook address — NOT the entry point, which can
+	// sit past the image near the PRX-module region — keeps the page in the gap between the
+	// guest image base and the guest thread stacks. The guest module loader maps PRX modules
+	// ABOVE the image, so an above-image page gets clobbered/reprotected mid-run (a DEP fault
+	// when the detour later jumps into it); the below-image gap is never targeted by
+	// guest/module allocations, so a write-once detour there survives for the whole run.
+	private unsafe void* TryAllocateBelowAnchor(ulong anchor, nuint size)
+	{
+		ulong baseAddress = anchor & 0xFFFFFFFFFFFF0000uL;
+		// Start ~128 MB below the anchor: the guest allocator grows DOWNWARD from just below
+		// the image base and will clobber a page only a few MB below it, but does not reach
+		// this far (the surviving TLS-handler page sits ~16 MB below the base). Scan 128 MB ..
+		// 1.5 GB below, in 16 MB steps — all comfortably within an E9 rel32 reach.
+		for (long delta = 0x8000000L; delta <= 0x60000000L; delta += 0x1000000L)
+		{
+			if (TryAllocAt(baseAddress, -delta, size, out var memory))
+			{
+				return memory;
+			}
+		}
+		return null;
+	}
+
 	private unsafe static bool TryAllocAt(ulong baseAddress, long signedDelta, nuint size, out void* memory)
 	{
 		memory = null;
@@ -3513,6 +3598,210 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)instructionLength);
 		}
 		return true;
+	}
+
+	// Sibling of PatchCallSite that writes an E9 rel32 (jmp) rather than E8 (call), so
+	// the guest stack/red zone is untouched at the detour — used by the signal-free guest
+	// execution logger (SHARPEMU_GUEST_HOOK). The trampoline itself re-executes the
+	// clobbered instructions and jmps back, so control returns transparently.
+	private unsafe bool PatchJmpSite(nint address, int clobberedLen, nint target)
+	{
+		if (clobberedLen < 5)
+		{
+			return false;
+		}
+		uint flNewProtect = default(uint);
+		if (!VirtualProtect((void*)address, (nuint)clobberedLen, 64u, &flNewProtect))
+		{
+			return false;
+		}
+		try
+		{
+			long rel = target - (address + 5);
+			if (rel < int.MinValue || rel > int.MaxValue)
+			{
+				Console.Error.WriteLine($"[HOOK][WARNING] jmp patch out of rel32 range at 0x{address:X16}");
+				return false;
+			}
+			*(byte*)address = 0xE9;
+			*(int*)(address + 1) = (int)rel;
+			for (int i = 5; i < clobberedLen; i++)
+			{
+				*(byte*)(address + i) = 0x90;
+			}
+		}
+		finally
+		{
+			VirtualProtect((void*)address, (nuint)clobberedLen, flNewProtect, &flNewProtect);
+			FlushInstructionCache(GetCurrentProcess(), (void*)address, (nuint)clobberedLen);
+		}
+		return true;
+	}
+
+	// Builds a per-hook trampoline for the signal-free execution logger. Mirrors
+	// CreateImportHandlerTrampoline's guest-state-save / host-RSP-switch / Win64-gateway-call
+	// structure, but is fully transparent: it snapshots ALL guest GPRs + RFLAGS onto a stack
+	// frame, calls GuestHookGatewayManaged (which records the snapshot), restores state
+	// byte-for-byte, re-executes a verbatim copy of the clobbered original instructions, then
+	// jmps back to hookAddress + clobberedLen. The snapshot frame layout MUST match
+	// GuestExecLogger's *Off constants. Returns 0 on failure.
+	private unsafe nint CreateGuestHookTrampoline(int hookIndex, ulong hookAddress, byte[] relocatedBytes, int clobberedLen)
+	{
+		// Below the image (see TryAllocateBelowAnchor), anchored on the hook address, so a later
+		// PRX module load (mapped above the image) can't clobber it.
+		void* ptr = TryAllocateBelowAnchor(hookAddress, 512u);
+		if (ptr == null)
+		{
+			return 0;
+		}
+		_guestHookTrampolines.Add((nint)ptr);
+		try
+		{
+			byte* p = (byte*)ptr;
+			int n = 0;
+
+			// --- Entry: guest state fully live, flags = guest's, rsp = original guest rsp ---
+			// lea rsp,[rsp-0x100]  (skip red zone; LEA => no flags touched)
+			p[n++] = 0x48; p[n++] = 0x8D; p[n++] = 0xA4; p[n++] = 0x24; *(uint*)(p + n) = 0xFFFFFF00u; n += 4;
+			p[n++] = 0x9C;                                        // pushfq
+			p[n++] = 0x50; p[n++] = 0x51; p[n++] = 0x52; p[n++] = 0x53; // push rax,rcx,rdx,rbx
+			p[n++] = 0x55; p[n++] = 0x56; p[n++] = 0x57;               // push rbp,rsi,rdi
+			p[n++] = 0x41; p[n++] = 0x50;                        // push r8
+			p[n++] = 0x41; p[n++] = 0x51;                        // push r9
+			p[n++] = 0x41; p[n++] = 0x52;                        // push r10
+			p[n++] = 0x41; p[n++] = 0x53;                        // push r11
+			p[n++] = 0x41; p[n++] = 0x54;                        // push r12
+			p[n++] = 0x41; p[n++] = 0x55;                        // push r13
+			p[n++] = 0x41; p[n++] = 0x56;                        // push r14
+			p[n++] = 0x41; p[n++] = 0x57;                        // push r15
+			p[n++] = 0x49; p[n++] = 0x89; p[n++] = 0xE4;         // mov r12, rsp  (frame-low; r12 guest val already saved)
+
+			// --- Resolve host RSP slot (TlsGetValue) on the guest stack, exactly as imports do ---
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xEC; p[n++] = 0x28; // sub rsp,0x28
+			p[n++] = 0xB9; *(uint*)(p + n) = _hostRspSlotTlsIndex; n += 4; // mov ecx, tlsIndex
+			p[n++] = 0x48; p[n++] = 0xB8; *(long*)(p + n) = _tlsGetValueAddress; n += 8; // mov rax, TlsGetValue
+			p[n++] = 0xFF; p[n++] = 0xD0;                        // call rax
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xC4; p[n++] = 0x28; // add rsp,0x28
+			p[n++] = 0x49; p[n++] = 0x89; p[n++] = 0xC3;         // mov r11, rax
+			p[n++] = 0x48; p[n++] = 0x85; p[n++] = 0xC0;         // test rax, rax
+			p[n++] = 0x74; int jzRel8At = n; p[n++] = 0x00;      // jz -> restore (bare thread: skip capture)
+
+			// --- Switch to host stack + call the managed gateway ---
+			p[n++] = 0x49; p[n++] = 0x8B; p[n++] = 0x23;         // mov rsp,[r11]
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xEC; p[n++] = 0x38; // sub rsp,0x38
+			p[n++] = 0x4C; p[n++] = 0x89; p[n++] = 0x64; p[n++] = 0x24; p[n++] = 0x28; // mov [rsp+0x28], r12
+			p[n++] = 0x48; p[n++] = 0xB9; *(long*)(p + n) = _selfHandlePtr; n += 8;    // mov rcx, selfHandle
+			p[n++] = 0xBA; *(int*)(p + n) = hookIndex; n += 4;   // mov edx, hookIndex
+			p[n++] = 0x4D; p[n++] = 0x89; p[n++] = 0xE0;         // mov r8, r12  (snapshot frame-low)
+			p[n++] = 0x48; p[n++] = 0xB8; *(long*)(p + n) = (long)HookGatewayPtr; n += 8; // mov rax, HookGatewayPtr
+			p[n++] = 0xFF; p[n++] = 0xD0;                        // call rax
+			p[n++] = 0x4C; p[n++] = 0x8B; p[n++] = 0x64; p[n++] = 0x24; p[n++] = 0x28; // mov r12,[rsp+0x28]
+			p[n++] = 0x48; p[n++] = 0x83; p[n++] = 0xC4; p[n++] = 0x38; // add rsp,0x38
+
+			// --- Restore label ---
+			int restoreAt = n;
+			p[jzRel8At] = (byte)(restoreAt - (jzRel8At + 1)); // backpatch jz rel8
+
+			// Restore guest state. Every flags-clobbering step above precedes this popfq,
+			// so the flags a relocated cmp/arith produces (and the flags the guest resumes
+			// with) are the guest's own.
+			p[n++] = 0x4C; p[n++] = 0x89; p[n++] = 0xE4;         // mov rsp, r12  (-> frame-low)
+			p[n++] = 0x41; p[n++] = 0x5F;                        // pop r15
+			p[n++] = 0x41; p[n++] = 0x5E;                        // pop r14
+			p[n++] = 0x41; p[n++] = 0x5D;                        // pop r13
+			p[n++] = 0x41; p[n++] = 0x5C;                        // pop r12
+			p[n++] = 0x41; p[n++] = 0x5B;                        // pop r11
+			p[n++] = 0x41; p[n++] = 0x5A;                        // pop r10
+			p[n++] = 0x41; p[n++] = 0x59;                        // pop r9
+			p[n++] = 0x41; p[n++] = 0x58;                        // pop r8
+			p[n++] = 0x5F; p[n++] = 0x5E; p[n++] = 0x5D;         // pop rdi,rsi,rbp
+			p[n++] = 0x5B; p[n++] = 0x5A; p[n++] = 0x59; p[n++] = 0x58; // pop rbx,rdx,rcx,rax
+			p[n++] = 0x9D;                                       // popfq
+			p[n++] = 0x48; p[n++] = 0x8D; p[n++] = 0xA4; p[n++] = 0x24; *(uint*)(p + n) = 0x00000100u; n += 4; // lea rsp,[rsp+0x100]
+
+			// --- Relocated clobber (verbatim; validated position-independent) ---
+			for (int i = 0; i < relocatedBytes.Length; i++)
+			{
+				p[n++] = relocatedBytes[i];
+			}
+
+			// --- jmp rel32 back to hookAddress + clobberedLen ---
+			p[n++] = 0xE9;
+			long back = (long)(hookAddress + (ulong)clobberedLen) - ((long)(nint)p + n + 4);
+			if (back < int.MinValue || back > int.MaxValue)
+			{
+				Console.Error.WriteLine($"[HOOK][WARNING] trampoline jmp-back out of rel32 range for 0x{hookAddress:X16}");
+				return 0;
+			}
+			*(int*)(p + n) = (int)back; n += 4;
+
+			Debug.Assert(n <= 512, "Guest hook trampoline exceeded its allocation.");
+			uint prot = default(uint);
+			VirtualProtect(ptr, 512u, 32u, &prot);
+			FlushInstructionCache(GetCurrentProcess(), ptr, 512u);
+			return (nint)ptr;
+		}
+		catch
+		{
+			return 0;
+		}
+	}
+
+	// Installs the signal-free execution-logger detours once, single-threaded, before guest
+	// threads spin up (called right after PatchTlsPatterns). Inert unless SHARPEMU_GUEST_HOOK
+	// is set. Write-once: each site gets a single E9 and is never mutated again, so it is safe
+	// even on hot multi-threaded code (no cross-modifying-code hazard).
+	// Hook trampolines live in their OWN list, NOT _importHandlerTrampolines: the setup path
+	// can run more than once, and each SetupImportStubs frees every _importHandlerTrampolines
+	// entry — which would free a hook trampoline out from under its still-installed E9 detour
+	// (a later re-run skips re-arming because the site already holds the jmp), leaving the
+	// detour pointing at a freed page. These are never freed until teardown.
+	private readonly List<nint> _guestHookTrampolines = new List<nint>();
+
+	private unsafe void InstallGuestExecHooks()
+	{
+		if (!SharpEmu.HLE.GuestExecLogger.Enabled)
+		{
+			return;
+		}
+
+		var addresses = SharpEmu.HLE.GuestExecLogger.Addresses;
+		for (int i = 0; i < addresses.Count; i++)
+		{
+			ulong addr = addresses[i];
+
+			// Only patch a committed, non-free region — a bogus user-supplied address must
+			// never fault the setup path.
+			if (VirtualQuery((void*)addr, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0 ||
+				mbi.State == 65536u)
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: address not mapped");
+				continue;
+			}
+
+			var site = new ReadOnlySpan<byte>((void*)addr, 24);
+			if (!SharpEmu.Core.Cpu.Disasm.GuestHookRelocator.TryPlan(site, addr, out int clobberedLen, out byte[] reloc, out string? reject))
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: {reject}");
+				continue;
+			}
+
+			nint tramp = CreateGuestHookTrampoline(i, addr, reloc, clobberedLen);
+			if (tramp == 0)
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: trampoline alloc failed");
+				continue;
+			}
+
+			if (PatchJmpSite((nint)addr, clobberedLen, tramp))
+			{
+				Console.Error.WriteLine($"[HOOK][INFO] armed 0x{addr:X} -> tramp 0x{tramp:X16} clobber={clobberedLen}");
+			}
+			else
+			{
+				Console.Error.WriteLine($"[HOOK][SKIP] 0x{addr:X}: patch failed");
+			}
+		}
 	}
 
 	private unsafe void TryPreReservePrtAperture(ulong baseAddress, ulong size)
@@ -4806,6 +5095,64 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 				MapGuestThreadPriority(target.Priority));
 		}
 		deliveryRunner.Schedule(DeliverException);
+		return true;
+	}
+
+	public bool HasPendingGuestException(ulong threadHandle)
+	{
+		if (threadHandle == 0 || Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		lock (_guestThreadGate)
+		{
+			return _pendingGuestExceptions.ContainsKey(threadHandle);
+		}
+	}
+
+	private ulong CurrentSignalDeliveryThreadHandle()
+	{
+		var handle = GuestThreadExecution.CurrentGuestThreadHandle;
+		return handle != 0 ? handle : _currentExternalGuestThreadHandle;
+	}
+
+	public bool HasPendingGuestExceptionForCurrentThread()
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		var handle = CurrentSignalDeliveryThreadHandle();
+		return handle != 0 && HasPendingGuestException(handle);
+	}
+
+	public bool TryDeliverPendingGuestExceptionInPlace(CpuContext currentContext)
+	{
+		if (Volatile.Read(ref _pendingGuestExceptionCount) == 0)
+		{
+			return false;
+		}
+
+		var handle = CurrentSignalDeliveryThreadHandle();
+		if (handle == 0 || !HasPendingGuestException(handle))
+		{
+			return false;
+		}
+
+		// A host-parked HLE wait (WaitSema / SyncOnAddress on the primordial or any
+		// external thread) discovered a queued signal. Deliver it synchronously on
+		// this same host thread so the guest handler runs and acknowledges, then the
+		// caller re-enters its wait. The interrupted continuation is captured from the
+		// live import call frame + register context, matching the import-boundary path.
+		if (!GuestThreadExecution.TryCaptureCurrentImportBoundaryContinuation(
+				currentContext, out var continuation))
+		{
+			return false;
+		}
+
+		DeliverPendingGuestExceptionAtSafePoint(currentContext, continuation);
 		return true;
 	}
 
@@ -6544,6 +6891,7 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 								$"[LOADER][TRACE] guest_thread.snapshot " +
 								$"handle=0x{thread.ThreadHandle:X16} name='{thread.Name}' " +
 								$"state={thread.State} executor={thread.ExecutorActive} " +
+								$"deferrals={thread.ExecutorClaimDeferrals} " +
 								$"imports={Interlocked.Read(ref thread.ImportCount)} " +
 								$"nid={Volatile.Read(ref thread.LastImportNid) ?? "none"} " +
 								$"ret=0x{Volatile.Read(ref thread.LastReturnRip):X16} " +
@@ -6552,6 +6900,16 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 								$"host_managed={thread.HostThread?.ManagedThreadId ?? 0} " +
 								$"host_tid={Volatile.Read(ref thread.HostThreadId)}");
 						}
+
+						// Ready-queue census: distinguishes a scheduler-dispatch stall (a runnable
+						// thread stranded in the queue, or perpetually deferred) from a genuinely
+						// blocked pool waiting on a wake that never arrives.
+						var readyHandles = string.Join(
+							",",
+							_readyGuestThreads.Select(t => $"0x{t.ThreadHandle:X16}"));
+						Console.Error.WriteLine(
+							$"[LOADER][TRACE] guest_thread.ready_queue " +
+							$"count={_readyGuestThreadCount} handles=[{readyHandles}]");
 					}
 					nextSnapshotTimestamp = Stopwatch.GetTimestamp() + Stopwatch.Frequency;
 				}
@@ -6710,6 +7068,334 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 			{
 				Console.Error.WriteLine($"[LOADER][ERROR] Stall stack: [rsp]=0x{value:X16} [rsp+8]=0x{value2:X16}");
 			}
+
+			// Diagnostic: SHARPEMU_STALL_DUMP_RANGE="addr,len[;addr,len...]" (hex) dumps guest
+			// memory ranges as hex when a stall is detected - useful for reading decrypted guest
+			// code (SELF modules) that is only mapped at runtime and cannot be paused after load.
+			var stallDumpSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_DUMP_RANGE");
+			if (!string.IsNullOrEmpty(stallDumpSpec))
+			{
+				foreach (var rangeSpec in stallDumpSpec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+				{
+					var parts = rangeSpec.Split(',', ':');
+					if (parts.Length != 2 ||
+						!ulong.TryParse(parts[0].Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var dumpAddr) ||
+						!ulong.TryParse(parts[1].Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var dumpLen))
+					{
+						continue;
+					}
+
+					dumpLen = Math.Min(dumpLen, 0x2000UL);
+					var dumpBuffer = new byte[dumpLen];
+					Console.Error.WriteLine(cpuContext.Memory.TryRead(dumpAddr, dumpBuffer)
+						? $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: {Convert.ToHexString(dumpBuffer)}"
+						: $"[LOADER][ERROR] Stall dump 0x{dumpAddr:X16}+0x{dumpLen:X}: <unreadable>");
+				}
+			}
+
+			// Diagnostic: SHARPEMU_STALL_SCAN_STRING="<ascii>[;lo-hi]" scans the guest HEAP
+			// (default 0x600000000-0x610000000) for an ASCII literal (e.g. a runtime-built
+			// asset filename like "sharedassets0.assets.resS") and then finds every aligned
+			// 8-byte pointer TO it - the descriptor's filename field, so descriptor base =
+			// holder-0x28. This is the missing "find the unstable heap descriptor this run"
+			// tool: locate it here, then aim SHARPEMU_HW_WATCH at descriptor+0x20 (phase) etc.
+			var scanSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_STRING");
+			if (!string.IsNullOrEmpty(scanSpec))
+			{
+				ScanHeapForStringAndPointers(scanSpec);
+			}
+
+			// Diagnostic: SHARPEMU_STALL_CHASE="0xBASE:off1:off2:..." follows a pointer chain -
+			// a = BASE; for each hex offset: a = *(a + off). Prints every hop and dumps 0x40 bytes
+			// at the final address. Resolves per-run-shifting object graphs (e.g. control-block ->
+			// op -> vtable -> method) to a stable code address for offline disassembly.
+			// Diagnostic: SHARPEMU_STALL_SCAN_PTR="0xADDR" scans the guest heap for aligned
+			// 8-byte values == ADDR (e.g. a stable image vtable) and dumps 0x400 bytes at each
+			// holder - resolving a per-run-shifting object by its stable vtable pointer.
+			var scanPtrSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_PTR");
+			if (!string.IsNullOrEmpty(scanPtrSpec)
+				&& ulong.TryParse(scanPtrSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var wantPtr))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall ptr-scan for 0x{wantPtr:X16}");
+				var hits = 0;
+				ScanHeapRegions(0x0000000600000000UL, 0x0000000610000000UL, (regionBase, buf) =>
+				{
+					if (hits >= 8)
+					{
+						return;
+					}
+					var count = buf.Length / 8;
+					for (var i = 0; i < count; i++)
+					{
+						if (BitConverter.ToUInt64(buf, i * 8) != wantPtr)
+						{
+							continue;
+						}
+						var holder = regionBase + (ulong)(i * 8);
+						var obj = new byte[0x400];
+						if (_cpuContext!.Memory.TryRead(holder, obj))
+						{
+							Console.Error.WriteLine($"[LOADER][ERROR]   holder 0x{holder:X16} [+0x3a8]=0x{BitConverter.ToUInt64(obj, 0x3a8):X16} [+0x3b8]=0x{BitConverter.ToUInt32(obj, 0x3b8):X8} [+0x3bc]=0x{BitConverter.ToUInt32(obj, 0x3bc):X8}");
+							Console.Error.WriteLine($"[LOADER][ERROR]   obj 0x{holder:X16}: {Convert.ToHexString(obj)}");
+						}
+						if (++hits >= 8)
+						{
+							return;
+						}
+					}
+				});
+				Console.Error.WriteLine($"[LOADER][ERROR]   ptr-scan hits={hits}");
+			}
+
+			var chaseSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_CHASE");
+			if (!string.IsNullOrEmpty(chaseSpec))
+			{
+				foreach (var oneChase in chaseSpec.Split(';', StringSplitOptions.RemoveEmptyEntries))
+				{
+					var toks = oneChase.Split(':', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+					if (toks.Length == 0 || !ulong.TryParse(toks[0].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var a))
+					{
+						continue;
+					}
+					Console.Error.WriteLine($"[LOADER][ERROR] Chase start 0x{a:X16}");
+					var ok = true;
+					for (var i = 1; i < toks.Length; i++)
+					{
+						if (!ulong.TryParse(toks[i].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var off))
+						{
+							ok = false; break;
+						}
+						if (!cpuContext.TryReadUInt64(a + off, out var next))
+						{
+							Console.Error.WriteLine($"[LOADER][ERROR]   +0x{off:X} @0x{a + off:X16} <unreadable>"); ok = false; break;
+						}
+						Console.Error.WriteLine($"[LOADER][ERROR]   [0x{a:X16}+0x{off:X}] = 0x{next:X16}");
+						a = next;
+					}
+					if (ok)
+					{
+						var cb = new byte[0x40];
+						Console.Error.WriteLine(cpuContext.Memory.TryRead(a, cb)
+							? $"[LOADER][ERROR] Chase final 0x{a:X16}: {Convert.ToHexString(cb)}"
+							: $"[LOADER][ERROR] Chase final 0x{a:X16}: <unreadable>");
+					}
+				}
+			}
+			// Diagnostic: SHARPEMU_STALL_PROBE_ADDR="0xADDR" triangulates one guest address three
+			// ways so an untracked BSS/singleton slot can be classified: (1) tracked-region
+			// membership via IVirtualMemory.SnapshotRegions() [what the loader mapped], (2) host
+			// commit state via VirtualQuery [what the guest CPU can actually touch], (3) the 8-byte
+			// value. Also dumps the highest tracked regions so the true image end is visible.
+			var probeSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_PROBE_ADDR");
+			if (!string.IsNullOrEmpty(probeSpec)
+				&& ulong.TryParse(probeSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var probeAddr))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall probe for 0x{probeAddr:X16}");
+				if (TryGetVirtualMemory(cpuContext, out var probeVm))
+				{
+					var regions = probeVm.SnapshotRegions();
+					VirtualMemoryRegion? owner = null;
+					ulong nearestBelowEnd = 0;
+					foreach (var region in regions)
+					{
+						var end = region.VirtualAddress + region.MemorySize;
+						if (probeAddr >= region.VirtualAddress && probeAddr < end)
+						{
+							owner = region;
+						}
+						if (end <= probeAddr && end > nearestBelowEnd)
+						{
+							nearestBelowEnd = end;
+						}
+					}
+					if (owner is { } o)
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   tracked: IN region VA=0x{o.VirtualAddress:X16} end=0x{o.VirtualAddress + o.MemorySize:X16} size=0x{o.MemorySize:X} prot={o.Protection} fileSz=0x{o.FileSize:X}");
+					}
+					else
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   tracked: NOT in any region (past all segment memsz); nearest region below ends 0x{nearestBelowEnd:X16} (gap 0x{(nearestBelowEnd != 0 ? probeAddr - nearestBelowEnd : 0):X})");
+					}
+					foreach (var region in regions.OrderByDescending(r => r.VirtualAddress + r.MemorySize).Take(4))
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   top region VA=0x{region.VirtualAddress:X16} end=0x{region.VirtualAddress + region.MemorySize:X16} size=0x{region.MemorySize:X} prot={region.Protection} fileSz=0x{region.FileSize:X}");
+					}
+				}
+				else
+				{
+					Console.Error.WriteLine($"[LOADER][ERROR]   tracked: <no IVirtualMemory>");
+				}
+				var probeCommitted = false;
+				unsafe
+				{
+					if (VirtualQuery((void*)probeAddr, out var probeMbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) != 0)
+					{
+						probeCommitted = probeMbi.State == MEM_COMMIT;
+						var stateName = probeMbi.State == MEM_COMMIT ? "COMMIT" : probeMbi.State == MEM_RESERVE ? "RESERVE" : probeMbi.State == MEM_FREE ? "FREE" : probeMbi.State.ToString();
+						Console.Error.WriteLine($"[LOADER][ERROR]   host: base=0x{probeMbi.BaseAddress:X16} size=0x{probeMbi.RegionSize:X} state={stateName} protect=0x{probeMbi.Protect:X}");
+					}
+					else
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   host: VirtualQuery failed");
+					}
+				}
+				var probeVal = new byte[8];
+				Console.Error.WriteLine(cpuContext.Memory.TryRead(probeAddr, probeVal)
+					? $"[LOADER][ERROR]   value (tracked TryRead): 0x{BitConverter.ToUInt64(probeVal, 0):X16}"
+					: $"[LOADER][ERROR]   value (tracked TryRead): <unreadable>");
+				if (probeCommitted)
+				{
+					unsafe
+					{
+						Console.Error.WriteLine($"[LOADER][ERROR]   value (raw host read):     0x{*(ulong*)probeAddr:X16}");
+					}
+				}
+			}
+			
+			// Diagnostic: SHARPEMU_STALL_SCAN_RIPREL="0xTARGET" scans every executable image
+			// region for rip-relative instructions referencing TARGET, classifying store vs
+			// load vs lea. Finds the initializer (the STORE) of a BSS singleton like the async
+			// streaming manager. Single pass: a rip-relative disp32 field satisfies
+			// disp == TARGET - (regionVA + off + 4); on a byte match, the preceding modrm must
+			// have mod=00,rm=101 ((modrm & 0xC7)==0x05), then the opcode byte classifies it.
+			var ripRelSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_RIPREL");
+			if (!string.IsNullOrEmpty(ripRelSpec)
+				&& ulong.TryParse(ripRelSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var ripTarget)
+				&& TryGetVirtualMemory(cpuContext, out var ripVm))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall rip-rel scan for 0x{ripTarget:X16}");
+				var ripHits = 0;
+				foreach (var region in ripVm.SnapshotRegions())
+				{
+					if ((region.Protection & ProgramHeaderFlags.Execute) == 0 || region.MemorySize == 0 || region.MemorySize > 0x8000000UL)
+					{
+						continue;
+					}
+					var buf = new byte[(int)region.MemorySize];
+					if (!cpuContext.Memory.TryRead(region.VirtualAddress, buf))
+					{
+						continue;
+					}
+					for (var off = 1; off + 4 <= buf.Length; off++)
+					{
+						var disp = BitConverter.ToInt32(buf, off);
+						var tgt = region.VirtualAddress + (ulong)(off + 4) + (ulong)(long)disp;
+						if (tgt != ripTarget)
+						{
+							continue;
+						}
+						var modrm = buf[off - 1];
+						if ((modrm & 0xC7) != 0x05)
+						{
+							continue; // disp coincidence, not a rip-relative operand
+						}
+						// Walk back over opcode (1- or 2-byte) and optional REX/66 to find the start + class.
+						var op = off >= 2 ? buf[off - 2] : (byte)0;
+						var op2 = off >= 3 ? buf[off - 3] : (byte)0;
+						var twoByte = op2 == 0x0F;
+						var opcode = op; // primary opcode byte immediately before modrm
+						string cls;
+						if (!twoByte && (opcode == 0x89 || opcode == 0x88 || opcode == 0xC7)) cls = "STORE";
+						else if (!twoByte && (opcode == 0x8B || opcode == 0x8A || opcode == 0x63)) cls = "load";
+						else if (!twoByte && opcode == 0x8D) cls = "lea";
+						else if (!twoByte && (opcode == 0x01 || opcode == 0x09 || opcode == 0x0B || opcode == 0x31 || opcode == 0x33 || opcode == 0x39 || opcode == 0x3B)) cls = "arith";
+						else if (!twoByte && opcode == 0xFF) cls = "grp5(call/jmp/inc)";
+						else cls = twoByte ? $"0F{opcode:X2}" : $"op{opcode:X2}";
+						var instrStart = off - 2;
+						if (off >= 3 && buf[off - 3] >= 0x40 && buf[off - 3] <= 0x4F) instrStart = off - 3;
+						if (twoByte) instrStart = off - 3;
+						if (off >= 4 && buf[instrStart - 1] >= 0x40 && buf[instrStart - 1] <= 0x4F) instrStart -= 1;
+						var ctxStart = Math.Max(0, instrStart - 1);
+						var ctxLen = Math.Min(12, buf.Length - ctxStart);
+						var ctx = Convert.ToHexString(buf, ctxStart, ctxLen);
+						Console.Error.WriteLine($"[LOADER][ERROR]   {cls} @0x{region.VirtualAddress + (ulong)instrStart:X16} modrm=0x{modrm:X2} bytes[{ctxStart - instrStart}]={ctx}");
+						if (++ripHits >= 64)
+						{
+							break;
+						}
+					}
+					if (ripHits >= 64)
+					{
+						break;
+					}
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR]   rip-rel scan hits={ripHits}");
+			}
+			
+			// Diagnostic: SHARPEMU_STALL_SCAN_FIELDSTORE="0xDISP" scans every executable image
+			// region for instructions with a memory operand [reg+DISP] using a mod=10 disp32
+			// encoding, classifying store vs load. Finds who writes an object field at a known
+			// struct offset (e.g. an operation state field [op+0x3b8]) - the external driver a
+			// stuck state machine is waiting on. Offline-decode the STORE hits with capstone.
+			var fsSpec = Environment.GetEnvironmentVariable("SHARPEMU_STALL_SCAN_FIELDSTORE");
+			if (!string.IsNullOrEmpty(fsSpec)
+				&& uint.TryParse(fsSpec.Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var fsDisp)
+				&& TryGetVirtualMemory(cpuContext, out var fsVm))
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR] Stall field-store scan for disp=0x{fsDisp:X}");
+				var fsHits = 0;
+				var fsDispBytes = BitConverter.GetBytes(fsDisp);
+				foreach (var region in fsVm.SnapshotRegions())
+				{
+					if ((region.Protection & ProgramHeaderFlags.Execute) == 0 || region.MemorySize == 0 || region.MemorySize > 0x8000000UL)
+					{
+						continue;
+					}
+					var buf = new byte[(int)region.MemorySize];
+					if (!cpuContext.Memory.TryRead(region.VirtualAddress, buf))
+					{
+						continue;
+					}
+					for (var off = 2; off + 4 <= buf.Length; off++)
+					{
+						if (buf[off] != fsDispBytes[0] || buf[off + 1] != fsDispBytes[1] || buf[off + 2] != fsDispBytes[2] || buf[off + 3] != fsDispBytes[3])
+						{
+							continue;
+						}
+						// The disp32 follows either modrm (mod=10, rm!=100) or modrm+SIB (rm==100).
+						var modrmOff = -1; var sib = false;
+						var m1 = buf[off - 1];
+						if ((m1 & 0xC0) == 0x80 && (m1 & 0x07) != 0x04)
+						{
+							modrmOff = off - 1;
+						}
+						else if (off >= 2 && (buf[off - 2] & 0xC0) == 0x80 && (buf[off - 2] & 0x07) == 0x04)
+						{
+							modrmOff = off - 2; sib = true;
+						}
+						if (modrmOff < 1)
+						{
+							continue;
+						}
+						var modrm = buf[modrmOff];
+						var opOff = modrmOff - 1;
+						var op = buf[opOff];
+						var rex = (opOff >= 1 && buf[opOff - 1] >= 0x40 && buf[opOff - 1] <= 0x4F) ? buf[opOff - 1] : (byte)0;
+						string cls;
+						if (op == 0x89 || op == 0x88 || op == 0xC7) cls = "STORE";
+						else if (op == 0x01 || op == 0x09 || op == 0x21 || op == 0x29 || op == 0x31) cls = "STORE-arith";
+						else if (op == 0xFF) cls = "grp5";
+						else if (op == 0x8B || op == 0x8A || op == 0x63) cls = "load";
+						else if (op == 0x39 || op == 0x3B || op == 0x83 || op == 0x81) cls = "cmp";
+						else cls = $"op{op:X2}";
+						var instrStart = rex != 0 ? opOff - 1 : opOff;
+						var ctxStart = Math.Max(0, instrStart - 1);
+						var ctxLen = Math.Min(16, buf.Length - ctxStart);
+						var ctx = Convert.ToHexString(buf, ctxStart, ctxLen);
+						Console.Error.WriteLine($"[LOADER][ERROR]   {cls} [+0x{fsDisp:X}] @0x{region.VirtualAddress + (ulong)instrStart:X16} modrm=0x{modrm:X2}{(sib ? " SIB" : "")} bytes={ctx}");
+						if (++fsHits >= 200)
+						{
+							break;
+						}
+					}
+					if (fsHits >= 200)
+					{
+						break;
+					}
+				}
+				Console.Error.WriteLine($"[LOADER][ERROR]   field-store scan hits={fsHits}");
+			}
+			
 
 			var threads = SnapshotGuestThreads();
 			if (threads.Length != 0)
@@ -7142,6 +7828,195 @@ public sealed unsafe partial class DirectExecutionBackend : INativeCpuBackend, I
 		_ = hProcess;
 		HostMemory.FlushInstructionCache(lpBaseAddress, dwSize);
 		return true;
+	}
+
+	// Stall-time heap string+pointer scanner (SHARPEMU_STALL_SCAN_STRING). Locates the
+	// current-run address of a runtime-built asset filename and every aligned pointer to
+	// it, exposing the (per-run-unstable) descriptor address so a hardware write-watch can
+	// be aimed at it. Walks committed readable heap regions via VirtualQuery.
+	private unsafe void ScanHeapForStringAndPointers(string spec)
+	{
+		try
+		{
+			if (_cpuContext == null)
+			{
+				return;
+			}
+
+			var needleText = spec;
+			ulong lo = 0x0000000600000000UL, hi = 0x0000000610000000UL;
+			var semi = spec.IndexOf(';');
+			if (semi >= 0)
+			{
+				needleText = spec.Substring(0, semi);
+				var rangePart = spec.Substring(semi + 1);
+				var dash = rangePart.IndexOf('-');
+				if (dash > 0
+					&& ulong.TryParse(rangePart.Substring(0, dash).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var plo)
+					&& ulong.TryParse(rangePart.Substring(dash + 1).Trim().Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, null, out var phi))
+				{
+					lo = plo;
+					hi = phi;
+				}
+			}
+
+			var needle = System.Text.Encoding.ASCII.GetBytes(needleText);
+			if (needle.Length == 0)
+			{
+				return;
+			}
+
+			Console.Error.WriteLine($"[LOADER][ERROR] Stall heap-scan \"{needleText}\" over 0x{lo:X}-0x{hi:X}");
+			var sw = System.Diagnostics.Stopwatch.StartNew();
+
+			var stringHits = new List<ulong>(8);
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				var from = 0;
+				while (from < buf.Length)
+				{
+					var idx = new ReadOnlySpan<byte>(buf, from, buf.Length - from).IndexOf(needle);
+					if (idx < 0)
+					{
+						break;
+					}
+					var hitAddr = regionBase + (ulong)(from + idx);
+					if (stringHits.Count < 16)
+					{
+						stringHits.Add(hitAddr);
+						Console.Error.WriteLine($"[LOADER][ERROR]   string @0x{hitAddr:X16}");
+					}
+					from += idx + 1;
+				}
+			});
+
+			if (stringHits.Count == 0)
+			{
+				Console.Error.WriteLine($"[LOADER][ERROR]   string: none (t={sw.Elapsed.TotalSeconds:F2}s)");
+				return;
+			}
+
+			// Pass 2: aligned 8-byte pointers to each string hit. A holder at H whose field is
+			// at [+0x28] means the SerializedFile descriptor base is H-0x28 (printed for use).
+			var pointerHits = 0;
+			var descBases = new List<ulong>(8);
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				if (pointerHits >= 64)
+				{
+					return;
+				}
+				var count = buf.Length / 8;
+				for (var i = 0; i < count; i++)
+				{
+					var v = BitConverter.ToUInt64(buf, i * 8);
+					for (var h = 0; h < stringHits.Count; h++)
+					{
+						if (v == stringHits[h])
+						{
+							var holder = regionBase + (ulong)(i * 8);
+							var descBase = holder - 0x28;
+							if (!descBases.Contains(descBase))
+							{
+								descBases.Add(descBase);
+							}
+							Console.Error.WriteLine($"[LOADER][ERROR]   ptr@0x{holder:X16} -> string 0x{v:X16}  (descriptor base if [+0x28]: 0x{descBase:X16})");
+							// Dump the presumed descriptor [base .. base+0x60) so the phase [+0x20],
+							// filename [+0x28] and size [+0x38] fields can be read directly.
+							var descDump = new byte[0x60];
+							if (_cpuContext!.Memory.TryRead(descBase, descDump))
+							{
+								Console.Error.WriteLine($"[LOADER][ERROR]     desc 0x{descBase:X16}: {Convert.ToHexString(descDump)}");
+								Console.Error.WriteLine($"[LOADER][ERROR]     desc fields: [+0x20]=0x{BitConverter.ToUInt64(descDump, 0x20):X16} [+0x28]=0x{BitConverter.ToUInt64(descDump, 0x28):X16} [+0x38]=0x{BitConverter.ToUInt64(descDump, 0x38):X16}");
+							}
+							if (++pointerHits >= 64)
+							{
+								return;
+							}
+						}
+					}
+				}
+			});
+
+			// Pass 3: find who REFERENCES each FileIdentifier descriptor (aligned pointers to the
+			// descriptor base). That referrer is the loader/job struct that should consume the
+			// FileIdentifier to issue the .resS data read - the chain up toward the never-dispatched
+			// deserialize job. Dump [ref-0x40 .. ref+0x40) so its fields are visible.
+			var referrerHits = 0;
+			ScanHeapRegions(lo, hi, (regionBase, buf) =>
+			{
+				if (referrerHits >= 64 || descBases.Count == 0)
+				{
+					return;
+				}
+				var count = buf.Length / 8;
+				for (var i = 0; i < count; i++)
+				{
+					var v = BitConverter.ToUInt64(buf, i * 8);
+					for (var d = 0; d < descBases.Count; d++)
+					{
+						if (v == descBases[d])
+						{
+							var refAt = regionBase + (ulong)(i * 8);
+							Console.Error.WriteLine($"[LOADER][ERROR]   ref@0x{refAt:X16} -> descriptor 0x{v:X16}");
+							var win = new byte[0x80];
+							if (refAt >= 0x40 && _cpuContext!.Memory.TryRead(refAt - 0x40, win))
+							{
+								Console.Error.WriteLine($"[LOADER][ERROR]     refwin 0x{refAt - 0x40:X16}: {Convert.ToHexString(win)}");
+							}
+							if (++referrerHits >= 64)
+							{
+								return;
+							}
+						}
+					}
+				}
+			});
+
+			Console.Error.WriteLine($"[LOADER][ERROR]   heap-scan done strings={stringHits.Count} ptrs={pointerHits} refs={referrerHits} t={sw.Elapsed.TotalSeconds:F2}s");
+		}
+		catch
+		{
+		}
+	}
+
+	private unsafe void ScanHeapRegions(ulong lo, ulong hi, Action<ulong, byte[]> onRegion)
+	{
+		var address = lo;
+		while (address < hi)
+		{
+			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				break;
+			}
+
+			var regionBase = mbi.BaseAddress;
+			var regionEnd = regionBase + mbi.RegionSize;
+			if (regionEnd <= address)
+			{
+				break;
+			}
+
+			if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect))
+			{
+				var start = Math.Max(regionBase, lo);
+				var clampedEnd = Math.Min(regionEnd, hi);
+				if (clampedEnd > start)
+				{
+					var len = clampedEnd - start;
+					if (len <= 0x10000000UL)
+					{
+						var buf = new byte[(int)len];
+						if (_cpuContext!.Memory.TryRead(start, buf))
+						{
+							onRegion(start, buf);
+						}
+					}
+				}
+			}
+
+			address = regionEnd;
+		}
 	}
 
 	private unsafe static nuint VirtualQuery(void* lpAddress, out MEMORY_BASIC_INFORMATION64 lpBuffer, nuint dwLength)

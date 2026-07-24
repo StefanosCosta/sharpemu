@@ -15,9 +15,15 @@ namespace SharpEmu.HLE;
 public static class GuestTlsTemplate
 {
     // Must match CpuDispatcher/DirectExecutionBackend's mapped prefix. PS5
-    // modules can require more than one host page of Variant II static TLS;
-    // Dreaming Sarah's startup image, for example, reaches 0x1870 bytes.
-    public const ulong StartupStaticTlsReservation = 0x20000UL;     // Was 0x10000UL, but thats too small for GTA V
+    // modules can require far more than one host page of Variant II static TLS:
+    // Dreaming Sarah's startup image reaches 0x1870 bytes and GTA V needs more
+    // than 0x10000, but large IL2CPP titles are much bigger - Subnautica's
+    // Il2CppUserAssemblies alone needs 0x187630 bytes of static TLS below the
+    // thread pointer. Reserve 2 MiB so those titles load; this sits comfortably
+    // inside the 0x0100_0000 (16 MiB) per-thread TLS region stride used by both
+    // the main and worker TLS mappers, so it cannot collide with an adjacent
+    // thread's block.
+    public const ulong StartupStaticTlsReservation = 0x20_0000UL;
     private static readonly object _gate = new();
     private static readonly SortedDictionary<ulong, ModuleTemplate> _modules = new();
     private static readonly Dictionary<ulong, ThreadDtv> _threadDtvs = new();
@@ -190,6 +196,37 @@ public static class GuestTlsTemplate
             _maximumAlignment = Math.Max(_maximumAlignment, normalizedAlignment);
             _generation++;
             return staticOffset;
+        }
+    }
+
+    /// <summary>
+    /// Replaces a registered module's PT_TLS init image in place, without
+    /// touching its already-assigned static offset/alignment. The loader must
+    /// register every module's identity before applying ELF relocations (so
+    /// DTPMOD/DTPOFF/TPOFF relocations can see the module's real static
+    /// offset), but a module's initialized TLS bytes (.tdata) can themselves
+    /// contain relocatable pointers - so the loader re-reads the segment
+    /// after relocations run and calls this to capture the corrected bytes,
+    /// before any guest thread's TLS block is ever derived from them.
+    /// </summary>
+    public static void UpdateInitImage(ulong moduleId, ReadOnlySpan<byte> initImage)
+    {
+        lock (_gate)
+        {
+            if (!_modules.TryGetValue(moduleId, out var existing))
+            {
+                return;
+            }
+
+            _modules[moduleId] = new ModuleTemplate
+            {
+                ModuleId = existing.ModuleId,
+                InitImage = initImage.ToArray(),
+                MemorySize = existing.MemorySize,
+                Alignment = existing.Alignment,
+                AlignmentBias = existing.AlignmentBias,
+                StaticOffset = existing.StaticOffset,
+            };
         }
     }
 

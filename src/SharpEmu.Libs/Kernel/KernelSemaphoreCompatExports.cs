@@ -235,7 +235,12 @@ public static class KernelSemaphoreCompatExports
         var deadlineMs = timeoutAddress != 0
             ? Environment.TickCount64 + Math.Max(1L, timeoutUsec / 1000L)
             : long.MaxValue;
-        lock (semaphore.Gate)
+        var scheduler = GuestThreadExecution.Scheduler;
+        // Explicit Monitor.Enter/Exit (not lock{}) so the gate can be released while a
+        // queued async signal handler runs in place (it may park on another semaphore
+        // for the whole GC and re-enter sema/syncaddr HLEs).
+        Monitor.Enter(semaphore.Gate);
+        try
         {
             if (_traceSema)
             {
@@ -251,6 +256,27 @@ public static class KernelSemaphoreCompatExports
                     semaphore.WaitingThreads = Math.Max(0, semaphore.WaitingThreads - 1);
                     _ = TryWriteUInt32(ctx, timeoutAddress, 0);
                     return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_ERROR_TIMED_OUT);
+                }
+
+                // Deliver a queued async guest exception (e.g. an IL2CPP stop-the-world
+                // SIGUSR1) in place, WITHOUT returning from WaitSema — the guest Baselib
+                // acquire does not re-check the token on return, so a spurious return
+                // would corrupt it. Release the gate first: the handler acks and then
+                // parks on the GC's ResumeSemaphore for the whole collection.
+                if (scheduler?.HasPendingGuestExceptionForCurrentThread() == true)
+                {
+                    Monitor.Exit(semaphore.Gate);
+                    try
+                    {
+                        scheduler.TryDeliverPendingGuestExceptionInPlace(ctx);
+                    }
+                    finally
+                    {
+                        Monitor.Enter(semaphore.Gate);
+                    }
+
+                    // Re-check Count: a real SignalSema during the GC may have satisfied us.
+                    continue;
                 }
 
                 Monitor.Wait(semaphore.Gate, (int)Math.Min(remaining, 100));
@@ -269,6 +295,10 @@ public static class KernelSemaphoreCompatExports
             }
 
             return SetReturn(ctx, OrbisGen2Result.ORBIS_GEN2_OK);
+        }
+        finally
+        {
+            Monitor.Exit(semaphore.Gate);
         }
     }
 

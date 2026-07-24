@@ -34,7 +34,7 @@ public static partial class KernelMemoryCompatExports
     private static long _nextAioSubmitId = 1;
     private static readonly ConcurrentDictionary<uint, int> _aioResults = new();
 
-    private static FileStream? GetOpenFile(int fd)
+    private static Stream? GetOpenFile(int fd)
     {
         lock (_fdGate)
         {
@@ -79,7 +79,12 @@ public static partial class KernelMemoryCompatExports
         int read;
         try
         {
-            read = RandomAccess.Read(stream.SafeFileHandle, buffer, offset);
+            // A real position-based read only applies to actual files; a
+            // synthetic device fd (e.g. /dev/urandom) has no offset concept,
+            // so just read from it directly.
+            read = stream is FileStream fileStream
+                ? RandomAccess.Read(fileStream.SafeFileHandle, buffer, offset)
+                : stream.Read(buffer, 0, buffer.Length);
         }
         catch (IOException)
         {
@@ -89,6 +94,16 @@ public static partial class KernelMemoryCompatExports
         if (read > 0 && !ctx.Memory.TryWrite(bufferAddress, buffer.AsSpan(0, read)))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
+        }
+
+        // Positional reads bypass LogIoTrace's read path, so trace them here too
+        // (SHARPEMU_LOG_IO): the .resS async-load investigation needs to see whether
+        // a resource stream is ever pread after open, not just sequentially read.
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IO"), "1", StringComparison.Ordinal))
+        {
+            var name = stream is FileStream preadStream ? preadStream.Name : $"fd:{fd}";
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pread path='{name}' fd={fd} off={offset} req={requested} read={read}");
         }
 
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
@@ -134,7 +149,14 @@ public static partial class KernelMemoryCompatExports
 
         try
         {
-            RandomAccess.Write(stream.SafeFileHandle, payload, offset);
+            if (stream is FileStream fileStream)
+            {
+                RandomAccess.Write(fileStream.SafeFileHandle, payload, offset);
+            }
+            else
+            {
+                stream.Write(payload, 0, payload.Length);
+            }
         }
         catch (IOException)
         {
@@ -180,7 +202,14 @@ public static partial class KernelMemoryCompatExports
 
         try
         {
-            stream.Flush(flushToDisk: true);
+            if (stream is FileStream fileStream)
+            {
+                fileStream.Flush(flushToDisk: true);
+            }
+            else
+            {
+                stream.Flush();
+            }
         }
         catch (IOException)
         {
@@ -198,7 +227,20 @@ public static partial class KernelMemoryCompatExports
         {
             foreach (var stream in _openFiles.Values)
             {
-                try { stream.Flush(flushToDisk: true); } catch (IOException) { }
+                try
+                {
+                    if (stream is FileStream fileStream)
+                    {
+                        fileStream.Flush(flushToDisk: true);
+                    }
+                    else
+                    {
+                        stream.Flush();
+                    }
+                }
+                catch (IOException)
+                {
+                }
             }
         }
 
@@ -558,6 +600,11 @@ public static partial class KernelMemoryCompatExports
                 BinaryPrimitives.WriteInt64LittleEndian(result[0..], transferred);
                 BinaryPrimitives.WriteUInt32LittleEndian(result[8..], AioStateCompleted);
                 _ = ctx.Memory.TryWrite(resultPtr, result);
+
+                // A thread may park in sceKernelSyncOnAddressWait on this result slot waiting for
+                // completion; writing the state word alone never wakes a futex waiter, so post the
+                // wake on the slot we just wrote.
+                KernelSyncOnAddressCompatExports.SignalAddressWaiters(resultPtr);
             }
         }
 
@@ -597,11 +644,21 @@ public static partial class KernelMemoryCompatExports
                     return -1;
                 }
 
-                RandomAccess.Write(stream.SafeFileHandle, scratch, offset);
+                if (stream is FileStream writeFileStream)
+                {
+                    RandomAccess.Write(writeFileStream.SafeFileHandle, scratch, offset);
+                }
+                else
+                {
+                    stream.Write(scratch, 0, scratch.Length);
+                }
+
                 return nbyte;
             }
 
-            var read = RandomAccess.Read(stream.SafeFileHandle, scratch, offset);
+            var read = stream is FileStream readFileStream
+                ? RandomAccess.Read(readFileStream.SafeFileHandle, scratch, offset)
+                : stream.Read(scratch, 0, scratch.Length);
             if (read > 0 && !ctx.Memory.TryWrite(buf, scratch.AsSpan(0, read)))
             {
                 return -1;

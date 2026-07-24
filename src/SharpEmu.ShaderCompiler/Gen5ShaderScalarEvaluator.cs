@@ -34,6 +34,17 @@ public static class Gen5ShaderScalarEvaluator
             Environment.GetEnvironmentVariable("SHARPEMU_STRICT_BUFFER_LOAD"),
             "1",
             StringComparison.Ordinal);
+
+    // SHARPEMU_LOG_CB_RESOLVE=1: dump every SBufferLoad V# resolution whose base lands in the
+    // Unity upload-pool window (the CB slot/offset-mismatch investigation) — the resource SGPR
+    // index, the raw 4 V# dwords, and the resolved base — so it can be cross-checked against the
+    // CPU producer's memcpy slots and the SH IndirectPatch blobs.
+    private static readonly bool _logCbResolve =
+        string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_LOG_CB_RESOLVE"),
+            "1",
+            StringComparison.Ordinal);
+    private static long _cbResolveTicks;
     private static readonly object _scalarFallbackTraceGate = new();
     private static readonly HashSet<(ulong Shader, uint Pc)> _tracedScalarFallbacks = [];
     // Shaders whose empty SRT/EUD caused a null-base scalar pointer load.
@@ -1876,6 +1887,17 @@ public static class Gen5ShaderScalarEvaluator
             ? bufferDescriptor.BaseAddress
             : scalarRegisters[scalarBase.Value] |
               ((ulong)scalarRegisters[scalarBase.Value + 1] << 32);
+        if (_logCbResolve && isBufferLoad &&
+            baseAddress >= 0x0000000602000000UL && baseAddress < 0x0000000603000000UL &&
+            System.Threading.Interlocked.Increment(ref _cbResolveTicks) <= 120)
+        {
+            var b = scalarBase.Value;
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.cb_resolve pc=0x{instruction.Pc:X} s{b} " +
+                $"vf=[0x{scalarRegisters[b]:X8}:0x{scalarRegisters[b + 1]:X8}:0x{scalarRegisters[b + 2]:X8}:0x{scalarRegisters[b + 3]:X8}] " +
+                $"base=0x{baseAddress:X} size={bufferDescriptor.SizeBytes} hasDesc={hasBufferDescriptor}");
+        }
+
         var dynamicOffset = control.DynamicOffsetRegister is { } offsetRegister &&
                             offsetRegister < ScalarRegisterCount
             ? scalarRegisters[offsetRegister]

@@ -197,6 +197,12 @@ public static class VideoOutExports
         public int FlipRate { get; set; }
         public ulong VblankCount { get; set; }
         public ulong FlipCount { get; set; }
+        // flipArg of the most recently submitted (== completed, since SharpEmu
+        // presents synchronously) flip. sceVideoOutGetFlipStatus reports it at
+        // status+0x18; a game's graphics thread polls that field to learn which
+        // of its outstanding flips has finished (e.g. Neva's triple-buffered
+        // 0/1/2 flip loop). Returning 0 here strands that loop after one frame.
+        public long LastCompletedFlipArg { get; set; }
         public int CurrentBuffer { get; set; } = -1;
         public uint OutputWidth { get; set; } = 1920;
         public uint OutputHeight { get; set; } = 1080;
@@ -710,16 +716,22 @@ public static class VideoOutExports
 
         ulong count;
         uint currentBuffer;
+        long lastFlipArg;
         lock (_stateGate)
         {
             count = port.FlipCount;
             currentBuffer = unchecked((uint)port.CurrentBuffer);
+            lastFlipArg = port.LastCompletedFlipArg;
         }
 
+        // SceVideoOutFlipStatus layout: count@0x00, processTime@0x08, tsc@0x10,
+        // flipArg@0x18 (the last COMPLETED flip's arg), submitTsc@0x20. The
+        // flipArg field is load-bearing: graphics threads poll it to match a
+        // completed flip back to the arg they submitted.
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x00, count);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x08, 0);
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x10, 0);
-        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, 0);
+        KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x18, unchecked((ulong)lastFlipArg));
         KernelMemoryCompatExports.TryWriteUInt64Compat(ctx, statusAddress + 0x20, currentBuffer);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1159,6 +1171,7 @@ public static class VideoOutExports
 
             port.CurrentBuffer = bufferIndex;
             port.FlipCount++;
+            port.LastCompletedFlipArg = flipArg;
             eventHint = SceVideoOutInternalEventFlip |
                 ((unchecked((ulong)flipArg) & 0x0000_FFFF_FFFF_FFFFUL) << 16);
             flipEventCount = port.FlipEvents.Count;

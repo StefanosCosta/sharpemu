@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using SharpEmu.HLE;
@@ -116,6 +118,30 @@ public sealed unsafe partial class DirectExecutionBackend
 
 		WarmUpPosixSignalPath();
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
+		SharpEmu.HLE.GuestWriteRipWatch.WarmUp();
+		SharpEmu.HLE.GuestSingleStepTracer.WarmUp();
+		SharpEmu.HLE.GuestAddrWriteCatcher.WarmUp();
+		SharpEmu.HLE.GuestRipBreakpoint.WarmUp();
+		SharpEmu.HLE.GuestExecLogger.WarmUp();
+
+		// A code-trap (INT3 breakpoint / single-step, SIGTRAP) or a write-watch
+		// (mprotect'd page, SIGSEGV) tool can fault while a guest thread runs on a
+		// freshly continuation-resumed runner thread. The Core continuation-resume
+		// chain is never in ModuleManager's HLE-only warm sweep, so its first resume
+		// JITs lazily; if a signal intersects a still-cold method there the JIT runs
+		// in the signal frame and fail-fasts ("UnmanagedCallersOnly method from
+		// managed code"). Pre-JIT the chain when any such tool is active so no method
+		// is cold under the signal. Gated, so a normal run's warm set is unchanged.
+		// GuestWriteRipWatch.Enabled only flips once a watch is armed at runtime, so
+		// the dynamic-arming intent (SHARPEMU_HOOK_ARM_WRITE) must be checked too.
+		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled ||
+			SharpEmu.HLE.GuestSingleStepTracer.Enabled ||
+			SharpEmu.HLE.GuestWriteRipWatch.Enabled ||
+			SharpEmu.HLE.GuestExecLogger.WriteWatchArmingEnabled ||
+			SharpEmu.HLE.GuestAddrWriteCatcher.Enabled)
+		{
+			WarmUpContinuationResumeChain();
+		}
 
 		if (!InstallPosixSignalHandler(PosixSigSegv) ||
 			!InstallPosixSignalHandler(PosixSigBus) ||
@@ -155,6 +181,14 @@ public sealed unsafe partial class DirectExecutionBackend
 		{
 			((delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal)(PosixSigSegv, 0, (nint)fakeUcontext);
 
+			// Warm the SIGTRAP breakpoint path too (SHARPEMU_BP_RIP): its managed
+			// code must be fully JITted before the first real INT3 fault, or that
+			// JIT runs inside the signal frame on a cold guest/worker thread and
+			// faults ("Invalid Program: … UnmanagedCallersOnly"). The fake ucontext
+			// has RIP=0, so GuestRipBreakpoint.TryHandleTrap finds no match and
+			// returns without touching guest memory.
+			((delegate* unmanaged<int, nint, nint, void>)&HandlePosixSignal)(PosixSigTrap, 0, (nint)fakeUcontext);
+
 			// Warm the branches the fabricated fault above skips without
 			// spamming diagnostics: the benign-exception path through
 			// VectoredHandler, the lazy-commit probe (fault address 0 bails
@@ -180,6 +214,51 @@ public sealed unsafe partial class DirectExecutionBackend
 		finally
 		{
 			_posixSignalWarmup = false;
+		}
+	}
+
+	/// <summary>
+	/// Pre-JIT the guest-thread continuation-resume chain so none of it compiles
+	/// lazily on a runner thread while a code-trap SIGTRAP is pending. Only invoked
+	/// when a breakpoint/single-step tool is enabled (a diagnostic run); a normal run
+	/// leaves these methods to JIT on first use as before. Best-effort: a failed
+	/// PrepareMethod (e.g. an unexpected overload/signature) is swallowed so it can
+	/// never break handler installation.
+	/// </summary>
+	private static void WarmUpContinuationResumeChain()
+	{
+		var t = typeof(DirectExecutionBackend);
+		string[] names =
+		{
+			// Fresh guest-thread entry path (RunGuestThread → ExecuteGuestThreadEntry)
+			// AND the blocked-continuation resume path — a SIGTRAP can interrupt guest
+			// code entered via either, so warm both entry chains, not just continuation.
+			nameof(ExecuteGuestThreadEntry),
+			nameof(ExecuteBlockedGuestThreadContinuation),
+			nameof(ApplyGuestContinuation),
+			nameof(ExecuteGuestContinuationEntry),
+			nameof(CallNativeEntry),
+			nameof(RestoreActiveExecutionThread),
+			nameof(BindTlsBase),
+			nameof(EmitHostNonvolatileXmmSave),
+		};
+		foreach (var name in names)
+		{
+			foreach (var m in t.GetMethods(BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+			{
+				if (m.Name != name || m.IsGenericMethodDefinition)
+				{
+					continue;
+				}
+				try
+				{
+					RuntimeHelpers.PrepareMethod(m.MethodHandle);
+				}
+				catch
+				{
+					// Warming is best-effort; never let it abort handler setup.
+				}
+			}
 		}
 	}
 
@@ -230,6 +309,83 @@ public sealed unsafe partial class DirectExecutionBackend
 		}
 		try
 		{
+			// Diagnostic single-step / branch tracer (SHARPEMU_TRACE_SS): consumes
+			// the arm-INT3 hit, step-over return-INT3s, and every TF single-step
+			// trap while active. Placed before the breakpoint path; it returns
+			// false when idle so a genuine SHARPEMU_BP_RIP INT3 still reaches the
+			// breakpoint handler (the two tools own disjoint addresses).
+			if (signal == PosixSigTrap && SharpEmu.HLE.GuestSingleStepTracer.Enabled)
+			{
+				var ssRegisters = GetPosixRegisterBase(ucontext);
+				if (ssRegisters != null &&
+					SharpEmu.HLE.GuestSingleStepTracer.TryHandleTrap((nint)ssRegisters))
+				{
+					return;
+				}
+			}
+
+			// Data-write catcher (SHARPEMU_CATCH_WRITE): the TF single-step trap after
+			// a caught store, which re-protects the target page.
+			if (signal == PosixSigTrap && SharpEmu.HLE.GuestAddrWriteCatcher.Enabled)
+			{
+				var cwRegisters = GetPosixRegisterBase(ucontext);
+				if (cwRegisters != null &&
+					SharpEmu.HLE.GuestAddrWriteCatcher.TryHandleTrap((nint)cwRegisters))
+				{
+					return;
+				}
+			}
+
+			// Diagnostic software breakpoint (SHARPEMU_BP_RIP): an INT3 patch
+			// raises SIGTRAP; capture the register file, restore the original
+			// byte, and rewind RIP so the real instruction re-executes.
+			if (signal == PosixSigTrap && SharpEmu.HLE.GuestRipBreakpoint.Enabled)
+			{
+				var bpRegisters = GetPosixRegisterBase(ucontext);
+				if (bpRegisters != null)
+				{
+					int[] bpOffsets = PosixRegisterOffsets;
+					var trapRip = *(ulong*)(bpRegisters + bpOffsets[16]);
+					if (SharpEmu.HLE.GuestRipBreakpoint.TryHandleTrap(
+							trapRip,
+							*(ulong*)(bpRegisters + bpOffsets[0]),   // rax
+							*(ulong*)(bpRegisters + bpOffsets[3]),   // rbx
+							*(ulong*)(bpRegisters + bpOffsets[1]),   // rcx
+							*(ulong*)(bpRegisters + bpOffsets[2]),   // rdx
+							*(ulong*)(bpRegisters + bpOffsets[6]),   // rsi
+							*(ulong*)(bpRegisters + bpOffsets[7]),   // rdi
+							*(ulong*)(bpRegisters + bpOffsets[5]),   // rbp
+							*(ulong*)(bpRegisters + bpOffsets[4]),   // rsp
+							*(ulong*)(bpRegisters + bpOffsets[12]),  // r12
+							*(ulong*)(bpRegisters + bpOffsets[13]),  // r13
+							*(ulong*)(bpRegisters + bpOffsets[14]),  // r14
+							*(ulong*)(bpRegisters + bpOffsets[15]),  // r15
+							out var newRip, out var newRsp))
+					{
+						*(ulong*)(bpRegisters + bpOffsets[16]) = newRip;   // rip
+						*(ulong*)(bpRegisters + bpOffsets[4]) = newRsp;    // rsp
+						return;
+					}
+				}
+			}
+
+			// Data-write catcher (SHARPEMU_CATCH_WRITE): a write-fault on its target page
+			// - record the writer (when it hits the target address) and single-step the
+			// store so it retires; before the image/heap write-trackers so it owns its page.
+			if (SharpEmu.HLE.GuestAddrWriteCatcher.Enabled &&
+				signal != PosixSigIll &&
+				siginfo != 0)
+			{
+				var cwFaultRegisters = GetPosixRegisterBase(ucontext);
+				if (cwFaultRegisters != null &&
+					SharpEmu.HLE.GuestAddrWriteCatcher.TryHandleWriteFault(
+						*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset),
+						(nint)cwFaultRegisters))
+				{
+					return;
+				}
+			}
+
 			// Guest-image write tracking runs first: it only needs the fault
 			// address (safe for host and guest threads alike) and must resume
 			// the faulting write immediately after restoring write access.
@@ -241,8 +397,34 @@ public sealed unsafe partial class DirectExecutionBackend
 				return;
 			}
 
+			// Diagnostic RIP write-watch (SHARPEMU_WATCH_WRITE_RIP): needs both
+			// the fault address and the faulting instruction pointer, so it reads
+			// RIP from the register context (last PosixRegisterOffsets entry).
+			if (SharpEmu.HLE.GuestWriteRipWatch.Enabled &&
+				signal != PosixSigIll &&
+				siginfo != 0)
+			{
+				var ripWatchRegisters = GetPosixRegisterBase(ucontext);
+				if (ripWatchRegisters != null &&
+					SharpEmu.HLE.GuestWriteRipWatch.TryHandleWriteFault(
+						*(ulong*)((byte*)siginfo + PosixSigInfoAddressOffset),
+						*(ulong*)(ripWatchRegisters + PosixRegisterOffsets[PosixRegisterOffsets.Length - 1])))
+				{
+					return;
+				}
+			}
+
 			if (TryHandlePosixFault(signal, siginfo, ucontext))
 			{
+				// A handled fault often just committed a lazily-reserved page.
+				// Re-attempt arming any pending RIP write-watch now (signal-safe:
+				// mprotect only, no allocation/Console) so a freshly-committed
+				// page is protected before the guest's retried store lands - the
+				// import-boundary re-arm alone races that first store.
+				if (SharpEmu.HLE.GuestWriteRipWatch.Enabled)
+				{
+					SharpEmu.HLE.GuestWriteRipWatch.Arm();
+				}
 				return;
 			}
 		}

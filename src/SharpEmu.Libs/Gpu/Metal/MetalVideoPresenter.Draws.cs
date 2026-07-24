@@ -981,7 +981,7 @@ internal static partial class MetalVideoPresenter
     private static void EncodeDrawCall(nint encoder, TranslatedGuestDraw draw)
     {
         var primitive = GetPrimitiveType(draw.PrimitiveType);
-        var vertexCount = draw.PrimitiveType == 0x11 && draw.IndexBuffer is null
+        var vertexCount = draw.PrimitiveType == GuestPrimitiveType.RectList && draw.IndexBuffer is null
             ? 4u
             : draw.VertexCount;
         if (draw.IndexBuffer is { } indexBuffer)
@@ -2019,7 +2019,9 @@ internal static partial class MetalVideoPresenter
 
                 return 3;
             case 6:
-            case 0x11:
+            // A rectangle list's three corners plus the derived fourth are a
+            // four-vertex strip; a triangle would cover only half the rectangle.
+            case GuestPrimitiveType.RectList:
                 return 4;
             default:
                 return 3;

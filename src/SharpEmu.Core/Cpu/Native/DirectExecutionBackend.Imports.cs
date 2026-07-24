@@ -3,6 +3,7 @@
 
 using System;
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
@@ -33,10 +34,80 @@ public sealed partial class DirectExecutionBackend
 	private const int ImportVectorRegisterCount = 8;
 	private const ulong StackCheckGuardValue = 0xC0DEC0DECAFEBA00UL;
 	private static long _canaryReturnRecoveries;
+	private static readonly List<ulong> _debugWriteWatchAddresses =
+		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_WRITE_ADDRS"));
+	private static readonly ulong[] _debugWriteWatchLastValues =
+		Enumerable.Repeat(ulong.MaxValue, _debugWriteWatchAddresses.Count).ToArray();
+	private static readonly List<ulong> _debugRetAddrs =
+		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_LOG_RET_ADDRS"));
+
+	// Reads and logs one guest u64 (SHARPEMU_LOG_MEM_U64=<hex addr>) alongside every
+	// SHARPEMU_LOG_RET_ADDRS hit, so a counter/field at a known address (e.g. a queue depth)
+	// can be sampled at the natural cadence of a specific call site instead of needing a
+	// live debug-server pause (which is unreliable against an already-running thread).
+	private static readonly ulong _debugMemU64Address =
+		ParseDiagnosticAddresses(Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEM_U64")) is { Count: > 0 } memU64Addrs
+			? memU64Addrs[0]
+			: 0UL;
+
+	// Samples the first few calls of a specific NID (SHARPEMU_LOG_NID_RET_SAMPLE=<nid>) so the
+	// caller's return address can be discovered without knowing it up front - the inverse of
+	// SHARPEMU_LOG_RET_ADDRS, useful once a NidHistogram capture identifies a hot NID but not
+	// which guest call site is driving it.
+	private static readonly string? _debugNidRetSampleTarget =
+		Environment.GetEnvironmentVariable("SHARPEMU_LOG_NID_RET_SAMPLE");
+	private static long _debugNidRetSampleCount;
+
+	// Logs every import made by one or more named guest threads
+	// (SHARPEMU_TRACE_IMPORTS_THREAD=<name>[,<name>...]) as nid + return-rip + first args, so the
+	// call sequence a specific thread runs right up to the point it parks can be reconstructed from
+	// the log tail; tracing several threads at once shows their interleaving. Cheap when unset.
+	// The special name __BARE__ matches imports made with NO cooperative guest-thread state.
+	private static readonly string[] _traceImportsThreads =
+		(Environment.GetEnvironmentVariable("SHARPEMU_TRACE_IMPORTS_THREAD") ?? string.Empty)
+			.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+	// A trace name ending in '*' matches by prefix (e.g. "Thread-*" matches the
+	// run-specific handle-named threads); otherwise it is an exact match.
+	private static bool TraceImportsMatches(string? name)
+	{
+		if (name == null)
+		{
+			return false;
+		}
+
+		foreach (var pattern in _traceImportsThreads)
+		{
+			if (pattern.EndsWith('*'))
+			{
+				if (name.AsSpan().StartsWith(pattern.AsSpan(0, pattern.Length - 1), StringComparison.Ordinal))
+				{
+					return true;
+				}
+			}
+			else if (string.Equals(name, pattern, StringComparison.Ordinal))
+			{
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// Per-window NID call-count breakdown (SHARPEMU_LOG_NID_HISTOGRAM=1), flushed and reset every
+	// ~2 real seconds rather than accumulated forever, so a dump shows what's actually firing
+	// *right now* during a steady-state stall instead of being dominated by whatever ran most
+	// during boot. Distinguishes "only one NID is ever called" (genuine starvation) from "other
+	// NIDs are interleaved at some rate" (some other guest thread is doing real work), which raw
+	// per-OS-thread CPU sampling cannot do under this scheduler's cooperative multiplexing.
+	private static readonly bool _nidHistogramEnabled =
+		string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_NID_HISTOGRAM"), "1", StringComparison.Ordinal);
+	private static readonly ConcurrentDictionary<string, long> _nidHistogram = new();
+	private static long _nidHistogramLastFlushTicks = Environment.TickCount64;
 
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
+	private int _il2CppApiLookupFailures;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -64,6 +135,28 @@ public sealed partial class DirectExecutionBackend
 			Console.Error.WriteLine(
 				$"[LOADER][ERROR] ImportDispatchGatewayManaged exception: {ex.GetType().Name}: {ex.Message}");
 			return 18446744071562199298uL;
+		}
+	}
+
+	// Win64 gateway for the signal-free guest execution logger (SHARPEMU_GUEST_HOOK).
+	// Reached by a normal call from a planted E9 detour trampoline running in preemptive
+	// guest context — never from a signal frame — so recording may JIT/allocate freely.
+	// Never throws back into guest code.
+	private static void GuestHookGatewayManaged(nint backendHandle, int hookIndex, nint snapshotPtr)
+	{
+		try
+		{
+			if (!(GCHandle.FromIntPtr(backendHandle).Target is DirectExecutionBackend))
+			{
+				return;
+			}
+
+			SharpEmu.HLE.GuestExecLogger.Capture(hookIndex, snapshotPtr);
+		}
+		catch (Exception ex)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][ERROR] GuestHookGatewayManaged exception: {ex.GetType().Name}: {ex.Message}");
 		}
 	}
 
@@ -145,6 +238,37 @@ public sealed partial class DirectExecutionBackend
 	private unsafe ulong DispatchImport(int importIndex, nint argPackPtr)
 	{
 		long num = NextImportDispatchIndex();
+		for (var watchIndex = 0; watchIndex < _debugWriteWatchAddresses.Count; watchIndex++)
+		{
+			var watchAddress = _debugWriteWatchAddresses[watchIndex];
+			var currentValue = *(ulong*)watchAddress;
+			if (currentValue != _debugWriteWatchLastValues[watchIndex])
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WATCH] addr=0x{watchAddress:X16} changed 0x{_debugWriteWatchLastValues[watchIndex]:X16} -> 0x{currentValue:X16} before import#{num}");
+				_debugWriteWatchLastValues[watchIndex] = currentValue;
+			}
+		}
+		if (SharpEmu.HLE.GuestWriteRipWatch.Enabled)
+		{
+			SharpEmu.HLE.GuestWriteRipWatch.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled)
+		{
+			SharpEmu.HLE.GuestRipBreakpoint.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestExecLogger.Enabled)
+		{
+			SharpEmu.HLE.GuestExecLogger.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestSingleStepTracer.Enabled)
+		{
+			SharpEmu.HLE.GuestSingleStepTracer.ArmAndFlush();
+		}
+		if (SharpEmu.HLE.GuestAddrWriteCatcher.Enabled)
+		{
+			SharpEmu.HLE.GuestAddrWriteCatcher.ArmAndFlush();
+		}
 		if ((num & 0x3F) == 0)
 		{
 			MarkExecutionProgress();
@@ -267,6 +391,15 @@ public sealed partial class DirectExecutionBackend
 				return 0;
 			}
 		}
+		// SHARPEMU_TRACE_IMPORTS_THREAD=__BARE__ traces imports made with NO active
+		// cooperative guest-thread state (guest=0 in the syncaddr log) - e.g. the
+		// primordial thread running outside the cooperative scheduler.
+		if (_activeGuestThreadState is null && TraceImportsMatches("__BARE__"))
+		{
+			Console.Error.WriteLine(
+				$"[IMPTRACE] __BARE__ {importStubEntry.Export?.LibraryName}:{importStubEntry.Export?.Name ?? importStubEntry.Nid} ({importStubEntry.Nid}) " +
+				$"ret=0x{num7:X16} rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+		}
 		if (_activeGuestThreadState is { } activeGuestThreadState)
 		{
 			Interlocked.Increment(ref activeGuestThreadState.ImportCount);
@@ -287,6 +420,13 @@ public sealed partial class DirectExecutionBackend
 			// Publish the NID last so readers cannot pair a new import name with
 			// the preceding import's argument snapshot.
 			Volatile.Write(ref activeGuestThreadState.LastImportNid, importStubEntry.Nid);
+			if (TraceImportsMatches(activeGuestThreadState.Name))
+			{
+				Console.Error.WriteLine(
+					$"[IMPTRACE] {activeGuestThreadState.Name} #{Interlocked.Read(ref activeGuestThreadState.ImportCount)} " +
+					$"{importStubEntry.Export?.LibraryName}:{importStubEntry.Export?.Name ?? importStubEntry.Nid} ({importStubEntry.Nid}) " +
+					$"ret=0x{num7:X16} rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16}");
+			}
 		}
 		if (_logStrlenBursts)
 		{
@@ -314,6 +454,21 @@ public sealed partial class DirectExecutionBackend
 			}
 			Console.Error.WriteLine(
 				$"[LOADER][TRACE] bootstrap_call#{num}: op=0x{value:X16} sym_ptr=0x{value2:X16} sym='{symbolText}' out_ptr=0x{num3:X16} ret=0x{num7:X16}");
+		}
+		// Host shutdown safe-point. Once RequestHostShutdown/Dispose set the
+		// backend-wide forced-exit flag, redirect ANY thread currently returning
+		// through an import - including cooperative guest workers - out to the
+		// host-exit sentinel. A thread spinning on a non-blocking import (e.g. an
+		// FMOD audio worker re-calling sceKernelSignalSema) never surfaces the
+		// shutdown at a guest-code entry boundary otherwise, so it would loop
+		// forever and stall guest-thread quiescence. Gate on the raw shutdown
+		// field (not ActiveForcedGuestExit, which TryForceGuestExitToHostStub
+		// itself sets) and NOT on !isGuestWorker (the offending thread is one).
+		if (_forcedGuestExit &&
+			TryForceGuestExitToHostStub(argPackPtr, num, num7, importStubEntry.Nid, shutdown: true))
+		{
+			cpuContext[CpuRegister.Rax] = 1uL;
+			return 1uL;
 		}
 		if (!isGuestWorker &&
 			!ActiveForcedGuestExit &&
@@ -518,6 +673,21 @@ public sealed partial class DirectExecutionBackend
 						cpuContext[CpuRegister.Rax] = unchecked((ulong)returnValue);
 					}
 					orbisGen2Result = (OrbisGen2Result)returnValue;
+					// Return-value differential (SHARPEMU_TRACE_IMPORTS_THREAD): log the HLE
+					// result + read-back of the likely out-param pointers (*rsi, *rdx), so a
+					// capability/size query that returns a wrong value (which could flip the
+					// guest into a disabled/synchronous-fallback path) is visible.
+					if (_traceImportsThreads.Length != 0 &&
+						TraceImportsMatches(_activeGuestThreadState?.Name ?? "__BARE__"))
+					{
+						var outRsi = cpuContext.TryReadUInt64(value2, out var outRsiValue) ? outRsiValue : 0UL;
+						var outRdx = cpuContext.TryReadUInt64(num3, out var outRdxValue) ? outRdxValue : 0UL;
+						Console.Error.WriteLine(
+							$"[IMPRET] {_activeGuestThreadState?.Name ?? "__BARE__"} " +
+							$"{cachedExport.LibraryName}:{cachedExport.Name} ({importStubEntry.Nid}) " +
+							$"rax=0x{cpuContext[CpuRegister.Rax]:X16} ret={returnValue} " +
+							$"rsi=0x{value2:X} *rsi=0x{outRsi:X16} rdx=0x{num3:X} *rdx=0x{outRdx:X16}");
+					}
 				}
 				else
 				{
@@ -580,7 +750,8 @@ public sealed partial class DirectExecutionBackend
 				{
 					Console.Error.WriteLine(
 						$"[LOADER][WARN] Import#{num} result: {orbisGen2Result} ({importStubEntry.Nid}) " +
-						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16}");
+						$"rdi=0x{value:X16} rsi=0x{value2:X16} rdx=0x{num3:X16} rcx=0x{num4:X16} ret=0x{num7:X16} " +
+						$"guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} managed={Environment.CurrentManagedThreadId}");
 				}
 			}
 			cpuContext[CpuRegister.Rbx] = value3;
@@ -1298,6 +1469,50 @@ public sealed partial class DirectExecutionBackend
 				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 				$"ret=0x{returnRip:X16}");
 		}
+		if (_debugRetAddrs.Count != 0 && _debugRetAddrs.Contains(returnRip))
+		{
+			var memU64Suffix = "";
+			if (_debugMemU64Address != 0 && cpuContext.TryReadUInt64(_debugMemU64Address, out var memU64Value))
+			{
+				memU64Suffix = $" mem[0x{_debugMemU64Address:X16}]=0x{memU64Value:X16} ({memU64Value})";
+			}
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] RetAddrHit#{dispatchIndex}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"rax=0x{cpuContext[CpuRegister.Rax]:X16} r15=0x{cpuContext[CpuRegister.R15]:X16} " +
+				$"r12=0x{cpuContext[CpuRegister.R12]:X16} r13=0x{cpuContext[CpuRegister.R13]:X16} " +
+				$"r14=0x{cpuContext[CpuRegister.R14]:X16} rbx=0x{cpuContext[CpuRegister.Rbx]:X16} " +
+				$"rbp=0x{cpuContext[CpuRegister.Rbp]:X16} " +
+				$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+				$"managed={Environment.CurrentManagedThreadId}{memU64Suffix}");
+		}
+		if (_debugNidRetSampleTarget is { Length: > 0 } &&
+			string.Equals(importStubEntry.Nid, _debugNidRetSampleTarget, StringComparison.Ordinal) &&
+			Interlocked.Increment(ref _debugNidRetSampleCount) % 3000 == 1)
+		{
+			Console.Error.WriteLine(
+				$"[LOADER][TRACE] NidRetSample#{_debugNidRetSampleCount}: {export.LibraryName}:{export.Name} ({importStubEntry.Nid}) " +
+				$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
+				$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
+				$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16}");
+		}
+		if (_nidHistogramEnabled)
+		{
+			_nidHistogram.AddOrUpdate($"{export.LibraryName}:{export.Name} ({importStubEntry.Nid})", 1, static (_, count) => count + 1);
+			var now = Environment.TickCount64;
+			var last = Volatile.Read(ref _nidHistogramLastFlushTicks);
+			if (now - last >= 2000 && Interlocked.CompareExchange(ref _nidHistogramLastFlushTicks, now, last) == last)
+			{
+				var snapshot = _nidHistogram.ToArray();
+				_nidHistogram.Clear();
+				Console.Error.WriteLine($"[LOADER][INFO] NidHistogram window={now - last}ms distinct={snapshot.Length}:");
+				foreach (var entry in snapshot.OrderByDescending(static kv => kv.Value).Take(20))
+				{
+					Console.Error.WriteLine($"[LOADER][INFO]   {entry.Value,10} x {entry.Key}");
+				}
+			}
+		}
 
 		int returnValue;
 		if (importStubEntry.IsNoBlockLeaf)
@@ -1347,7 +1562,8 @@ public sealed partial class DirectExecutionBackend
 					$"rdi=0x{arg0:X16} rsi=0x{cpuContext[CpuRegister.Rsi]:X16} " +
 					$"rdx=0x{cpuContext[CpuRegister.Rdx]:X16} rcx=0x{cpuContext[CpuRegister.Rcx]:X16} " +
 					$"r8=0x{cpuContext[CpuRegister.R8]:X16} r9=0x{cpuContext[CpuRegister.R9]:X16} " +
-					$"ret=0x{returnRip:X16}");
+					$"ret=0x{returnRip:X16} guest=0x{GuestThreadExecution.CurrentGuestThreadHandle:X16} " +
+					$"managed={Environment.CurrentManagedThreadId}");
 			}
 		}
 
@@ -1437,6 +1653,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedFileProbeMiss =
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
 			IsExpectedFileProbeNotFoundNid(nid);
+		var expectedUnwindModuleMiss =
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
+			IsExpectedUnwindModuleMissNid(nid);
 		var expectedTimedWaitTimeout =
 			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
 			unchecked((int)result) == 60;
@@ -1459,6 +1678,7 @@ public sealed partial class DirectExecutionBackend
 			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960009);
 		if (!expectedFileProbeMiss &&
+			!expectedUnwindModuleMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
@@ -1498,6 +1718,16 @@ public sealed partial class DirectExecutionBackend
 			"eV9wAD2riIA" or // sceKernelStat
 			"1G3lF1Gg1k8" or // sceKernelOpen
 			"gEpBkcwxUjw";   // sceKernelAprResolveFilepathsToIdsAndFileSizes
+
+	// The C++ unwinder probes these for every frame's return address; the top-of-chain
+	// frame's return address is SharpEmu's own host guest-return sentinel (not a guest
+	// module), so NOT_FOUND is the expected terminal "stop" signal, emitted on every
+	// exception unwind. Route it through the sampled/suppressed path so heavy-exception
+	// titles (subnautica) don't flood the log.
+	private static bool IsExpectedUnwindModuleMissNid(string nid) =>
+		nid is
+			"RpQJJVKTiFM" or // sceKernelGetModuleInfoForUnwind
+			"4fU5yvOkVG4";   // sceSysmoduleGetModuleInfoForUnwind
 
 	private bool IsLeafImport(string nid)
 	{
@@ -1651,7 +1881,7 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
-	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid)
+	private unsafe bool TryForceGuestExitToHostStub(nint argPackPtr, long dispatchIndex, ulong returnRip, string nid, bool shutdown = false)
 	{
 		ulong num = ActiveEntryReturnSentinelRip;
 		if (num < 65536 || !TryPatchActiveGuestReturnSlot(num))
@@ -1667,6 +1897,14 @@ public sealed partial class DirectExecutionBackend
 			return false;
 		}
 		ActiveForcedGuestExit = true;
+		if (shutdown)
+		{
+			// Host shutdown redirect: not a stall, so skip the loop-guard LastError
+			// text and the recent-import dump. The thread simply winds out at the
+			// host-exit sentinel so teardown can reach guest-thread quiescence.
+			Console.Error.WriteLine($"[LOADER][INFO] Forced guest exit on host shutdown at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
+			return true;
+		}
 		LastError = $"Detected repeating import loop at import#{dispatchIndex} ({nid}) and forced guest exit.";
 		Console.Error.WriteLine($"[LOADER][ERROR] Import-loop guard fired at import#{dispatchIndex}: nid={nid} ret=0x{returnRip:X16} -> host_exit=0x{num:X16}");
 		DumpRecentImportTrace();
@@ -2028,8 +2266,7 @@ public sealed partial class DirectExecutionBackend
 		ulong outputAddress = cpuContext[CpuRegister.Rdx];
 		if (!TryReadAsciiZ(symbolNameAddress, 512, out var symbolName))
 		{
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		var moduleHandle = unchecked((int)cpuContext[CpuRegister.Rdi]);
 		if (!TryResolveModuleSymbolAddress(moduleHandle, symbolName, out var resolvedAddress) &&
@@ -2039,8 +2276,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DLSYM"), "1", StringComparison.Ordinal))
 		{
@@ -2049,10 +2285,31 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (outputAddress == 0L || !TryWriteUInt64Compat(outputAddress, resolvedAddress))
 		{
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		cpuContext[CpuRegister.Rax] = 0uL;
+		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	/// <summary>
+	/// Shared failure return for <see cref="DispatchKernelDynlibDlsym"/>.
+	/// </summary>
+	/// <remarks>
+	/// Zeroing the caller's out-slot is the important half: callers pass the address of an
+	/// uninitialised local, and leaving it untouched on failure makes the guest bind whatever
+	/// stack residue was there as the resolved symbol and later call through it (observed as an
+	/// execute fault at 0xFFFFFFFFFFFFFFFF while a Unity title bound its IL2CPP API table).
+	/// The status also moves off -1, which is not a representable SCE error, onto the same
+	/// ENOENT the unresolved-import path returns.
+	/// </remarks>
+	private OrbisGen2Result FailKernelDynlibDlsym(CpuContext cpuContext, ulong outputAddress)
+	{
+		if (outputAddress != 0)
+		{
+			_ = TryWriteUInt64Compat(outputAddress, 0);
+		}
+
+		cpuContext[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
 		return OrbisGen2Result.ORBIS_GEN2_OK;
 	}
 
@@ -2116,14 +2373,21 @@ public sealed partial class DirectExecutionBackend
 			!TryResolveIl2CppApiAddress(symbolName, out var resolvedAddress) ||
 			!TryWriteUInt64Compat(outputAddress, resolvedAddress))
 		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] il2cpp_api_lookup_symbol failed: name='{symbolName}' out=0x{outputAddress:X16}");
+			// A title binds its whole IL2CPP API table one symbol at a time, so an
+			// unresolvable runtime floods hundreds of identical lines; sample them.
+			var failure = Interlocked.Increment(ref _il2CppApiLookupFailures);
+			if (failure <= 16 || failure % 256 == 0)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] il2cpp_api_lookup_symbol failed #{failure}: name='{symbolName}' out=0x{outputAddress:X16}");
+			}
+
 			if (outputAddress != 0)
 			{
 				_ = TryWriteUInt64Compat(outputAddress, 0);
 			}
 
-			cpuContext[CpuRegister.Rax] = ulong.MaxValue;
+			cpuContext[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}
 

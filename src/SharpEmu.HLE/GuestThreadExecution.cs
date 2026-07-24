@@ -30,6 +30,25 @@ public readonly record struct GuestThreadSnapshot(
 /// false leaves it parked. Resume runs later on the woken thread outside that gate, and
 /// its return value becomes the guest's RAX for the resumed call.
 /// </summary>
+/// <remarks>
+/// <para><b>TryWake must be a pure, idempotent condition test.</b> It is NOT called only in
+/// response to a matching wake: the scheduler also probes it speculatively and without any key
+/// match — once synchronously right after the block registers (RunGuestThread's exit handler)
+/// and again after delivering a guest exception (RestoreInterruptedGuestThread). Concretely:</para>
+/// <list type="bullet">
+/// <item>No observable side effect when it returns <c>false</c>.</item>
+/// <item>Side effects (consuming a token, decrementing a count, granting ownership) only on the
+/// <c>true</c> branch — the caller guarantees it then re-readies the thread, so they commit once.</item>
+/// <item>Not all implementations are idempotent across two <c>true</c> results (the rwlock waiter
+/// grants ownership), which is why every call site invokes it under the guest-thread gate with
+/// <c>State == Blocked</c> re-checked inside. Keep any new call site to that rule.</item>
+/// </list>
+/// <para>A predicate that assumes "I was only called because someone woke me" will release its
+/// thread spuriously. Conversely, a predicate that can only detect an explicitly posted wake will
+/// strand its thread forever if the producer satisfies the condition without posting one — see
+/// <c>docs/cooperative-guest-blocking.md</c>, and the sync-on-address predicate for a worked
+/// example of testing the underlying condition rather than trusting the notification.</para>
+/// </remarks>
 public interface IGuestThreadBlockWaiter
 {
     int Resume();
@@ -116,6 +135,35 @@ public interface IGuestThreadScheduler
         ulong handler,
         int exceptionType,
         out string? error);
+
+    /// <summary>
+    /// Reports whether a guest exception (e.g. an asynchronously-delivered POSIX
+    /// signal) has been queued for the given thread but not yet run. A thread
+    /// host-parked in an HLE wait must consult this before and while it sleeps so
+    /// it can wake itself and return to an import boundary where the queued
+    /// handler is delivered; otherwise a signal raised on a parked thread is never
+    /// observed. Defaults to false for schedulers that never queue exceptions.
+    /// </summary>
+    bool HasPendingGuestException(ulong threadHandle) => false;
+
+    /// <summary>
+    /// Reports whether the CURRENT calling thread — cooperative or the external/
+    /// primordial thread whose handle an HLE cannot cheaply obtain — has a queued
+    /// guest exception. Host-parked HLE waits consult this before and while they
+    /// sleep. Defaults to false.
+    /// </summary>
+    bool HasPendingGuestExceptionForCurrentThread() => false;
+
+    /// <summary>
+    /// Runs any queued guest exception for the CURRENT calling thread synchronously,
+    /// in place, on this host thread — capturing the interrupted continuation from
+    /// the active import call frame — and returns after the handler returns. Returns
+    /// true if a handler was delivered. Host-parked HLE waits use this so an
+    /// asynchronously-delivered signal (e.g. an IL2CPP stop-the-world SIGUSR1) is
+    /// observed and acknowledged without spuriously returning from the wait. Defaults
+    /// to false.
+    /// </summary>
+    bool TryDeliverPendingGuestExceptionInPlace(CpuContext currentContext) => false;
 }
 
 public readonly record struct GuestImportCallFrame(
@@ -478,6 +526,17 @@ public static class GuestThreadExecution
             RestoreFullFpuState: false);
         return true;
     }
+
+    /// <summary>
+    /// Public wrapper over the block-continuation capture, for HLE waits that must
+    /// deliver a queued guest exception in place: it snapshots the interrupted guest
+    /// state from the live import call frame (return RIP / resume RSP / return slot)
+    /// plus the caller's register context, identical to what the import-boundary
+    /// delivery uses. Fails if there is no active import call frame.
+    /// </summary>
+    public static bool TryCaptureCurrentImportBoundaryContinuation(
+        CpuContext context, out GuestCpuContinuation continuation)
+        => TryCaptureCurrentBlockContinuation(context, out continuation);
 
     public static void RequestCurrentEntryExit(string reason, int status)
     {

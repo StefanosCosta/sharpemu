@@ -131,6 +131,11 @@ public sealed partial class DirectExecutionBackend
 			{
 				return -1;
 			}
+			if (exceptionCode == 3221225477u &&
+				TryRecoverLowAddressAccess(exceptionRecord, contextRecord, rip))
+			{
+				return -1;
+			}
 			if (exceptionCode == StatusIllegalInstruction &&
 				TryRecoverIllegalInstruction(contextRecord, rip))
 			{
@@ -180,6 +185,15 @@ public sealed partial class DirectExecutionBackend
 			ulong r13 = ReadCtxU64(contextRecord, 224);
 			ulong r14 = ReadCtxU64(contextRecord, 232);
 			ulong r15 = ReadCtxU64(contextRecord, 240);
+
+			// Drain the signal-free hook ring first. It is normally flushed from import
+			// dispatch, so the records for the few guest calls immediately preceding a fault
+			// — exactly the ones that explain it — were still unpublished when the process
+			// aborted. Cheap no-op when SHARPEMU_GUEST_HOOK is unset.
+			if (SharpEmu.HLE.GuestExecLogger.Enabled)
+			{
+				SharpEmu.HLE.GuestExecLogger.ArmAndFlush();
+			}
 
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.WriteLine("[LOADER][INFO] NATIVE EXCEPTION CAUGHT!");
@@ -400,7 +414,9 @@ public sealed partial class DirectExecutionBackend
 						rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp,
 						r8, r9, r10, r11, r12, r13, r14, r15);
 					DumpGuestReferenceDiagnostics();
+					DumpGuestMemScanDiagnostics();
 					DumpGuestPointerWindowDiagnostics();
+					SharpEmu.HLE.GuestImageWriteTracker.FlushPendingDiagnostics();
 					break;
 				case 2147483651u:
 					Console.Error.WriteLine("[LOADER][WARNING]   Type: Breakpoint (int3)");
@@ -410,6 +426,7 @@ public sealed partial class DirectExecutionBackend
 					Console.Error.WriteLine("[LOADER][ERROR]   Type: Abort (SIGABRT)");
 					DumpRecentImportTrace();
 					DumpGuestDisasmDiagnostics(rip, rbp, rsp);
+					SharpEmu.HLE.GuestImageWriteTracker.FlushPendingDiagnostics();
 					break;
 				case 3221225501u:
 					Console.Error.WriteLine("[LOADER][INFO]   Type: Illegal Instruction");
@@ -815,6 +832,7 @@ public sealed partial class DirectExecutionBackend
 
 		Console.Error.WriteLine(
 			$"[LOADER][INFO]   Ref scan targets: {string.Join(", ", targetList.ConvertAll(static addr => $"0x{addr:X16}"))}");
+		var scanStopwatch = System.Diagnostics.Stopwatch.StartNew();
 
 		var hitCounts = new Dictionary<ulong, int>(targetList.Count);
 		for (var i = 0; i < targetList.Count; i++)
@@ -841,7 +859,12 @@ public sealed partial class DirectExecutionBackend
 				IsReadableProtection(mbi.Protect) &&
 				IsExecutableProtection(mbi.Protect))
 			{
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Ref scan region 0x{regionBase:X16}..0x{regionEnd:X16} " +
+					$"(0x{regionEnd - regionBase:X} bytes) start t={scanStopwatch.Elapsed.TotalSeconds:F2}s");
 				ScanExecutableRegionForTargetReferences(regionBase, regionEnd, targetList, hitCounts, maxHitsPerTarget);
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Ref scan region 0x{regionBase:X16}..0x{regionEnd:X16} done t={scanStopwatch.Elapsed.TotalSeconds:F2}s");
 			}
 
 			var allTargetsSatisfied = true;
@@ -868,6 +891,141 @@ public sealed partial class DirectExecutionBackend
 			if (!hitCounts.TryGetValue(target, out var count) || count == 0)
 			{
 				Console.Error.WriteLine($"[LOADER][INFO]   Ref scan 0x{target:X16}: none");
+			}
+		}
+	}
+
+	// Temporary ASCII byte-pattern scanner (SHARPEMU_LOG_MEMSCAN_TEXT) for locating a string
+	// literal's guest address so SHARPEMU_LOG_REFSCAN_ADDRS can then find who reads it. Unlike
+	// DumpGuestReferenceDiagnostics, this must walk readable-but-not-executable regions too,
+	// since string literals normally live in rodata, not code.
+	private unsafe void DumpGuestMemScanDiagnostics()
+	{
+		var rawTargets = Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEMSCAN_TEXT");
+		if (string.IsNullOrWhiteSpace(rawTargets) || _cpuContext == null)
+		{
+			return;
+		}
+
+		var tokens = rawTargets.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+		var targets = new List<byte[]>(tokens.Length);
+		foreach (var token in tokens)
+		{
+			var bytes = System.Text.Encoding.ASCII.GetBytes(token);
+			if (bytes.Length > 0)
+			{
+				targets.Add(bytes);
+			}
+		}
+
+		if (targets.Count == 0)
+		{
+			return;
+		}
+
+		const ulong scanBase = 0x0000000800000000UL;
+		const ulong scanEnd = 0x0000000810000000UL;
+		const int maxHitsPerTarget = 24;
+
+		Console.Error.WriteLine($"[LOADER][INFO]   Mem scan targets: {string.Join(", ", tokens)}");
+		var scanStopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+		var hitCounts = new int[targets.Count];
+
+		ulong address = scanBase;
+		while (address < scanEnd)
+		{
+			if (VirtualQuery((void*)address, out var mbi, (nuint)sizeof(MEMORY_BASIC_INFORMATION64)) == 0)
+			{
+				break;
+			}
+
+			ulong regionBase = mbi.BaseAddress;
+			ulong regionEnd = regionBase + mbi.RegionSize;
+			if (regionEnd <= address)
+			{
+				break;
+			}
+
+			if (mbi.State == MEM_COMMIT && IsReadableProtection(mbi.Protect))
+			{
+				ScanRegionForByteTargets(regionBase, regionEnd, targets, hitCounts, maxHitsPerTarget);
+			}
+
+			var allTargetsSatisfied = true;
+			for (var i = 0; i < targets.Count; i++)
+			{
+				if (hitCounts[i] < maxHitsPerTarget)
+				{
+					allTargetsSatisfied = false;
+					break;
+				}
+			}
+
+			if (allTargetsSatisfied)
+			{
+				break;
+			}
+
+			address = regionEnd;
+		}
+
+		Console.Error.WriteLine($"[LOADER][INFO]   Mem scan done t={scanStopwatch.Elapsed.TotalSeconds:F2}s");
+		for (var i = 0; i < targets.Count; i++)
+		{
+			if (hitCounts[i] == 0)
+			{
+				Console.Error.WriteLine($"[LOADER][INFO]   Mem scan \"{tokens[i]}\": none");
+			}
+		}
+	}
+
+	private void ScanRegionForByteTargets(
+		ulong regionBase,
+		ulong regionEnd,
+		IReadOnlyList<byte[]> targets,
+		int[] hitCounts,
+		int maxHitsPerTarget)
+	{
+		if (_cpuContext == null || regionEnd <= regionBase)
+		{
+			return;
+		}
+
+		var regionLength = regionEnd - regionBase;
+		if (regionLength > int.MaxValue)
+		{
+			regionLength = int.MaxValue;
+		}
+
+		var buffer = new byte[(int)regionLength];
+		if (!_cpuContext.Memory.TryRead(regionBase, buffer))
+		{
+			return;
+		}
+
+		for (var t = 0; t < targets.Count; t++)
+		{
+			if (hitCounts[t] >= maxHitsPerTarget)
+			{
+				continue;
+			}
+
+			var needle = targets[t];
+			var searchOffset = 0;
+			while (hitCounts[t] < maxHitsPerTarget && searchOffset < buffer.Length)
+			{
+				var relativeIndex = buffer.AsSpan(searchOffset).IndexOf(needle);
+				if (relativeIndex < 0)
+				{
+					break;
+				}
+
+				var hitAddress = regionBase + (ulong)(searchOffset + relativeIndex);
+				hitCounts[t]++;
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Mem scan hit \"{System.Text.Encoding.ASCII.GetString(needle)}\" at 0x{hitAddress:X16}");
+				searchOffset += relativeIndex + 1;
 			}
 		}
 	}
@@ -949,6 +1107,23 @@ public sealed partial class DirectExecutionBackend
 		}
 	}
 
+	// A previous version of this scan disassembled every byte offset in the
+	// region looking for RIP-relative memory operands. That's the only fully
+	// general approach (a naive length-based linear sweep permanently
+	// desyncs from true instruction boundaries the moment it misdecodes one
+	// byte of embedded non-code data — jump tables, RTTI, literal pools), but
+	// full-decode-per-byte is far too slow across a multi-megabyte region:
+	// it never finished within the process's stall-watchdog window even
+	// after trimming decode-side overhead.
+	//
+	// Instead: bulk-read the region once, then do a cheap arithmetic
+	// pre-filter at every byte offset — compare the 4 bytes there against the
+	// disp32 value a RIP-relative operand would need to encode our target,
+	// assuming (correctly, for the MOV/LEA r64,[rip+disp32] forms this tool
+	// cares about) that the disp32 field is the last 4 bytes of the
+	// instruction. A false-arithmetic-match is a ~1-in-4-billion coincidence,
+	// so only real hits (plus vanishingly rare noise) ever reach the small
+	// number of real decodes used to confirm and format a match.
 	private void ScanExecutableRegionForTargetReferences(
 		ulong regionBase,
 		ulong regionEnd,
@@ -961,36 +1136,102 @@ public sealed partial class DirectExecutionBackend
 			return;
 		}
 
-		ulong rip = regionBase;
-		while (rip < regionEnd)
+		var regionLength = regionEnd - regionBase;
+		if (regionLength > int.MaxValue)
 		{
-			if (!IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, rip, maxLen: 15, out var bytes) ||
-				!IcedDecoder.TryDecode(rip, bytes, out var instruction) ||
-				instruction.Length <= 0)
+			regionLength = int.MaxValue;
+		}
+
+		var buffer = new byte[(int)regionLength];
+		if (!_cpuContext.Memory.TryRead(regionBase, buffer))
+		{
+			return;
+		}
+
+		for (var t = 0; t < targets.Count; t++)
+		{
+			var target = targets[t];
+			if (!hitCounts.TryGetValue(target, out var count) || count >= maxHitsPerTarget)
 			{
-				rip++;
 				continue;
 			}
 
-			if (instruction.MemoryAddress is { } memoryAddress)
+			for (var p = 0; p + 4 <= buffer.Length && count < maxHitsPerTarget; p++)
 			{
-				for (var i = 0; i < targets.Count; i++)
+				var disp32 = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(p, 4));
+				var assumedNextIp = regionBase + (ulong)p + 4;
+				var computedTarget = unchecked((ulong)((long)assumedNextIp + disp32));
+				if (computedTarget != target)
 				{
-					var target = targets[i];
-					if (memoryAddress != target ||
-						!hitCounts.TryGetValue(target, out var count) ||
-						count >= maxHitsPerTarget)
+					continue;
+				}
+
+				// Candidate disp32 field found at regionBase+p. Confirm with
+				// the real decoder by trying plausible instruction-start
+				// offsets before it (covers varying REX/opcode/ModRM prefix
+				// lengths) and requiring the instruction to end exactly at
+				// the disp32 field (no trailing immediate/other operand).
+				// x86 has no unique tokenization, so a real REX-prefixed
+				// instruction's trailing bytes can also decode as a shorter,
+				// spurious non-REX instruction one byte later. Search longest
+				// backOffset first — the longer decode is almost always the
+				// one the compiler actually emitted (REX is only present when
+				// the compiler put it there), and this stops the shorter
+				// coincidental overlap from shadowing the real instruction.
+				for (var backOffset = 8; backOffset >= 2 && p - backOffset >= 0; backOffset--)
+				{
+					var candidateStart = regionBase + (ulong)(p - backOffset);
+					if (!IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, candidateStart, maxLen: 15, out var bytes) ||
+						!IcedDecoder.TryDecode(candidateStart, bytes, out var instruction) ||
+						instruction.MemoryAddress != target ||
+						candidateStart + (ulong)instruction.Length != regionBase + (ulong)p + 4)
 					{
 						continue;
 					}
 
 					hitCounts[target] = count + 1;
+					count++;
 					Console.Error.WriteLine(
-						$"[LOADER][INFO]   Ref scan hit target=0x{target:X16} rip=0x{instruction.Rip:X16} text={instruction.Text} bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
+						$"[LOADER][INFO]   Ref scan hit target=0x{target:X16} rip=0x{candidateStart:X16} text={instruction.Text} bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
+					break;
 				}
 			}
 
-			rip += (ulong)instruction.Length;
+			// Second pass: direct near CALL (0xE8) / JMP (0xE9) rel32, used to
+			// find callers of a function address. Unlike the RIP-relative
+			// memory-operand case above, these are single fixed-length (5
+			// byte) forms anchored at the opcode byte itself, so no
+			// backOffset search is needed — just confirm with a real decode.
+			for (var p = 0; p + 5 <= buffer.Length && count < maxHitsPerTarget; p++)
+			{
+				var opcode = buffer[p];
+				if (opcode != 0xE8 && opcode != 0xE9)
+				{
+					continue;
+				}
+
+				var disp32 = BinaryPrimitives.ReadInt32LittleEndian(buffer.AsSpan(p + 1, 4));
+				var candidateNextIp = regionBase + (ulong)p + 5;
+				var computedTarget = unchecked((ulong)((long)candidateNextIp + disp32));
+				if (computedTarget != target)
+				{
+					continue;
+				}
+
+				var callSite = regionBase + (ulong)p;
+				if (!IcedDecoder.TryReadGuestBytes(_cpuContext.Memory, callSite, maxLen: 15, out var bytes) ||
+					!IcedDecoder.TryDecode(callSite, bytes, out var instruction) ||
+					instruction.NearBranchTarget != target ||
+					instruction.Length != 5)
+				{
+					continue;
+				}
+
+				hitCounts[target] = count + 1;
+				count++;
+				Console.Error.WriteLine(
+					$"[LOADER][INFO]   Ref scan call-site target=0x{target:X16} rip=0x{callSite:X16} text={instruction.Text} bytes={IcedDecoder.FormatBytes(instruction.Bytes)}");
+			}
 		}
 	}
 
@@ -1016,6 +1257,47 @@ public sealed partial class DirectExecutionBackend
 			{
 				result.Add(address);
 			}
+		}
+
+		return result;
+	}
+
+	// One-off experimental hook for testing "what happens downstream if this guard
+	// byte were set" hypotheses without hand-patching the guest binary. Format:
+	// "addr=value,addr=value,...", e.g. SHARPEMU_FORCE_BYTE_WRITE=0x807C44398=1.
+	private static List<(ulong Address, byte Value)> ParseForcedByteWrites(string? rawValue)
+	{
+		var result = new List<(ulong Address, byte Value)>();
+		if (string.IsNullOrWhiteSpace(rawValue))
+		{
+			return result;
+		}
+
+		foreach (var token in rawValue.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+		{
+			var parts = token.Split('=', StringSplitOptions.TrimEntries);
+			if (parts.Length != 2)
+			{
+				continue;
+			}
+
+			var normalizedAddress = parts[0].StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+				? parts[0][2..]
+				: parts[0];
+			if (!ulong.TryParse(normalizedAddress, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var address))
+			{
+				continue;
+			}
+
+			var normalizedValue = parts[1].StartsWith("0x", StringComparison.OrdinalIgnoreCase)
+				? parts[1][2..]
+				: parts[1];
+			if (!byte.TryParse(normalizedValue, NumberStyles.HexNumber, CultureInfo.InvariantCulture, out var value))
+			{
+				continue;
+			}
+
+			result.Add((address, value));
 		}
 
 		return result;
@@ -1240,8 +1522,17 @@ public sealed partial class DirectExecutionBackend
 
 	private unsafe static bool TryReadHostBytes(ulong address, byte[] buffer)
 	{
-		if (address < 65536)
+		if (address < 65536 || address > ulong.MaxValue - (ulong)buffer.Length)
 		{
+			// The upper check rejects ranges that would wrap past ulong.MaxValue —
+			// diagnostic dumps sometimes pass a raw fault RIP or sentinel value
+			// (e.g. an unresolved-import error code or -1 used as a pointer) that
+			// sits right at the top of the address space. Without this guard,
+			// `address + buffer.Length` overflows to a tiny value, the page-probe
+			// loop below never executes (its range becomes empty), and the
+			// unguarded Marshal.Copy after it raises a native fault that is not
+			// catchable on this platform and kills the whole process, silently
+			// truncating every diagnostic that would have printed afterward.
 			return false;
 		}
 

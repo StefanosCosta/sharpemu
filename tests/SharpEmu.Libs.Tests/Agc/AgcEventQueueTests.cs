@@ -3,6 +3,7 @@
 
 using System.Buffers.Binary;
 using SharpEmu.HLE;
+using SharpEmu.Libs.Agc;
 using SharpEmu.Libs.Kernel;
 using Xunit;
 
@@ -97,6 +98,79 @@ public sealed class AgcEventQueueTests
             0x07);
 
         Assert.Equal(0, triggered);
+    }
+
+    // sceAgcDriverGetEqContextId is called right after sceKernelWaitEqueue delivers a
+    // graphics-filter event, taking a pointer to that SceKernelEvent and reading back the
+    // udata field - exactly the userData the game itself passed to sceAgcDriverAddEqEvent
+    // at registration time (confirmed via live disassembly of the call site: metal_slug's
+    // Access Violation investigation, testing_instructions.md).
+    [Fact]
+    public void DriverGetEqContextId_ReadsUserDataFromDeliveredEvent()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+
+        const ulong handleOutAddress = BaseAddress + 0x100;
+        const ulong eventsAddress = BaseAddress + 0x200;
+        const ulong outCountAddress = BaseAddress + 0x300;
+        const ulong timeoutAddress = BaseAddress + 0x400;
+
+        ctx[CpuRegister.Rdi] = handleOutAddress;
+        var createResult = KernelEventQueueCompatExports.KernelCreateEqueue(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, createResult);
+        var handle = ReadUInt64(memory, handleOutAddress);
+
+        const ulong registeredEventId = 0x3;
+        const ulong userData = 0x7; // matches the real caller's "& 7" queue-index usage
+        var registered = KernelEventQueueCompatExports.RegisterEvent(
+            handle,
+            registeredEventId,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            userData);
+        Assert.True(registered);
+
+        var triggered = KernelEventQueueCompatExports.TriggerRegisteredEventsByFilter(
+            KernelEventQueueCompatExports.KernelEventFilterGraphics,
+            data: 0x2C);
+        Assert.Equal(1, triggered);
+
+        WriteUInt64(memory, timeoutAddress, 0);
+        ctx[CpuRegister.Rdi] = handle;
+        ctx[CpuRegister.Rsi] = eventsAddress;
+        ctx[CpuRegister.Rdx] = 1;
+        ctx[CpuRegister.Rcx] = outCountAddress;
+        ctx[CpuRegister.R8] = timeoutAddress;
+        var waitResult = KernelEventQueueCompatExports.KernelWaitEqueue(ctx);
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, waitResult);
+        Assert.Equal(1u, ReadUInt32(memory, outCountAddress));
+
+        ctx[CpuRegister.Rdi] = eventsAddress;
+        var result = AgcExports.DriverGetEqContextId(ctx);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.Equal(userData, ctx[CpuRegister.Rax]);
+
+        // _registeredEvents is process-wide static state shared by every test in this
+        // class - leaving this registration behind would make a sibling test that counts
+        // "no graphics registrations" see this one and fail.
+        KernelEventQueueCompatExports.DeleteRegisteredEvent(
+            handle,
+            registeredEventId,
+            KernelEventQueueCompatExports.KernelEventFilterGraphics);
+    }
+
+    [Fact]
+    public void DriverGetEqContextId_NullEventPointerReturnsZero()
+    {
+        var memory = new FakeCpuMemory(BaseAddress, MemorySize);
+        var ctx = new CpuContext(memory, Generation.Gen5);
+        ctx[CpuRegister.Rdi] = 0;
+
+        var result = AgcExports.DriverGetEqContextId(ctx);
+
+        Assert.Equal((int)OrbisGen2Result.ORBIS_GEN2_OK, result);
+        Assert.Equal(0UL, ctx[CpuRegister.Rax]);
     }
 
     private static ulong ReadUInt64(FakeCpuMemory memory, ulong address)

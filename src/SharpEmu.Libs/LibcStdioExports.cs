@@ -47,6 +47,12 @@ public static class LibcStdioExports
     private static readonly object _ctypeTableGate = new();
     private static nint _ctypeTableBase;
 
+    private static readonly object _ctypeLowerTableGate = new();
+    private static nint _ctypeLowerTableBase;
+
+    private static readonly object _ctypeUpperTableGate = new();
+    private static nint _ctypeUpperTableBase;
+
     [SysAbiExport(
         Nid = "xeYO4u7uyJ0",
         ExportName = "fopen",
@@ -67,6 +73,21 @@ public static class LibcStdioExports
         }
 
         var hostPath = KernelMemoryCompatExports.ResolveGuestPath(guestPath);
+        if (string.IsNullOrEmpty(hostPath))
+        {
+            // ResolveGuestPath default-denies an unmapped mount prefix by returning "".
+            // fopen's contract is NULL + ENOENT; handing the guest anything else (or letting
+            // the empty path reach FileStream and throw) makes its `if (!fp)` check miss.
+            if (_traceStdio)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] fopen: guest='{guestPath}' mode='{mode}' -> NOT_FOUND (unresolvable guest path)");
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         if (fileAccess != FileAccess.Read && KernelMemoryCompatExports.IsReadOnlyGuestMutationPath(guestPath))
         {
             if (_traceStdio)
@@ -122,7 +143,11 @@ public static class LibcStdioExports
             ctx[CpuRegister.Rax] = handle;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        // ArgumentException/NotSupportedException cover host paths .NET rejects on syntax
+        // alone. They must not escape: DispatchImport's catch-all returns an SCE error code
+        // in rax, which a guest reading a FILE* takes for a live handle.
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException)
         {
             if (_traceStdio)
             {
@@ -660,6 +685,18 @@ public static class LibcStdioExports
         }
 
         var hostPath = KernelMemoryCompatExports.ResolveGuestPath(guestPath);
+        if (string.IsNullOrEmpty(hostPath))
+        {
+            if (_traceStdio)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] freopen: guest='{guestPath}' mode='{mode}' -> NOT_FOUND (unresolvable guest path)");
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         if (fileAccess != FileAccess.Read && KernelMemoryCompatExports.IsReadOnlyGuestMutationPath(guestPath))
         {
             ctx[CpuRegister.Rax] = 0;
@@ -690,7 +727,8 @@ public static class LibcStdioExports
             ctx[CpuRegister.Rax] = handle;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException)
         {
             if (_traceStdio)
             {
@@ -716,6 +754,28 @@ public static class LibcStdioExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    [SysAbiExport(
+        Nid = "1uJgoVq3bQU",
+        ExportName = "_Getptolower",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int GetPtolower(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)EnsureCaseTable(ref _ctypeLowerTableBase, _ctypeLowerTableGate, toUpper: false));
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    [SysAbiExport(
+        Nid = "rcQCUr0EaRU",
+        ExportName = "_Getptoupper",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libc")]
+    public static int GetPtoupper(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = unchecked((ulong)EnsureCaseTable(ref _ctypeUpperTableBase, _ctypeUpperTableGate, toUpper: true));
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
     private static unsafe nint EnsureCtypeTable()
     {
         lock (_ctypeTableGate)
@@ -738,6 +798,48 @@ public static class LibcStdioExports
             _ctypeTableBase = storage - (CtypeTableLowerBound * sizeof(ushort));
             return _ctypeTableBase;
         }
+    }
+
+    /// <summary>
+    /// _Getptolower/_Getptoupper are Dinkumware's other per-character accessor tables,
+    /// same family and indexing convention as _Getpctype's _Ctypevec._Table
+    /// (base[c] for c in [-128, 255], see EnsureCtypeTable). Unlike the ctype flags
+    /// table, the "C" locale's upper/lower mapping is simple, standard, and
+    /// locale-invariant (only 'A'-'Z'/'a'-'z' change, under plain ASCII case folding;
+    /// every other code point — including everything outside 0..0x7F — maps to itself),
+    /// so there is no Dinkumware-vs-UCRT layout ambiguity to get wrong here the way
+    /// there was for the bitmask table.
+    /// </summary>
+    private static unsafe nint EnsureCaseTable(ref nint cache, object gate, bool toUpper)
+    {
+        lock (gate)
+        {
+            if (cache != 0)
+            {
+                return cache;
+            }
+
+            var storage = Marshal.AllocHGlobal(CtypeTableEntryCount * sizeof(ushort));
+            var entries = new Span<ushort>((void*)storage, CtypeTableEntryCount);
+            for (var i = 0; i < CtypeTableEntryCount; i++)
+            {
+                var c = i + CtypeTableLowerBound;
+                entries[i] = (ushort)MapAsciiCase(c, toUpper);
+            }
+
+            cache = storage - (CtypeTableLowerBound * sizeof(ushort));
+            return cache;
+        }
+    }
+
+    private static int MapAsciiCase(int c, bool toUpper)
+    {
+        if (toUpper)
+        {
+            return c is >= 'a' and <= 'z' ? c - ('a' - 'A') : c;
+        }
+
+        return c is >= 'A' and <= 'Z' ? c + ('a' - 'A') : c;
     }
 
     private static ushort ComputeCtypeFlags(int c)

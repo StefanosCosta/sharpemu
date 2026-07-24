@@ -978,9 +978,58 @@ public static class KernelRuntimeCompatExports
         LibraryName = "libKernel")]
     public static int KernelGetModuleInfoForUnwind(CpuContext ctx)
     {
-        var queriedAddress = ctx[CpuRegister.Rdi];
-        var flags = unchecked((int)ctx[CpuRegister.Rsi]);
-        var outInfoAddress = ctx[CpuRegister.Rdx];
+        return GetModuleInfoForUnwindCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            unchecked((int)ctx[CpuRegister.Rsi]),
+            ctx[CpuRegister.Rdx]);
+    }
+
+    // libSceSysmodule exposes the same module-info-for-unwind query as libKernel's
+    // sceKernelGetModuleInfoForUnwind (identical 0x130-byte struct, same
+    // addr/flags/out-info argument layout) — the C++ runtime uses whichever is
+    // linked for exception unwinding. Delegate to the shared core so both stay in
+    // lock-step. Previously unresolved, which left the unwinder without the
+    // eh_frame ranges for the module containing a faulting/throwing address.
+    [SysAbiExport(
+        Nid = "4fU5yvOkVG4",
+        ExportName = "sceSysmoduleGetModuleInfoForUnwind",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libSceSysmodule")]
+    public static int SysmoduleGetModuleInfoForUnwind(CpuContext ctx)
+    {
+        return GetModuleInfoForUnwindCore(
+            ctx,
+            ctx[CpuRegister.Rdi],
+            unchecked((int)ctx[CpuRegister.Rsi]),
+            ctx[CpuRegister.Rdx]);
+    }
+
+    // The guest C-runtime unwinder calls _is_signal_return(pc) to detect a kernel
+    // signal-return trampoline frame (so it can flag a signal frame and pull the full
+    // register set from the ucontext). SharpEmu delivers faults host-side (see
+    // DirectExecutionBackend.PosixSignals) and never injects a guest-visible
+    // signal-trampoline frame — async guest-exception delivery uses a normal
+    // import-frame continuation, not a signal frame — so no guest return address is
+    // ever a signal return. Report 0 (ordinary frame) for every pc. Previously
+    // unresolved, which stalled the unwinder's per-frame signal-frame probe.
+    [SysAbiExport(
+        Nid = "crb5j7mkk1c",
+        ExportName = "_is_signal_return",
+        Target = Generation.Gen4 | Generation.Gen5,
+        LibraryName = "libkernel")]
+    public static int IsSignalReturn(CpuContext ctx)
+    {
+        ctx[CpuRegister.Rax] = 0;
+        return (int)OrbisGen2Result.ORBIS_GEN2_OK;
+    }
+
+    private static int GetModuleInfoForUnwindCore(
+        CpuContext ctx,
+        ulong queriedAddress,
+        int flags,
+        ulong outInfoAddress)
+    {
         if (outInfoAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
@@ -1328,6 +1377,150 @@ public static class KernelRuntimeCompatExports
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
 
+    // A guest time_t spans the full 64-bit range while a host date stops at year
+    // 1..9999, and titles do walk outside it: this pair is what the guest libc's
+    // mktime is built on, and its normalisation loop steps an unnormalised time
+    // an hour at a time until the local->utc->local round trip agrees with what
+    // it asked for. Neither a host exception nor an error return can ever make
+    // that round trip agree, so the loop never terminates - metal_slug_tactics
+    // spends millions of calls walking a garbage time_t an hour at a time and
+    // never boots. Both directions are pure arithmetic (shift by the zone
+    // offset); only looking the offset up needs a date a calendar can express,
+    // so clamp that lookup and keep answering. Both directions clamp the same
+    // way, which is what keeps the round trip exact out there.
+    internal static long ClampToRepresentableUnixSeconds(long seconds) =>
+        Math.Clamp(
+            seconds,
+            DateTimeOffset.MinValue.ToUnixTimeSeconds(),
+            DateTimeOffset.MaxValue.ToUnixTimeSeconds());
+
+    private static DateTimeOffset ZoneLookupInstant(long unixSeconds) =>
+        DateTimeOffset.FromUnixTimeSeconds(ClampToRepresentableUnixSeconds(unixSeconds));
+
+    /// <summary>
+    /// The local zone as the guest sees it at one instant: the offset to shift by,
+    /// and how much of that offset is daylight saving.
+    /// </summary>
+    internal readonly record struct LocalZone(int OffsetSeconds, int DstSeconds);
+
+    /// <summary>
+    /// Resolves the zone for a conversion. <paramref name="requestedIsDst"/> is the
+    /// caller's own reading of an ambiguous local time - mktime hands its tm_isdst
+    /// straight through - so a positive value means "take this as daylight time", zero
+    /// means "take it as standard time", and a negative value leaves it to the zone.
+    /// Both conversion directions resolve through here so that they always report the
+    /// same zone for the same instant, which is the agreement the guest checks.
+    /// </summary>
+    internal static LocalZone ResolveLocalZone(long unixSeconds, int requestedIsDst)
+    {
+        var instant = ZoneLookupInstant(unixSeconds);
+        var zone = TimeZoneInfo.Local;
+        var offset = zone.GetUtcOffset(instant);
+        var standardOffset = zone.BaseUtcOffset;
+        var daylightDelta = zone.IsDaylightSavingTime(instant)
+            ? offset - standardOffset
+            : DaylightDeltaFromRules(instant.DateTime);
+
+        if (requestedIsDst > 0)
+        {
+            return new LocalZone(
+                checked((int)(standardOffset + daylightDelta).TotalSeconds),
+                checked((int)daylightDelta.TotalSeconds));
+        }
+
+        if (requestedIsDst == 0)
+        {
+            return new LocalZone(checked((int)standardOffset.TotalSeconds), 0);
+        }
+
+        var appliedDelta = offset - standardOffset;
+        return new LocalZone(
+            checked((int)offset.TotalSeconds),
+            checked((int)appliedDelta.TotalSeconds));
+    }
+
+    // Outside a daylight period the zone's own offset says nothing about how big a
+    // daylight shift would be, so the size has to come from the rules themselves.
+    // A guest libc builds its whole zone table through these conversions - tens of
+    // thousands of calls walking 1970 to 2037 - and GetAdjustmentRules hands out a
+    // fresh copy of the array every time, so the rules are read once.
+    private static readonly TimeZoneInfo.AdjustmentRule[] _localAdjustmentRules =
+        TimeZoneInfo.Local.GetAdjustmentRules();
+
+    private static TimeSpan DaylightDeltaFromRules(DateTime date)
+    {
+        var delta = TimeSpan.Zero;
+        foreach (var rule in _localAdjustmentRules)
+        {
+            if (rule.DateStart <= date.Date && rule.DateEnd >= date.Date &&
+                rule.DaylightDelta > delta)
+            {
+                delta = rule.DaylightDelta;
+            }
+        }
+
+        return delta;
+    }
+
+    /// <summary>
+    /// Writes the guest's timesec structure: an 8-byte time followed by the zone
+    /// offset and the daylight part of it, both as 32-bit second counts.
+    /// </summary>
+    /// <remarks>
+    /// The layout is what the guest libc reads back, not a guess: its mktime compares
+    /// the field at +8 between the two conversion directions and refuses to settle
+    /// until they agree, then shifts its result by the field at +12; its localtime
+    /// reads +12 alone as tm_isdst. Writing anything else here leaves the fields as
+    /// whatever the caller's stack held, which is what made mktime walk a time_t an
+    /// hour at a time forever.
+    /// </remarks>
+    private static bool TryWriteOrbisTimesec(
+        CpuContext ctx,
+        ulong address,
+        long unixSeconds,
+        LocalZone zone)
+    {
+        if (address == 0)
+        {
+            return true;
+        }
+
+        Span<byte> timesec = stackalloc byte[OrbisTimesecSize];
+        BinaryPrimitives.WriteInt64LittleEndian(timesec, unixSeconds);
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            timesec.Slice(sizeof(long), sizeof(uint)),
+            unchecked((uint)zone.OffsetSeconds));
+        BinaryPrimitives.WriteUInt32LittleEndian(
+            timesec.Slice(sizeof(long) + sizeof(uint), sizeof(uint)),
+            unchecked((uint)zone.DstSeconds));
+        return ctx.Memory.TryWrite(address, timesec);
+    }
+
+    private static readonly bool _traceTimezone = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_TIMEZONE"),
+        "1",
+        StringComparison.Ordinal);
+    private static readonly int _timezoneTraceLimit =
+        int.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_LOG_TIMEZONE_LIMIT"), out var limit)
+            ? limit
+            : 40;
+    private static int _timezoneTraceCount;
+
+    private static void TraceTimezone(string operation, CpuContext ctx)
+    {
+        if (!_traceTimezone || Interlocked.Increment(ref _timezoneTraceCount) > _timezoneTraceLimit)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] tz.{operation} " +
+            $"rdi=0x{ctx[CpuRegister.Rdi]:X16} rsi=0x{ctx[CpuRegister.Rsi]:X16} " +
+            $"rdx=0x{ctx[CpuRegister.Rdx]:X16} rcx=0x{ctx[CpuRegister.Rcx]:X16} " +
+            $"r8=0x{ctx[CpuRegister.R8]:X16} r9=0x{ctx[CpuRegister.R9]:X16} " +
+            $"ret=0x{(GuestThreadExecution.TryGetCurrentImportCallFrame(out var frame) ? frame.ReturnRip : 0UL):X16}");
+    }
+
     [SysAbiExport(
         Nid = "-o5uEDpN+oY",
         ExportName = "sceKernelConvertUtcToLocaltime",
@@ -1340,42 +1533,26 @@ public static class KernelRuntimeCompatExports
         var timesecAddress = ctx[CpuRegister.Rdx];
         var dstSecondsAddress = ctx[CpuRegister.Rcx];
 
+        TraceTimezone("utc_to_local", ctx);
         if (localTimeAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var utc = DateTimeOffset.FromUnixTimeSeconds(utcSeconds);
-        var local = TimeZoneInfo.ConvertTime(utc, TimeZoneInfo.Local);
-        var offset = local.Offset;
-        var localSeconds = utcSeconds + (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(local.DateTime)
-            ? (uint)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= local.Date && rule.DateEnd >= local.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0u;
-        var westSeconds = unchecked((uint)(int)offset.TotalSeconds);
+        // An instant carries its own daylight state, so this direction never has an
+        // ambiguity for the caller to resolve.
+        var zone = ResolveLocalZone(utcSeconds, requestedIsDst: -1);
+        var localSeconds = utcSeconds + zone.OffsetSeconds;
 
-        if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)))
+        if (!ctx.TryWriteUInt64(localTimeAddress, unchecked((ulong)localSeconds)) ||
+            !TryWriteOrbisTimesec(ctx, timesecAddress, utcSeconds, zone))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (timesecAddress != 0)
-        {
-            Span<byte> timesec = stackalloc byte[OrbisTimesecSize];
-            BinaryPrimitives.WriteInt64LittleEndian(timesec, utcSeconds);
-            BinaryPrimitives.WriteUInt32LittleEndian(timesec.Slice(sizeof(long), sizeof(uint)), westSeconds);
-            BinaryPrimitives.WriteUInt32LittleEndian(timesec.Slice(sizeof(long) + sizeof(uint), sizeof(uint)), dstSeconds);
-            if (!ctx.Memory.TryWrite(timesecAddress, timesec))
-            {
-                return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
-            }
-        }
-
-        if (dstSecondsAddress != 0 && !ctx.TryWriteUInt64(dstSecondsAddress, dstSeconds))
+        // Four bytes, not eight: the guest hands this a plain int slot, and mktime's
+        // sits directly below the time it then compares against.
+        if (dstSecondsAddress != 0 && !TryWriteInt32(ctx, dstSecondsAddress, zone.DstSeconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -1392,29 +1569,26 @@ public static class KernelRuntimeCompatExports
     public static int KernelConvertLocaltimeToUtc(CpuContext ctx)
     {
         var localSeconds = unchecked((long)ctx[CpuRegister.Rdi]);
+        // A local time can name an instant twice, or none at all, across a daylight
+        // change; the caller states which reading it means, exactly as it holds it in
+        // tm_isdst - positive for daylight, zero for standard, negative for "decide".
+        var requestedIsDst = unchecked((int)ctx[CpuRegister.Rsi]);
         var utcTimeAddress = ctx[CpuRegister.Rdx];
-        var timezoneAddress = ctx[CpuRegister.Rcx];
+        var timesecAddress = ctx[CpuRegister.Rcx];
         var dstSecondsAddress = ctx[CpuRegister.R8];
 
-        if (timezoneAddress == 0)
+        TraceTimezone("local_to_utc", ctx);
+        if (timesecAddress == 0)
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_INVALID_ARGUMENT;
         }
 
-        var localDate = DateTimeOffset.FromUnixTimeSeconds(localSeconds).DateTime;
-        var offset = TimeZoneInfo.Local.GetUtcOffset(localDate);
-        var utcSeconds = localSeconds - (long)offset.TotalSeconds;
-        var dstSeconds = TimeZoneInfo.Local.IsDaylightSavingTime(localDate)
-            ? (int)Math.Max(0, TimeZoneInfo.Local.GetAdjustmentRules()
-                .Where(rule => rule.DateStart <= localDate.Date && rule.DateEnd >= localDate.Date)
-                .Select(rule => rule.DaylightDelta.TotalSeconds)
-                .DefaultIfEmpty(0)
-                .Max())
-            : 0;
-        var minutesWest = unchecked((int)-offset.TotalMinutes);
+        var zone = ResolveLocalZone(localSeconds, requestedIsDst);
+        var utcSeconds = localSeconds - zone.OffsetSeconds;
 
-        if (!TryWriteInt32(ctx, timezoneAddress, minutesWest) ||
-            !TryWriteInt32(ctx, timezoneAddress + sizeof(int), dstSeconds / 60))
+        // The same structure the other direction writes: the guest compares the two
+        // against each other and will not accept a conversion until they agree.
+        if (!TryWriteOrbisTimesec(ctx, timesecAddress, utcSeconds, zone))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
@@ -1424,7 +1598,7 @@ public static class KernelRuntimeCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
-        if (dstSecondsAddress != 0 && !TryWriteInt32(ctx, dstSecondsAddress, dstSeconds))
+        if (dstSecondsAddress != 0 && !TryWriteInt32(ctx, dstSecondsAddress, zone.DstSeconds))
         {
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }

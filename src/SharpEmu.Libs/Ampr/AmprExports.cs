@@ -989,6 +989,11 @@ public static class AmprExports
             return false;
         }
 
+        // Completing this record writes the value a sceKernelSyncOnAddressWait waiter polls; post
+        // the matching wake so a thread parked on this address is actually released (the memory
+        // write alone never wakes a futex waiter).
+        KernelSyncOnAddressCompatExports.SignalAddressWaiters(address);
+
         TraceAmpr(ctx, "complete_write_address", address, value, 0);
         return true;
     }

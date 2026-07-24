@@ -192,6 +192,10 @@ public static unsafe class HostMemory
                     }
 
                     SetProtectRangeLocked(existing, start, end - start, protect);
+                    if (GuestWriteRipWatch.Enabled)
+                    {
+                        GuestWriteRipWatch.Arm();
+                    }
                     return address;
                 }
 
@@ -260,6 +264,15 @@ public static unsafe class HostMemory
                     DefaultProtect = protect
                 };
 
+                Trace($"alloc: addr=0x{(ulong)result:X16} size=0x{alignedSize:X}");
+                // Arm any pending RIP write-watch synchronously the moment its
+                // backing page becomes host-mapped, before the guest resumes and
+                // performs its first (init) store - the import-boundary re-arm
+                // pass alone races that early-boot write.
+                if (GuestWriteRipWatch.Enabled)
+                {
+                    GuestWriteRipWatch.Arm();
+                }
                 return (void*)result;
             }
         }
@@ -277,6 +290,7 @@ public static unsafe class HostMemory
                 }
 
                 Regions.Remove((ulong)address);
+                Trace($"free: addr=0x{(ulong)address:X16} size=0x{region.Size:X}");
                 return munmap((nint)address, (nuint)region.Size) == 0;
             }
         }
@@ -294,18 +308,43 @@ public static unsafe class HostMemory
 
             lock (Gate)
             {
-                if (!TryFindRegionLocked(start, out var region) || end > region.End)
+                if (!TryFindRegionLocked(start, out var firstRegion))
                 {
                     return false;
                 }
 
-                oldProtect = region.ProtectAt(start);
+                // Walk forward through back-to-back regions (no gap) so a protect range
+                // spanning multiple separately-allocated-but-adjacent mmap()/Alloc() calls
+                // (e.g. two adjacent sceKernelMmap reservations) still succeeds - a real
+                // mprotect(2) only cares about which pages are currently mapped, not which
+                // mmap() call originally produced them.
+                var regions = new List<Region> { firstRegion };
+                var cursor = firstRegion.End;
+                while (cursor < end)
+                {
+                    if (!TryFindRegionLocked(cursor, out var nextRegion))
+                    {
+                        return false; // genuine gap: not mapped
+                    }
+
+                    regions.Add(nextRegion);
+                    cursor = nextRegion.End;
+                }
+
+                oldProtect = firstRegion.ProtectAt(start);
                 if (mprotect((nint)start, (nuint)(end - start), ToPosixProtect(newProtect)) != 0)
                 {
                     return false;
                 }
 
-                SetProtectRangeLocked(region, start, end - start, newProtect);
+                var segmentStart = start;
+                foreach (var region in regions)
+                {
+                    var segmentEnd = Math.Min(region.End, end);
+                    SetProtectRangeLocked(region, segmentStart, segmentEnd - segmentStart, newProtect);
+                    segmentStart = segmentEnd;
+                }
+
                 return true;
             }
         }

@@ -290,9 +290,12 @@ public sealed partial class DirectExecutionBackend
 					"1",
 					StringComparison.Ordinal))
 			{
-				Console.Error.WriteLine("[LOADER][INFO]   Full fault stack window (RSP-0x300..RSP+0x100):");
+				// Reach far enough above RSP to cover the caller frames the RBP walk reports:
+				// the locals that explain a fault usually live in the grandparent frame, which
+				// the old +0x100 ceiling stopped just short of.
+				Console.Error.WriteLine("[LOADER][INFO]   Full fault stack window (RSP-0x300..RSP+0x400):");
 				var windowStart = rsp >= 0x300 ? rsp - 0x300 : 0;
-				for (var stackAddr = windowStart; stackAddr < rsp + 0x100; stackAddr += 8)
+				for (var stackAddr = windowStart; stackAddr < rsp + 0x400; stackAddr += 8)
 				{
 					if (!TryReadHostQword(stackAddr, out var value))
 					{

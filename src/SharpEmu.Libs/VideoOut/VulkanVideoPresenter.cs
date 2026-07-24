@@ -465,7 +465,6 @@ internal static unsafe class VulkanVideoPresenter
         uint.TryParse(Environment.GetEnvironmentVariable("SHARPEMU_SKIP_TALL_COMPUTE_Z"), out var z)
             ? z
             : 0;
-    private const uint GuestPrimitiveRectList = 0x11;
 
     private static readonly object _gate = new();
     private readonly record struct PendingGuestWork(
@@ -2831,6 +2830,38 @@ internal static unsafe class VulkanVideoPresenter
         }
 
         return keys;
+    }
+
+    internal static PrimitiveTopology GetPrimitiveTopology(uint primitiveType) =>
+        primitiveType switch
+        {
+            1 => PrimitiveTopology.PointList,
+            2 => PrimitiveTopology.LineList,
+            3 => PrimitiveTopology.LineStrip,
+            5 => PrimitiveTopology.TriangleFan,
+            6 => PrimitiveTopology.TriangleStrip,
+            // Vulkan has no rectangle list. The guest's three corners plus the
+            // derived fourth are exactly a four-vertex strip: the corners come
+            // out of the vertex index in Z order, so (0,1,2) and (1,2,3) tile
+            // the whole rectangle. A triangle list would draw only the first.
+            GuestPrimitiveType.RectList => PrimitiveTopology.TriangleStrip,
+            _ => PrimitiveTopology.TriangleList,
+        };
+
+    // Rect-list hardware derives the fourth corner from the three the draw
+    // supplies; the guest vertex shader computes corners from the vertex index,
+    // so asking it for the fourth index reproduces that corner.
+    internal static uint GetDrawVertexCount(
+        uint primitiveType,
+        uint vertexCount,
+        GuestIndexBuffer? indexBuffer)
+    {
+        if (primitiveType == GuestPrimitiveType.RectList && indexBuffer is null)
+        {
+            return 4;
+        }
+
+        return vertexCount;
     }
 
     internal static bool ShouldAttachGuestDepth(
@@ -8879,6 +8910,13 @@ internal static unsafe class VulkanVideoPresenter
             return expanded;
         }
 
+        // Diagnostic: force every consumed global buffer to be re-read from current guest memory
+        // at host-bind time, bypassing the source==shadow short-circuit in CreateGlobalBufferResource.
+        private static readonly bool _forceGlobalReread = string.Equals(
+            Environment.GetEnvironmentVariable("SHARPEMU_FORCE_GLOBAL_REREAD"),
+            "1",
+            StringComparison.Ordinal);
+
         private GlobalBufferResource CreateGlobalBufferResource(
             GuestMemoryBuffer guestBuffer)
         {
@@ -8932,6 +8970,21 @@ internal static unsafe class VulkanVideoPresenter
 
             var source = guestBuffer.Data.AsSpan(0, guestBuffer.Length);
             var shadow = allocation.Shadow.AsSpan(checked((int)guestOffset), guestBuffer.Length);
+
+            // Diagnostic (SHARPEMU_FORCE_GLOBAL_REREAD=1): refresh the shadow from CURRENT guest
+            // memory before the equality gate below, so a producer write that landed AFTER the
+            // parser's synchronous snapshot (a deferred DMA copy or a compute writeback that runs
+            // on the ordered GPU queue) is not masked by source==shadow. If forcing this makes an
+            // otherwise-black title render, the buffer WAS being written but the eager-snapshot +
+            // conditional-re-read path uploaded stale zeros; if it stays black, the buffer is
+            // genuinely never written. Inert when unset.
+            if (_forceGlobalReread)
+            {
+                WaitForGuestBufferAllocationForCpuVisibility(allocation);
+                WriteBackAllDirtyGuestBuffers();
+                _guestMemory?.TryRead(guestBuffer.BaseAddress, shadow);
+            }
+
             if (!source.SequenceEqual(shadow))
             {
                 if (!guestBuffer.Writable &&
@@ -9435,18 +9488,6 @@ internal static unsafe class VulkanVideoPresenter
             _vk.FreeMemory(_device, allocation.Memory, null);
         }
 
-        private static PrimitiveTopology GetPrimitiveTopology(uint primitiveType) =>
-            primitiveType switch
-            {
-                1 => PrimitiveTopology.PointList,
-                2 => PrimitiveTopology.LineList,
-                3 => PrimitiveTopology.LineStrip,
-                5 => PrimitiveTopology.TriangleFan,
-                6 => PrimitiveTopology.TriangleStrip,
-                GuestPrimitiveRectList => PrimitiveTopology.TriangleStrip,
-                _ => PrimitiveTopology.TriangleList,
-            };
-
         // Strip and fan topologies are the ones for which a restart index
         // splits primitives; list topologies never restart.
         private static bool RequiresPrimitiveRestart(PrimitiveTopology topology) =>
@@ -9554,19 +9595,6 @@ internal static unsafe class VulkanVideoPresenter
                 $"vk.vertex_offset_oob loc={vertexBuffer.Location} " +
                 $"offset={vertexBuffer.OffsetBytes} size={vertexBuffer.Size}");
             return 0;
-        }
-
-        private static uint GetDrawVertexCount(
-            uint primitiveType,
-            uint vertexCount,
-            GuestIndexBuffer? indexBuffer)
-        {
-            if (primitiveType == GuestPrimitiveRectList && indexBuffer is null)
-            {
-                return 4;
-            }
-
-            return vertexCount;
         }
 
         private static BlendFactor ToVkBlendFactor(uint factor) =>

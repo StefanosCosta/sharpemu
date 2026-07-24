@@ -46,10 +46,25 @@ public static unsafe class MemPollWatch
 
     private static readonly bool _enabled = _addresses.Length != 0 || _chain.Length != 0;
 
+    // SHARPEMU_MEM_POLL_PVM=1: read watched addresses through the emulator's memory
+    // abstraction (ICpuMemory.TryRead) instead of raw host pointers. This is the ONLY way to
+    // observe DIRECT-MEMORY regions (sceKernelMapDirectMemory pools): raw pointers +
+    // HostMemory.Query report them as uncommitted so the default path skips them, yet the
+    // renderer/shader-eval read them fine via this same abstraction. Also enables 4-byte reads
+    // for u32 counters at 4-aligned addresses that the 8-aligned raw path rejects.
+    private static readonly bool _usePvm = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_MEM_POLL_PVM"), "1", StringComparison.Ordinal);
+
+    private static volatile ICpuMemory? _guestMemory;
+
     private static Thread? _thread;
     private static volatile bool _stop;
 
     public static bool Enabled => _enabled;
+
+    /// <summary>Register the guest memory abstraction so SHARPEMU_MEM_POLL_PVM reads can resolve
+    /// direct-memory regions. Safe to call repeatedly (e.g. from AGC submit setup).</summary>
+    public static void AttachGuestMemory(ICpuMemory memory) => _guestMemory = memory;
 
     public static void Start()
     {
@@ -65,7 +80,8 @@ public static unsafe class MemPollWatch
             Priority = ThreadPriority.Highest,
         };
         _thread.Start();
-        Console.Error.WriteLine($"[MEMPOLL] watching {_addresses.Length} address(es), spin={_intervalSpin}");
+        Console.Error.WriteLine(
+            $"[MEMPOLL] watching {_addresses.Length} address(es), spin={_intervalSpin}, pvm={_usePvm}");
     }
 
     public static void Stop() => _stop = true;
@@ -101,6 +117,45 @@ public static unsafe class MemPollWatch
     private static bool TryReadCommitted(ulong address, out ulong value)
     {
         value = 0;
+
+        var mem = _guestMemory;
+        if (_usePvm && mem is not null)
+        {
+            // Read through the emulator's memory abstraction so DIRECT-MEMORY regions resolve.
+            // PVM.TryRead validates safely (returns false, never aborts), so the address range is
+            // relaxed to also cover low GPU/video-memory buffers (e.g. compute outputs / scanouts)
+            // that fall below the CPU guest window. 8-byte read when 8-aligned; otherwise a 4-byte
+            // read (u32 counters/CBs are commonly at 4-aligned addresses the raw path rejects).
+            if (address < 0x1000UL || (address & 0x3UL) != 0)
+            {
+                return false;
+            }
+
+            Span<byte> buf = stackalloc byte[8];
+            if ((address & 0x7UL) == 0)
+            {
+                if (!mem.TryRead(address, buf))
+                {
+                    return false;
+                }
+
+                value = BitConverter.ToUInt64(buf);
+            }
+            else
+            {
+                if (!mem.TryRead(address, buf[..4]))
+                {
+                    return false;
+                }
+
+                value = BitConverter.ToUInt32(buf[..4]);
+            }
+
+            return true;
+        }
+
+        // Raw path: strict guest window + 8-byte alignment; a host-thread fault on a
+        // reserved-but-uncommitted page aborts the process, so VirtualQuery-gate first.
         if (address < 0x0000000400000000UL || address >= 0x0000000900000000UL || (address & 0x7UL) != 0)
         {
             return false;
@@ -119,12 +174,9 @@ public static unsafe class MemPollWatch
     {
         var last = new ulong[_addresses.Length];
         var seen = new bool[_addresses.Length];
-        // A page must be host-COMMITTED before we dereference it: this poller is a host
-        // thread, so a fault on a reserved-but-uncommitted guest page is NOT recovered by
-        // the guest lazy-commit path and aborts the process. VirtualQuery-gate each address
-        // until its page commits (guest arena pages then stay committed — object frees don't
-        // decommit them), after which we read directly at full speed.
-        var committed = new bool[_addresses.Length];
+        // TryReadCommitted gates each read: raw pointers are VirtualQuery-checked for
+        // MEM_COMMIT (a host-thread fault on a reserved-but-uncommitted guest page aborts the
+        // process), and the PVM path returns false until the region resolves.
         var sw = Stopwatch.StartNew();
         var chainSeen = false;
         var chainLast = 0UL;
@@ -156,28 +208,16 @@ public static unsafe class MemPollWatch
 
             for (var i = 0; i < _addresses.Length; i++)
             {
-                var address = _addresses[i];
-                if (address < 0x0000000400000000UL || address >= 0x0000000900000000UL || (address & 0x7UL) != 0)
+                if (!TryReadCommitted(_addresses[i], out var value))
                 {
+                    anyPending = true; // not yet readable (uncommitted / unresolved region)
                     continue;
                 }
 
-                if (!committed[i])
-                {
-                    if (HostMemory.Query((void*)address, out var info) == 0 || info.State != HostMemory.MEM_COMMIT)
-                    {
-                        anyPending = true;
-                        continue;
-                    }
-
-                    committed[i] = true;
-                }
-
-                var value = *(ulong*)address;
                 if (!seen[i] || value != last[i])
                 {
                     Console.Error.WriteLine(
-                        $"[MEMPOLL] t={sw.ElapsedMilliseconds}ms addr=0x{address:X} " +
+                        $"[MEMPOLL] t={sw.ElapsedMilliseconds}ms addr=0x{_addresses[i]:X} " +
                         $"{(seen[i] ? $"0x{last[i]:X16}" : "init")} -> 0x{value:X16}");
                     last[i] = value;
                     seen[i] = true;

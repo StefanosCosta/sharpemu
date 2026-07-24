@@ -186,6 +186,15 @@ public sealed partial class DirectExecutionBackend
 			ulong r14 = ReadCtxU64(contextRecord, 232);
 			ulong r15 = ReadCtxU64(contextRecord, 240);
 
+			// Drain the signal-free hook ring first. It is normally flushed from import
+			// dispatch, so the records for the few guest calls immediately preceding a fault
+			// — exactly the ones that explain it — were still unpublished when the process
+			// aborted. Cheap no-op when SHARPEMU_GUEST_HOOK is unset.
+			if (SharpEmu.HLE.GuestExecLogger.Enabled)
+			{
+				SharpEmu.HLE.GuestExecLogger.ArmAndFlush();
+			}
+
 			Console.Error.WriteLine("[LOADER][INFO] =========================================");
 			Console.Error.WriteLine("[LOADER][INFO] NATIVE EXCEPTION CAUGHT!");
 			Console.Error.WriteLine($"[LOADER][INFO]   Code: 0x{exceptionCode:X8}");

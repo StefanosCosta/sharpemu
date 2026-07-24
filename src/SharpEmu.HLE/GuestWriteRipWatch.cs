@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 using System.Globalization;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
 namespace SharpEmu.HLE;
@@ -218,6 +220,86 @@ public static unsafe class GuestWriteRipWatch
                 Mprotect((nint)watch.PageStart, (nuint)(watch.PageEnd - watch.PageStart), ProtRead) == 0)
             {
                 Volatile.Write(ref watch.Armed, 1);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pre-JIT the entire signal-reachable fault-handler path before any POSIX
+    /// handler is installed, mirroring <see cref="GuestImageWriteTracker.WarmUp"/>.
+    /// A cold managed method entered from a SIGSEGV frame on a cooperative guest
+    /// worker JITs inside the signal frame while the thread's GC-mode/stack-walk
+    /// bookkeeping is inconsistent, and the runtime fail-fasts ("attempted to call
+    /// an UnmanagedCallersOnly method from managed code"). Driving one synthetic
+    /// fault on a private page-aligned scratch page compiles
+    /// <see cref="TryHandleWriteFault"/>/<c>TryHandleForWatch</c>/
+    /// <see cref="ArmDynamic"/> and warms the <c>mprotect</c> marshalling stub in
+    /// ordinary managed context; the arm/flush entrypoints are prepared too.
+    /// Leaves no watch armed and no record queued. No-op where mprotect is absent.
+    /// </summary>
+    public static void WarmUp()
+    {
+        if (!_writeWatchCapable)
+        {
+            return;
+        }
+
+        // Snapshot the ring and dynamic-table cursors so the synthetic fault
+        // leaves no residue: no live watch on a freed page, no spurious record for
+        // ArmAndFlush to print on the first real pass.
+        var savedDynamicCount = Volatile.Read(ref _dynamicCount);
+        var savedWriteIndex = Volatile.Read(ref _recordWriteIndex);
+        var savedFlushIndex = Volatile.Read(ref _recordFlushIndex);
+        var savedSequence = Volatile.Read(ref _writeSequence);
+
+        // Own a full host page so mprotecting our 4 KiB watch page read-only
+        // touches only this scratch, never a page shared with the managed heap.
+        // Host pages are 16 KiB on Apple Silicon (the emulator runs 4 KiB under
+        // Rosetta, but this warmup can run on a bare host); align to the largest so
+        // the kernel's length rounding stays inside memory we own.
+        var scratch = NativeMemory.AlignedAlloc(0x4000, 0x4000);
+        try
+        {
+            var address = (ulong)scratch;
+            if (ArmDynamic(address))
+            {
+                // TryHandleForWatch restores the page to read/write, so it is safe
+                // to free below.
+                _ = TryHandleWriteFault(address, 0);
+            }
+        }
+        finally
+        {
+            NativeMemory.AlignedFree(scratch);
+
+            // Roll back the synthetic activity so a real run starts clean.
+            if (savedDynamicCount >= 0 && savedDynamicCount < DynamicCapacity)
+            {
+                var watch = _dynamicWatches[savedDynamicCount];
+                Volatile.Write(ref watch.Armed, 0);
+                watch.PageStart = 0;
+                watch.PageEnd = 0;
+                watch.Address = 0;
+                watch.FaultCount = 0;
+                watch.LoggedArm = 0;
+            }
+
+            Volatile.Write(ref _dynamicCount, savedDynamicCount);
+            Volatile.Write(ref _recordWriteIndex, savedWriteIndex);
+            Volatile.Write(ref _recordFlushIndex, savedFlushIndex);
+            Volatile.Write(ref _writeSequence, savedSequence);
+        }
+
+        // Guarantee every signal-reachable method is compiled even if the synthetic
+        // arm above did not fire (e.g. mprotect refused the scratch page), and warm
+        // the managed-context arm/flush entrypoints the tool also reaches.
+        foreach (var name in new[] { "TryHandleWriteFault", "TryHandleForWatch", "ArmDynamic", "Arm", "ArmAndFlush" })
+        {
+            var method = typeof(GuestWriteRipWatch).GetMethod(
+                name, BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method != null)
+            {
+                RuntimeHelpers.PrepareMethod(method.MethodHandle);
             }
         }
     }

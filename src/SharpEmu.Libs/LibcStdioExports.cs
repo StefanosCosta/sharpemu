@@ -73,6 +73,21 @@ public static class LibcStdioExports
         }
 
         var hostPath = KernelMemoryCompatExports.ResolveGuestPath(guestPath);
+        if (string.IsNullOrEmpty(hostPath))
+        {
+            // ResolveGuestPath default-denies an unmapped mount prefix by returning "".
+            // fopen's contract is NULL + ENOENT; handing the guest anything else (or letting
+            // the empty path reach FileStream and throw) makes its `if (!fp)` check miss.
+            if (_traceStdio)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] fopen: guest='{guestPath}' mode='{mode}' -> NOT_FOUND (unresolvable guest path)");
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         if (fileAccess != FileAccess.Read && KernelMemoryCompatExports.IsReadOnlyGuestMutationPath(guestPath))
         {
             if (_traceStdio)
@@ -128,7 +143,11 @@ public static class LibcStdioExports
             ctx[CpuRegister.Rax] = handle;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        // ArgumentException/NotSupportedException cover host paths .NET rejects on syntax
+        // alone. They must not escape: DispatchImport's catch-all returns an SCE error code
+        // in rax, which a guest reading a FILE* takes for a live handle.
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException)
         {
             if (_traceStdio)
             {
@@ -666,6 +685,18 @@ public static class LibcStdioExports
         }
 
         var hostPath = KernelMemoryCompatExports.ResolveGuestPath(guestPath);
+        if (string.IsNullOrEmpty(hostPath))
+        {
+            if (_traceStdio)
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] freopen: guest='{guestPath}' mode='{mode}' -> NOT_FOUND (unresolvable guest path)");
+            }
+
+            ctx[CpuRegister.Rax] = 0;
+            return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND;
+        }
+
         if (fileAccess != FileAccess.Read && KernelMemoryCompatExports.IsReadOnlyGuestMutationPath(guestPath))
         {
             ctx[CpuRegister.Rax] = 0;
@@ -696,7 +727,8 @@ public static class LibcStdioExports
             ctx[CpuRegister.Rax] = handle;
             return (int)OrbisGen2Result.ORBIS_GEN2_OK;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException
+            or ArgumentException or NotSupportedException)
         {
             if (_traceStdio)
             {

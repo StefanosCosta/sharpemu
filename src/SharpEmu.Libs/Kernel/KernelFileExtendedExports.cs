@@ -96,6 +96,16 @@ public static partial class KernelMemoryCompatExports
             return (int)OrbisGen2Result.ORBIS_GEN2_ERROR_MEMORY_FAULT;
         }
 
+        // Positional reads bypass LogIoTrace's read path, so trace them here too
+        // (SHARPEMU_LOG_IO): the .resS async-load investigation needs to see whether
+        // a resource stream is ever pread after open, not just sequentially read.
+        if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_IO"), "1", StringComparison.Ordinal))
+        {
+            var name = stream is FileStream preadStream ? preadStream.Name : $"fd:{fd}";
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] pread path='{name}' fd={fd} off={offset} req={requested} read={read}");
+        }
+
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }

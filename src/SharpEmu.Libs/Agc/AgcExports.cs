@@ -52,6 +52,8 @@ public static partial class AgcExports
     private const uint ItSetPredication = 0x20;
     private const uint ItWaitRegMem = 0x3C;
     private const uint ItIndirectBuffer = 0x3F;
+    // Safety cap on INDIRECT_BUFFER (sceAgcDcbJump) chains followed per submission.
+    private const uint MaxIndirectBufferChains = 4096;
     private const uint ItEventWrite = 0x46;
     private const uint ItReleaseMem = 0x49;
     private const uint ItDmaData = 0x50;
@@ -246,8 +248,19 @@ public static partial class AgcExports
             Environment.GetEnvironmentVariable("SHARPEMU_LOG_AGC_SHADER"),
             "1",
             StringComparison.Ordinal);
+    // DIAG (caveman-ninja Class-B): on-demand guest code dump. SHARPEMU_DUMP_CODE="0xADDR[,..]"
+    // dumps 0x300 bytes at each address on the first DriverSubmitDcb, so guest helper functions
+    // can be disassembled offline without a rebuild per function. Inert unless set.
+    private static readonly ulong[] _dumpCodeAddresses = ParseHexAddressList(
+        Environment.GetEnvironmentVariable("SHARPEMU_DUMP_CODE"));
+    private static int _diagDumpCodeDone;
     private static readonly ulong? _traceComputeShaderAddress = ParseOptionalHexAddress(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COMPUTE_SHADER_ADDRESS"));
+    // DIAG (caveman Class-B coherence): SHARPEMU_TRACE_COMPUTE_SNAPSHOT=0xSHADER logs, per
+    // dispatch (NOT deduped), the first dword of each global-memory binding's parse-time
+    // snapshot, so we can see whether the evaluator captures the live count (4) or a stale 0.
+    private static readonly ulong? _traceComputeSnapshot = ParseOptionalHexAddress(
+        Environment.GetEnvironmentVariable("SHARPEMU_TRACE_COMPUTE_SNAPSHOT"));
     private static readonly ulong? _tracePixelShaderAddress = ParseOptionalHexAddress(
         Environment.GetEnvironmentVariable("SHARPEMU_TRACE_PIXEL_SHADER_ADDRESS"));
     private static readonly ulong? _traceRenderTargetAddress = ParseOptionalHexAddress(
@@ -1095,6 +1108,31 @@ public static partial class AgcExports
             startIndex = endIndex;
         }
 
+        // DIAG (caveman-ninja Class-B): same catch as the range variant, for the
+        // (offset,value)-pair form. Fire when a pair sets user-data s0 (reg 0xC) to a
+        // pool-window slot.
+        if (_traceAgcShader)
+        {
+            for (var i = 0; i < registers.Length; i++)
+            {
+                if (registers[i].Offset == PsTextureUserDataRegister)
+                {
+                    if (_diagShRegAnyPairs++ < 40)
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.shreg_any kind=pairs offset=0xC s0=0x{registers[i].Value:X}");
+                    }
+
+                    if (registers[i].Value is >= 0x02000000 and < 0x03000000)
+                    {
+                        DumpShRegEmitCaller(ctx, "pairs", registersAddress, PsTextureUserDataRegister, 4);
+                    }
+
+                    break;
+                }
+            }
+        }
+
         return ReturnPointer(ctx, firstCommandAddress);
     }
 
@@ -1330,7 +1368,94 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.cb_set_sh_range buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} offset=0x{offset:X8} count={valueCount}");
+
+        // DIAG (caveman-ninja Class-B): if this range covers user-data s0 (reg 0xC = the
+        // scene-draw CB V# low dword) and the value is a pool-window slot, capture the REAL
+        // synchronous guest caller (this export runs on the render thread building the DCB,
+        // with a valid stack — unlike the deferred SET_SH_REG apply). This is the frame-walk
+        // anchor closest to the matrix-write + slot computation.
+        if (_traceAgcShader && offset <= PsTextureUserDataRegister &&
+            PsTextureUserDataRegister < offset + valueCount &&
+            valuesAddress != 0 &&
+            _diagShRegAnyRange++ < 40)
+        {
+            TryReadUInt32(ctx, valuesAddress + ((PsTextureUserDataRegister - offset) * sizeof(uint)), out var slotLo);
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.shreg_any kind=range offset=0x{offset:X} count={valueCount} s0=0x{slotLo:X}");
+            if (slotLo is >= 0x02000000 and < 0x03000000)
+            {
+                DumpShRegEmitCaller(ctx, "range", valuesAddress, offset, valueCount);
+            }
+        }
+
         return ReturnPointer(ctx, commandAddress);
+    }
+
+    // DIAG (caveman-ninja Class-B): dump the synchronous guest caller of an SH-register emit
+    // that carries the scene-draw CB V#. Prints the caller return chain (stack scan, since
+    // Unity is frame-pointer-omitted), the 4 V# dwords + assembled base, a readback of the
+    // 128 CB bytes at that base (is the matrix data present at emit time?), and the caller's
+    // code for offline disassembly. Bounded + inert unless SHARPEMU_LOG_AGC_SHADER=1.
+    private static void DumpShRegEmitCaller(
+        CpuContext ctx, string kind, ulong valuesAddress, uint offset, uint valueCount)
+    {
+        if (_diagShRegEmitDumps++ >= 6)
+        {
+            return;
+        }
+
+        var idx0 = PsTextureUserDataRegister - offset;
+        TryReadUInt32(ctx, valuesAddress + (idx0 * sizeof(uint)), out var w0);
+        TryReadUInt32(ctx, valuesAddress + ((idx0 + 1) * sizeof(uint)), out var w1);
+        TryReadUInt32(ctx, valuesAddress + ((idx0 + 2) * sizeof(uint)), out var w2);
+        TryReadUInt32(ctx, valuesAddress + ((idx0 + 3) * sizeof(uint)), out var w3);
+        var cbBase = w0 | ((ulong)(w1 & 0xFFFFu) << 32);
+
+        var cbBytes = new byte[128];
+        var cbRead = ctx.Memory.TryRead(cbBase, cbBytes);
+        var cbNonZero = false;
+        if (cbRead)
+        {
+            foreach (var b in cbBytes)
+            {
+                if (b != 0)
+                {
+                    cbNonZero = true;
+                    break;
+                }
+            }
+        }
+
+        var ret0 = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var r0) ? r0 : 0;
+        var sb = new System.Text.StringBuilder();
+        var rsp = ctx[CpuRegister.Rsp];
+        for (uint i = 0; i < 48; i++)
+        {
+            if (ctx.TryReadUInt64(rsp + ((ulong)i * 8), out var slot) &&
+                slot is > 0x800000000 and < 0x808000000)
+            {
+                sb.Append($" +{i * 8:X2}=0x{slot:X}");
+            }
+        }
+
+        Console.Error.WriteLine(
+            $"[LOADER][TRACE] agc.shreg_emit kind={kind} offset=0x{offset:X} count={valueCount} " +
+            $"vf=[0x{w0:X8}:0x{w1:X8}:0x{w2:X8}:0x{w3:X8}] base=0x{cbBase:X} " +
+            $"cbRead={cbRead} cbNonZero={cbNonZero} valuesAddr=0x{valuesAddress:X} " +
+            $"rdi=0x{ctx[CpuRegister.Rdi]:X} rbx=0x{ctx[CpuRegister.Rbx]:X} r12=0x{ctx[CpuRegister.R12]:X} " +
+            $"r13=0x{ctx[CpuRegister.R13]:X} r14=0x{ctx[CpuRegister.R14]:X} r15=0x{ctx[CpuRegister.R15]:X}");
+        Console.Error.WriteLine($"[LOADER][TRACE] agc.shreg_emit_stack{sb}");
+
+        if (ret0 is > 0x800000000 and < 0x808000000)
+        {
+            var dumpBase = ret0 - 0x400;
+            var codeBytes = new byte[0x600];
+            if (ctx.Memory.TryRead(dumpBase, codeBytes))
+            {
+                Console.Error.WriteLine(
+                    $"[LOADER][TRACE] agc.shreg_emit_code ret=0x{ret0:X} base=0x{dumpBase:X}: {Convert.ToHexString(codeBytes)}");
+            }
+        }
     }
 
     [SysAbiExport(
@@ -1625,6 +1750,42 @@ public static partial class AgcExports
         }
 
         TraceAgc($"agc.dcb_draw_index_auto buf=0x{commandBufferAddress:X16} cmd=0x{commandAddress:X16} count={indexCount}");
+
+        // DIAG (caveman-ninja Class-B): the procedural scene draws are DrawIndexAuto. If they
+        // go through this HLE export, capture the SYNCHRONOUS guest draw-emit caller (adjacent
+        // to the per-draw CB setup we are hunting) + count + caller code. Bounded/inert.
+        if (_traceAgcShader && _diagDrawAutoDumps++ < 12)
+        {
+            var ret0 = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var r0) ? r0 : 0;
+            var sb = new System.Text.StringBuilder();
+            var rsp = ctx[CpuRegister.Rsp];
+            for (uint i = 0; i < 48; i++)
+            {
+                if (ctx.TryReadUInt64(rsp + ((ulong)i * 8), out var slot) &&
+                    slot is > 0x800000000 and < 0x808000000)
+                {
+                    sb.Append($" +{i * 8:X2}=0x{slot:X}");
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.draw_auto count={indexCount} cmd=0x{commandAddress:X} " +
+                $"ret0=0x{ret0:X} rdi=0x{ctx[CpuRegister.Rdi]:X} rsi=0x{ctx[CpuRegister.Rsi]:X} " +
+                $"rbx=0x{ctx[CpuRegister.Rbx]:X} r12=0x{ctx[CpuRegister.R12]:X} r13=0x{ctx[CpuRegister.R13]:X} " +
+                $"r14=0x{ctx[CpuRegister.R14]:X} r15=0x{ctx[CpuRegister.R15]:X}");
+            Console.Error.WriteLine($"[LOADER][TRACE] agc.draw_auto_stack{sb}");
+            if (_diagDrawAutoDumps == 1 && ret0 is > 0x800000000 and < 0x808000000)
+            {
+                var dumpBase = ret0 - 0x400;
+                var codeBytes = new byte[0x600];
+                if (ctx.Memory.TryRead(dumpBase, codeBytes))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.draw_auto_code ret=0x{ret0:X} base=0x{dumpBase:X}: {Convert.ToHexString(codeBytes)}");
+                }
+            }
+        }
+
         return ReturnPointer(ctx, commandAddress);
     }
 
@@ -2800,6 +2961,78 @@ public static partial class AgcExports
         }
 
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
+        MemPollWatch.AttachGuestMemory(ctx.Memory);
+
+        if (_dumpCodeAddresses.Length != 0 &&
+            System.Threading.Interlocked.Exchange(ref _diagDumpCodeDone, 1) == 0)
+        {
+            foreach (var addr in _dumpCodeAddresses)
+            {
+                var codeBytes = new byte[0x300];
+                if (ctx.Memory.TryRead(addr, codeBytes))
+                {
+                    Console.Error.WriteLine(
+                        $"[LOADER][TRACE] agc.dump_code addr=0x{addr:X}: {Convert.ToHexString(codeBytes)}");
+                }
+            }
+        }
+
+        // DIAG (caveman-ninja Class-B): the scene-draw SET_SH_REG(0xC) applies run on the
+        // synthetic-ctx GPU-wait resume path (no guest stack), so the submit call site can
+        // only be observed here, on the guest render thread that submits the DCB. Dump the
+        // return-address chain (rbp-walk) once — this is the frame-walk anchor into Unity's
+        // command-buffer builder (the code that writes the transform matrices + chooses the
+        // CB ring slot). Bounded + inert unless SHARPEMU_LOG_AGC_SHADER=1.
+        if (_traceAgcShader && _diagSubmitCallerDumps++ < 3)
+        {
+            var ret0 = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var r0) ? r0 : 0;
+
+            // Frame-pointer omission: rbp is not a frame chain, so scan the stack for
+            // return addresses in the guest image window instead of an rbp-walk.
+            var sb = new System.Text.StringBuilder();
+            var rsp = ctx[CpuRegister.Rsp];
+            for (uint i = 0; i < 64; i++)
+            {
+                if (ctx.TryReadUInt64(rsp + ((ulong)i * 8), out var slot) &&
+                    slot is > 0x800000000 and < 0x808000000)
+                {
+                    sb.Append($" +{i * 8:X2}=0x{slot:X}");
+                }
+            }
+
+            Console.Error.WriteLine(
+                "[LOADER][TRACE] agc.submit_caller " +
+                $"ret0=0x{ret0:X} rdi=0x{ctx[CpuRegister.Rdi]:X} rsi=0x{ctx[CpuRegister.Rsi]:X} " +
+                $"rdx=0x{ctx[CpuRegister.Rdx]:X} rbx=0x{ctx[CpuRegister.Rbx]:X} rbp=0x{ctx[CpuRegister.Rbp]:X} " +
+                $"r12=0x{ctx[CpuRegister.R12]:X} r13=0x{ctx[CpuRegister.R13]:X} r14=0x{ctx[CpuRegister.R14]:X} " +
+                $"r15=0x{ctx[CpuRegister.R15]:X}");
+            Console.Error.WriteLine($"[LOADER][TRACE] agc.submit_stack{sb}");
+
+            // Dump code windows around each distinct in-image return address on the stack
+            // (frame-pointer omission ⇒ this scan is the call chain). Only on the first hit.
+            if (_diagSubmitCallerDumps == 1)
+            {
+                var seen = new System.Collections.Generic.HashSet<ulong>();
+                for (uint i = 0; i < 64; i++)
+                {
+                    if (!ctx.TryReadUInt64(rsp + ((ulong)i * 8), out var slot) ||
+                        slot is not (> 0x800000000 and < 0x808000000) ||
+                        !seen.Add(slot))
+                    {
+                        continue;
+                    }
+
+                    var dumpBase = slot - 0x600;
+                    var codeBytes = new byte[0x800];
+                    if (ctx.Memory.TryRead(dumpBase, codeBytes))
+                    {
+                        Console.Error.WriteLine(
+                            $"[LOADER][TRACE] agc.frame_code ret=0x{slot:X} base=0x{dumpBase:X}: {Convert.ToHexString(codeBytes)}");
+                    }
+                }
+            }
+        }
+
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
@@ -2852,6 +3085,7 @@ public static partial class AgcExports
         }
 
         GuestGpu.Current.AttachGuestMemory(ctx.Memory);
+        MemPollWatch.AttachGuestMemory(ctx.Memory);
         var gpuState = _submittedGpuStates.GetValue(ctx.Memory, static _ => new SubmittedGpuState());
         lock (gpuState.Gate)
         {
@@ -3142,6 +3376,11 @@ public static partial class AgcExports
         bool tracePackets)
     {
         var offset = 0u;
+        // Bounds how many INDIRECT_BUFFER chains one submission may follow, so a
+        // malformed or cyclic guest chain (A jumps to B jumps back to A) can never
+        // spin the parser forever. Real command streams chain a small number of
+        // overflow chunks; the cap is far above any legitimate depth.
+        var chainFollowCount = 0u;
         while (offset < dwordCount)
         {
             var currentAddress = commandAddress + ((ulong)offset * sizeof(uint));
@@ -3241,6 +3480,69 @@ public static partial class AgcExports
                 }
 
                 offset += length;
+                continue;
+            }
+
+            if (op == ItIndirectBuffer)
+            {
+                // sceAgcDcbJump (DcbJump above) chains the command stream into
+                // another buffer chunk when the current one overflows, writing the
+                // target as lo32/hi16 + a dword size. The decode loop previously had
+                // no case for this opcode, so it fell through to `offset += length`
+                // and kept parsing the CURRENT buffer — every draw/dispatch/copy in
+                // the jumped-to chunk (e.g. Unity's GPU-driven cull compute that
+                // fills its indirect-count buffers) was silently dropped, which is
+                // why compute-driven Unity titles rendered black. A jump is a goto,
+                // not a call: execution continues at the target and does not return
+                // to the packet after it (the jump is the last packet the builder
+                // writes in a chunk), so redirect the parse window to the target.
+                // Suspend/resume still works because HandleSubmittedWaitRegMem
+                // records an absolute ResumeAddress, which lands inside the target.
+                if (!TryReadUInt32(ctx, currentAddress + 4, out var chainLo) ||
+                    !TryReadUInt32(ctx, currentAddress + 8, out var chainHi) ||
+                    !TryReadUInt32(ctx, currentAddress + 12, out var chainSizeRaw))
+                {
+                    TracePacketParseFailure(
+                        state, currentAddress, offset, header, "indirect-buffer-fields");
+                    return false;
+                }
+
+                var chainTarget = ((ulong)(chainHi & 0xFFFFu) << 32) | chainLo;
+                var chainSize = chainSizeRaw & 0xFFFFFu;
+                if (chainTarget == 0 || chainSize == 0)
+                {
+                    // Null/empty chain: nothing further to execute in this stream.
+                    return false;
+                }
+
+                if (++chainFollowCount > MaxIndirectBufferChains)
+                {
+                    TracePacketParseFailure(
+                        state,
+                        currentAddress,
+                        offset,
+                        header,
+                        $"indirect-buffer-chain-limit-{MaxIndirectBufferChains}");
+                    return false;
+                }
+
+                if (tracePackets)
+                {
+                    TraceAgc(
+                        $"agc.dcb.jump queue={state.QueueName} dw={offset} " +
+                        $"target=0x{chainTarget:X16} size_dw={chainSize} " +
+                        $"chain={chainFollowCount}");
+                }
+
+                // The window cache holds a snapshot of the CURRENT buffer only; drop
+                // it so target reads go to live guest memory (the wrapper restores it
+                // on return). Redirecting the loop variables makes the target the new
+                // stream, which composes with further chained jumps iteratively.
+                _dcbWindowBuffer = null;
+                _dcbWindowByteLength = 0;
+                commandAddress = chainTarget;
+                dwordCount = chainSize;
+                offset = 0;
                 continue;
             }
 
@@ -3813,6 +4115,15 @@ public static partial class AgcExports
                         destinationAddress,
                         byteCount,
                         immediateFill ? (uint)sourceAddress : null);
+                }
+
+                if (_logDmaDrops && (!copied || immediateFill))
+                {
+                    LogDmaDrop(
+                        !copied ? "compact_dma.not_copied" : "compact_dma.immediate_fill",
+                        destinationAddress,
+                        byteCount,
+                        $"src=0x{sourceAddress:X16} compact={compactLayout} fill={immediateFill}");
                 }
 
                 if (tracePacket)
@@ -4492,6 +4803,18 @@ public static partial class AgcExports
             writesGuestMemory ? byteCount : 0);
     }
 
+    // Diagnostic (SHARPEMU_LOG_DMA_DROPS=1): non-rate-limited log of every DMA_DATA / WRITE_DATA
+    // packet that hits a drop/skip branch (so a copy that should fill a constant buffer but is
+    // silently dropped is visible — the rate-limited agc.dma_packet trace hides these, and a
+    // dropped copy never reaches the vk.ordered_action list). Inert when unset.
+    private static readonly bool _logDmaDrops = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_DMA_DROPS"), "1", StringComparison.Ordinal);
+
+    private static void LogDmaDrop(string where, ulong dst, uint bytes, string detail)
+    {
+        Console.Error.WriteLine($"[DMADROP] {where} dst=0x{dst:X16} bytes={bytes} {detail}");
+    }
+
     private static void ApplySubmittedStandardDmaDataSnapshot(
         CpuContext ctx,
         uint control,
@@ -4513,6 +4836,15 @@ public static partial class AgcExports
             destinationSelect is not (0 or 3) ||
             (destinationSelect == 0 && destinationAddressSpace != 0))
         {
+            if (_logDmaDrops)
+            {
+                LogDmaDrop(
+                    "std_dma.dst_gate",
+                    destinationLow | ((ulong)destinationHigh << 32),
+                    byteCount,
+                    $"dst_sel={destinationSelect} dst_swap={destinationSwap} dst_as={destinationAddressSpace} src_sel={sourceSelect}");
+            }
+
             return;
         }
 
@@ -4567,7 +4899,21 @@ public static partial class AgcExports
         }
         else
         {
+            if (_logDmaDrops)
+            {
+                LogDmaDrop(
+                    "std_dma.src_gate",
+                    destinationAddress,
+                    byteCount,
+                    $"src_sel={sourceSelect} src_as={sourceAddressSpace}");
+            }
+
             return;
+        }
+
+        if (_logDmaDrops && !copied)
+        {
+            LogDmaDrop("std_dma.copy_failed", destinationAddress, byteCount, $"src_sel={sourceSelect}");
         }
 
         if (ShouldTraceHotPath(ref _standardDmaTraceCount))
@@ -5619,6 +5965,67 @@ public static partial class AgcExports
                 directDestination[startRegister + index] = value;
             }
 
+            // DIAG (caveman-ninja Class-B, CB slot-divergence hunt): when a DIRECT
+            // SET_SH_REG writes user-data s0 (reg 0xC = the scene-draw constant-buffer V#
+            // low dword) and the assembled 48-bit V# base lands in the Unity upload-pool
+            // window, dump: the 4-dword V# (0xC..0xF), the resolved base (= "slot Y"), a
+            // readback of the 128 CB bytes at that base (expected all-zero = the black
+            // draw's unwritten transform CB), and the GUEST SUBMIT CALLER (return addr at
+            // [rsp] + one frame up via [rbp+8], with a code dump) so the render-submit
+            // path can be frame-walked to the matrix-upload routine. The [rbp+8]/[rsp]
+            // reads are meaningful only on the synchronous submit path; the GPU-wait
+            // resume path uses a synthetic CpuContext, so guard on the guest image window
+            // (out-of-window caller ⇒ logged as n/a rather than garbage).
+            if (_traceAgcShader && op == ItSetShReg &&
+                startRegister <= PsTextureUserDataRegister &&
+                PsTextureUserDataRegister < startRegister + (packetLength - 2) &&
+                state.ShRegisters.TryGetValue(PsTextureUserDataRegister, out var vfWord0) &&
+                state.ShRegisters.TryGetValue(PsTextureUserDataRegister + 1, out var vfWord1))
+            {
+                var cbBase = vfWord0 | ((ulong)(vfWord1 & 0xFFFFu) << 32);
+                if (cbBase >= 0x0000000602000000UL && cbBase < 0x0000000603000000UL &&
+                    _diagShUserData0Dumps++ < 24)
+                {
+                    state.ShRegisters.TryGetValue(PsTextureUserDataRegister + 2, out var vfWord2);
+                    state.ShRegisters.TryGetValue(PsTextureUserDataRegister + 3, out var vfWord3);
+
+                    var cbBytes = new byte[128];
+                    var cbRead = ctx.Memory.TryRead(cbBase, cbBytes);
+                    var cbNonZero = false;
+                    if (cbRead)
+                    {
+                        foreach (var b in cbBytes)
+                        {
+                            if (b != 0)
+                            {
+                                cbNonZero = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    var callerRet = ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var r) ? r : 0;
+                    var frameUp = ctx.TryReadUInt64(ctx[CpuRegister.Rbp] + 8, out var fu) ? fu : 0;
+                    Console.Error.WriteLine(
+                        "[LOADER][TRACE] agc.cb_userdata0 " +
+                        $"vf=[0x{vfWord0:X8}:0x{vfWord1:X8}:0x{vfWord2:X8}:0x{vfWord3:X8}] " +
+                        $"base=0x{cbBase:X} read={cbRead} nonzero={cbNonZero} " +
+                        $"caller_ret=0x{callerRet:X16} frame_up=0x{frameUp:X16}");
+
+                    if (callerRet is > 0x800000000 and < 0x808000000)
+                    {
+                        var dumpBase = callerRet - 0x120;
+                        var codeBytes = new byte[0x180];
+                        if (ctx.Memory.TryRead(dumpBase, codeBytes))
+                        {
+                            Console.Error.WriteLine(
+                                "[LOADER][TRACE] agc.cb_userdata0_caller " +
+                                $"base=0x{dumpBase:X16}: {Convert.ToHexString(codeBytes)}");
+                        }
+                    }
+                }
+            }
+
             // DIAG (probe 1): does CB_COLOR (0x318) ever arrive via the DIRECT
             // SetContextReg packet path (as opposed to the indirect blob)?
             if (_traceAgcShader && op == ItSetContextReg &&
@@ -5708,6 +6115,27 @@ public static partial class AgcExports
                     }
                 }
             }
+        }
+
+        // DIAG (CB slot/offset-mismatch investigation): dump SH-space indirect applies (the
+        // path that carries user-data SGPRs, incl. the constant-buffer V# base pointer) — the
+        // cx dump below never covered this. Shows the blob/args address + each (offset,value)
+        // so the CB V# base value can be cross-checked against the CPU producer's memcpy slots.
+        if (_traceAgcShader && register == RShRegsIndirect &&
+            System.Threading.Interlocked.Increment(ref _diagShApplyTicks) <= 80)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (uint i = 0; i < Math.Min(registerCount, 24u); i++)
+            {
+                var ea = registersAddress + ((ulong)i * 8);
+                if (TryReadUInt32(ctx, ea, out var off) && TryReadUInt32(ctx, ea + sizeof(uint), out var val))
+                {
+                    sb.Append($" 0x{off:X3}=0x{val:X8}");
+                }
+            }
+
+            Console.Error.WriteLine(
+                $"[LOADER][TRACE] agc.indirect_apply_sh regs=0x{registersAddress:X16} count={registerCount}{sb}");
         }
 
         if (_traceAgcShader && register == RCxRegsIndirect)
@@ -5824,6 +6252,13 @@ public static partial class AgcExports
     private static int _diagCxColorBaseHits;
     private static int _diagCxApplyTicks;
     private static bool _diagCxOffsetSetDumped;
+    private static int _diagShApplyTicks;
+    private static int _diagShUserData0Dumps;
+    private static int _diagSubmitCallerDumps;
+    private static int _diagShRegEmitDumps;
+    private static int _diagShRegAnyRange;
+    private static int _diagShRegAnyPairs;
+    private static int _diagDrawAutoDumps;
 
     private static bool TryReadSubmittedDrawCount(
         CpuContext ctx,
@@ -6816,7 +7251,7 @@ public static partial class AgcExports
                 // clear via CmdClearColorImage so the pass still runs without
                 // Address-0 descriptors or a graphics pipeline.
                 usedFixedFullscreenClear = true;
-                fullscreenClearColor = DecodeSolidClearColor(pixelEvaluation);
+                fullscreenClearColor = DecodeSolidClearColor(pixelState, pixelEvaluation);
                 lock (_submitTraceGate)
                 {
                     if (_tracedFixedFullscreenClears.Add(
@@ -6905,7 +7340,7 @@ public static partial class AgcExports
                      pixelEvaluation))
         {
             usedFixedFullscreenClear = true;
-            fullscreenClearColor = DecodeSolidClearColor(pixelEvaluation);
+            fullscreenClearColor = DecodeSolidClearColor(pixelState, pixelEvaluation);
         }
 
         var useFixedFullscreenClear = usedFixedFullscreenClear;
@@ -7143,12 +7578,24 @@ public static partial class AgcExports
             pixelState,
             pixelEvaluation);
 
+    // DIAG (caveman-ninja Class-B): SHARPEMU_NO_PROC_CLEAR=1 disables the procedural-
+    // fullscreen-clear fallback entirely, so a pair that would be replaced by a solid
+    // color clear is instead compiled+drawn normally. Decisive test for whether the
+    // clear misclassification is dropping a real content pass. Inert unless set.
+    private static readonly bool _disableProceduralClear = string.Equals(
+        Environment.GetEnvironmentVariable("SHARPEMU_NO_PROC_CLEAR"), "1", StringComparison.Ordinal);
+
     private static bool IsProceduralFullscreenClearPair(
         Gen5ShaderState exportState,
         Gen5ShaderEvaluation exportEvaluation,
         Gen5ShaderState pixelState,
         Gen5ShaderEvaluation pixelEvaluation)
     {
+        if (_disableProceduralClear)
+        {
+            return false;
+        }
+
         if ((exportEvaluation.VertexInputs?.Count ?? 0) != 0 ||
             exportEvaluation.ImageBindings.Count != 0 ||
             pixelEvaluation.ImageBindings.Count != 0 ||
@@ -7224,10 +7671,26 @@ public static partial class AgcExports
                 Gen5ShaderEncoding.Sopp;
     }
 
-    private static (float Red, float Green, float Blue, float Alpha) DecodeSolidClearColor(
+    internal static (float Red, float Green, float Blue, float Alpha) DecodeSolidClearColor(
+        Gen5ShaderState pixelState,
         Gen5ShaderEvaluation pixelEvaluation)
     {
-        // Default opaque white; guest clear shaders often mov a 1.0 literal into v0.
+        // Preferred path: recover the exact constant the pixel shader exports to
+        // MRT0. A fullscreen solid-fill clear moves a constant into a vector
+        // register and exports it — either as four fp32 channels or, when the
+        // colour target is fp16 (Gen5ExportControl.Compressed), as two fp16x2
+        // packed registers (e.g. VMovB32 v0 <- 0x3C003C00 = (1.0h, 1.0h)). The
+        // scalar-register heuristic below misses both, so trace the IR first and
+        // fall back only when the constant cannot be recovered.
+        if (TryDecodeExportedClearColor(pixelState.Program, pixelEvaluation, out var exported))
+        {
+            return exported;
+        }
+
+        // Fallback: some clear shaders mov a scalar/CB value (folded into the
+        // initial SGPR file by the evaluator) into the exported register.
+        // Interpret s0 as an fp32 colour replicated across all channels — the
+        // original title-clear behaviour, preserved to avoid regressing it.
         float red = 1f, green = 1f, blue = 1f, alpha = 1f;
         if (pixelEvaluation.InitialScalarRegisters.Count > 0)
         {
@@ -7243,6 +7706,230 @@ public static partial class AgcExports
         }
 
         return (red, green, blue, alpha);
+    }
+
+    // Follows the MRT0 (target 0) export back to the constant that feeds it,
+    // handling both fp32 exports (four channel registers) and fp16-packed
+    // Compressed exports (two fp16x2 registers). Returns false when any needed
+    // channel is not a decodable constant, or the recovered colour is
+    // implausible, so the caller can fall back.
+    private static bool TryDecodeExportedClearColor(
+        Gen5ShaderProgram program,
+        Gen5ShaderEvaluation pixelEvaluation,
+        out (float Red, float Green, float Blue, float Alpha) color)
+    {
+        color = default;
+
+        // The last export to target 0 wins (matches how the GPU would overwrite).
+        Gen5ShaderInstruction? mrt0 = null;
+        foreach (var instruction in program.Instructions)
+        {
+            if (instruction.Control is Gen5ExportControl { Target: 0 })
+            {
+                mrt0 = instruction;
+            }
+        }
+
+        if (mrt0 is null ||
+            mrt0.Control is not Gen5ExportControl export ||
+            mrt0.Sources.Count < 4)
+        {
+            return false;
+        }
+
+        float r, g, b, a;
+        if (export.Compressed)
+        {
+            // fp16-packed: Sources[0] holds (R, G), Sources[1] holds (B, A).
+            if (!TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[0].Value, out var lo) ||
+                !TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[1].Value, out var hi))
+            {
+                return false;
+            }
+
+            r = UnpackHalf((ushort)(lo & 0xFFFF));
+            g = UnpackHalf((ushort)(lo >> 16));
+            b = UnpackHalf((ushort)(hi & 0xFFFF));
+            a = UnpackHalf((ushort)(hi >> 16));
+        }
+        else
+        {
+            // fp32: Sources[0..3] hold one channel each (R, G, B, A).
+            if (!TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[0].Value, out var rb) ||
+                !TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[1].Value, out var gb) ||
+                !TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[2].Value, out var bb) ||
+                !TryResolveVectorConstant32(
+                    program, pixelEvaluation, mrt0.Sources[3].Value, out var ab))
+            {
+                return false;
+            }
+
+            r = BitConverter.UInt32BitsToSingle(rb);
+            g = BitConverter.UInt32BitsToSingle(gb);
+            b = BitConverter.UInt32BitsToSingle(bb);
+            a = BitConverter.UInt32BitsToSingle(ab);
+        }
+
+        if (!IsPlausibleClearChannel(r) ||
+            !IsPlausibleClearChannel(g) ||
+            !IsPlausibleClearChannel(b) ||
+            !IsPlausibleClearChannel(a))
+        {
+            return false;
+        }
+
+        color = (r, g, b, a);
+        return true;
+    }
+
+    private static bool IsPlausibleClearChannel(float value) =>
+        float.IsFinite(value) && value >= 0f && value <= 4f;
+
+    private static float UnpackHalf(ushort bits) =>
+        (float)BitConverter.UInt16BitsToHalf(bits);
+
+    // Resolves the 32-bit constant most recently written into a vector register
+    // by scanning the decoded program (these clear pairs are gated to a handful
+    // of instructions upstream). Handles a VMovB32 immediate/scalar/inline
+    // constant and a VCvtPkrtzF16F32 that packs two constant fp32 operands into
+    // an fp16x2. Returns false when the register is written by anything else.
+    private static bool TryResolveVectorConstant32(
+        Gen5ShaderProgram program,
+        Gen5ShaderEvaluation pixelEvaluation,
+        uint vectorRegister,
+        out uint bits)
+    {
+        bits = 0;
+
+        Gen5ShaderInstruction? writer = null;
+        foreach (var instruction in program.Instructions)
+        {
+            if (instruction.Destinations.Count == 1 &&
+                instruction.Destinations[0] is
+                    { Kind: Gen5OperandKind.VectorRegister } destination &&
+                destination.Value == vectorRegister)
+            {
+                writer = instruction;
+            }
+        }
+
+        if (writer is null)
+        {
+            return false;
+        }
+
+        switch (writer.Opcode)
+        {
+            case "VMovB32":
+                return writer.Sources.Count == 1 &&
+                    TryResolveConstantOperand(pixelEvaluation, writer.Sources[0], out bits);
+
+            case "VCvtPkrtzF16F32":
+                if (writer.Sources.Count < 2 ||
+                    !TryResolveConstantOperand(
+                        pixelEvaluation, writer.Sources[0], out var loBits) ||
+                    !TryResolveConstantOperand(
+                        pixelEvaluation, writer.Sources[1], out var hiBits))
+                {
+                    return false;
+                }
+
+                var lo = BitConverter.HalfToUInt16Bits(
+                    (Half)BitConverter.UInt32BitsToSingle(loBits));
+                var hi = BitConverter.HalfToUInt16Bits(
+                    (Half)BitConverter.UInt32BitsToSingle(hiBits));
+                bits = lo | ((uint)hi << 16);
+                return true;
+
+            default:
+                return false;
+        }
+    }
+
+    // Resolves a source operand to its 32-bit constant bit pattern: a literal
+    // immediate, an inline constant, or a scalar register whose value the
+    // evaluator already folded into the initial SGPR file.
+    private static bool TryResolveConstantOperand(
+        Gen5ShaderEvaluation pixelEvaluation,
+        Gen5Operand operand,
+        out uint bits)
+    {
+        switch (operand.Kind)
+        {
+            case Gen5OperandKind.LiteralConstant:
+                bits = operand.Value;
+                return true;
+
+            case Gen5OperandKind.ScalarRegister:
+                if (operand.Value < (uint)pixelEvaluation.InitialScalarRegisters.Count)
+                {
+                    bits = pixelEvaluation.InitialScalarRegisters[(int)operand.Value];
+                    return true;
+                }
+
+                bits = 0;
+                return false;
+
+            case Gen5OperandKind.EncodedConstant:
+                return TryDecodeInlineConstantBits(operand.Value, out bits);
+
+            default:
+                bits = 0;
+                return false;
+        }
+    }
+
+    // The GCN/RDNA inline-constant encodings a clear shader can name directly.
+    // Mirrors Gen5ShaderScalarEvaluator's private inline-constant table so the
+    // two cannot drift: small integers by two's-complement bits, common floats
+    // by their fp32 bit pattern (VMovB32 moves the raw bits either way).
+    private static bool TryDecodeInlineConstantBits(uint encoded, out uint bits)
+    {
+        if (encoded == 125)
+        {
+            bits = 0;
+            return true;
+        }
+
+        if (encoded is >= 128 and <= 192)
+        {
+            bits = encoded - 128;
+            return true;
+        }
+
+        if (encoded is >= 193 and <= 208)
+        {
+            bits = unchecked((uint)-(int)(encoded - 192));
+            return true;
+        }
+
+        var value = encoded switch
+        {
+            240 => 0.5f,
+            241 => -0.5f,
+            242 => 1.0f,
+            243 => -1.0f,
+            244 => 2.0f,
+            245 => -2.0f,
+            246 => 4.0f,
+            247 => -4.0f,
+            248 => 1.0f / (2.0f * MathF.PI),
+            _ => float.NaN,
+        };
+
+        if (float.IsNaN(value))
+        {
+            bits = 0;
+            return false;
+        }
+
+        bits = BitConverter.SingleToUInt32Bits(value);
+        return true;
     }
 
     private static readonly bool _fillClearHack = !string.Equals(
@@ -9684,6 +10371,19 @@ public static partial class AgcExports
             }
 
             return;
+        }
+
+        if (_traceComputeSnapshot is { } snapWatch && shaderAddress == snapWatch)
+        {
+            var snap = string.Join(
+                ',',
+                evaluation.GlobalMemoryBindings.Select(b =>
+                    $"s{b.ScalarAddress}@0x{b.BaseAddress:X}[{b.DataLength}]=" +
+                    (b.Data is { Length: >= 4 } d
+                        ? $"0x{System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(d):X8}"
+                        : "short")));
+            TraceAgcShader(
+                $"agc.compute_snapshot cs=0x{shaderAddress:X} seq={sequence} {snap}");
         }
 
         var bindings = evaluation.ImageBindings;
@@ -12213,6 +12913,27 @@ public static partial class AgcExports
         $"lod={descriptor.MinLod:X3}/{descriptor.MinLodWarn:X3} " +
         $"bc={descriptor.BcSwizzle} meta=0x{descriptor.MetadataAddress:X16} " +
         $"flags=0x{descriptor.DescriptorFlags:X6} dst=0x{descriptor.DstSelect:X3}";
+
+    private static ulong[] ParseHexAddressList(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return Array.Empty<ulong>();
+        }
+
+        var parts = value.Split(new[] { ',', ';', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+        var list = new System.Collections.Generic.List<ulong>(parts.Length);
+        foreach (var part in parts)
+        {
+            var addr = ParseOptionalHexAddress(part);
+            if (addr.HasValue)
+            {
+                list.Add(addr.Value);
+            }
+        }
+
+        return list.ToArray();
+    }
 
     private static ulong? ParseOptionalHexAddress(string? value)
     {

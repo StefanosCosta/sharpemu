@@ -107,6 +107,7 @@ public sealed partial class DirectExecutionBackend
 	private readonly object _importResultLogSampleGate = new();
 	private readonly Dictionary<string, int> _importResultLogSamples = new(StringComparer.Ordinal);
 	private int _il2CppExceptionDiagnosticCount;
+	private int _il2CppApiLookupFailures;
 
 	private static ulong ImportDispatchGatewayManaged(nint backendHandle, int importIndex, nint argPackPtr)
 	{
@@ -1652,6 +1653,9 @@ public sealed partial class DirectExecutionBackend
 		var expectedFileProbeMiss =
 			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
 			IsExpectedFileProbeNotFoundNid(nid);
+		var expectedUnwindModuleMiss =
+			result == OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND &&
+			IsExpectedUnwindModuleMissNid(nid);
 		var expectedTimedWaitTimeout =
 			string.Equals(nid, "27bAgiJmOh0", StringComparison.Ordinal) &&
 			unchecked((int)result) == 60;
@@ -1674,6 +1678,7 @@ public sealed partial class DirectExecutionBackend
 			string.Equals(nid, "D-CzAxQL0XI", StringComparison.Ordinal) &&
 			resultValue == unchecked((int)0x80960009);
 		if (!expectedFileProbeMiss &&
+			!expectedUnwindModuleMiss &&
 			!expectedTimedWaitTimeout &&
 			!expectedEqueueTimeout &&
 			!expectedMutexTrylockBusy &&
@@ -1713,6 +1718,16 @@ public sealed partial class DirectExecutionBackend
 			"eV9wAD2riIA" or // sceKernelStat
 			"1G3lF1Gg1k8" or // sceKernelOpen
 			"gEpBkcwxUjw";   // sceKernelAprResolveFilepathsToIdsAndFileSizes
+
+	// The C++ unwinder probes these for every frame's return address; the top-of-chain
+	// frame's return address is SharpEmu's own host guest-return sentinel (not a guest
+	// module), so NOT_FOUND is the expected terminal "stop" signal, emitted on every
+	// exception unwind. Route it through the sampled/suppressed path so heavy-exception
+	// titles (subnautica) don't flood the log.
+	private static bool IsExpectedUnwindModuleMissNid(string nid) =>
+		nid is
+			"RpQJJVKTiFM" or // sceKernelGetModuleInfoForUnwind
+			"4fU5yvOkVG4";   // sceSysmoduleGetModuleInfoForUnwind
 
 	private bool IsLeafImport(string nid)
 	{
@@ -2251,8 +2266,7 @@ public sealed partial class DirectExecutionBackend
 		ulong outputAddress = cpuContext[CpuRegister.Rdx];
 		if (!TryReadAsciiZ(symbolNameAddress, 512, out var symbolName))
 		{
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		var moduleHandle = unchecked((int)cpuContext[CpuRegister.Rdi]);
 		if (!TryResolveModuleSymbolAddress(moduleHandle, symbolName, out var resolvedAddress) &&
@@ -2262,8 +2276,7 @@ public sealed partial class DirectExecutionBackend
 		{
 			Console.Error.WriteLine(
 				$"[LOADER][WARN] sceKernelDlsym failed: handle=0x{cpuContext[CpuRegister.Rdi]:X} symbol='{symbolName}'");
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		if (string.Equals(Environment.GetEnvironmentVariable("SHARPEMU_LOG_DLSYM"), "1", StringComparison.Ordinal))
 		{
@@ -2272,10 +2285,31 @@ public sealed partial class DirectExecutionBackend
 		}
 		if (outputAddress == 0L || !TryWriteUInt64Compat(outputAddress, resolvedAddress))
 		{
-			cpuContext[CpuRegister.Rax] = 18446744073709551615uL;
-			return OrbisGen2Result.ORBIS_GEN2_OK;
+			return FailKernelDynlibDlsym(cpuContext, outputAddress);
 		}
 		cpuContext[CpuRegister.Rax] = 0uL;
+		return OrbisGen2Result.ORBIS_GEN2_OK;
+	}
+
+	/// <summary>
+	/// Shared failure return for <see cref="DispatchKernelDynlibDlsym"/>.
+	/// </summary>
+	/// <remarks>
+	/// Zeroing the caller's out-slot is the important half: callers pass the address of an
+	/// uninitialised local, and leaving it untouched on failure makes the guest bind whatever
+	/// stack residue was there as the resolved symbol and later call through it (observed as an
+	/// execute fault at 0xFFFFFFFFFFFFFFFF while a Unity title bound its IL2CPP API table).
+	/// The status also moves off -1, which is not a representable SCE error, onto the same
+	/// ENOENT the unresolved-import path returns.
+	/// </remarks>
+	private OrbisGen2Result FailKernelDynlibDlsym(CpuContext cpuContext, ulong outputAddress)
+	{
+		if (outputAddress != 0)
+		{
+			_ = TryWriteUInt64Compat(outputAddress, 0);
+		}
+
+		cpuContext[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
 		return OrbisGen2Result.ORBIS_GEN2_OK;
 	}
 
@@ -2339,14 +2373,21 @@ public sealed partial class DirectExecutionBackend
 			!TryResolveIl2CppApiAddress(symbolName, out var resolvedAddress) ||
 			!TryWriteUInt64Compat(outputAddress, resolvedAddress))
 		{
-			Console.Error.WriteLine(
-				$"[LOADER][WARN] il2cpp_api_lookup_symbol failed: name='{symbolName}' out=0x{outputAddress:X16}");
+			// A title binds its whole IL2CPP API table one symbol at a time, so an
+			// unresolvable runtime floods hundreds of identical lines; sample them.
+			var failure = Interlocked.Increment(ref _il2CppApiLookupFailures);
+			if (failure <= 16 || failure % 256 == 0)
+			{
+				Console.Error.WriteLine(
+					$"[LOADER][WARN] il2cpp_api_lookup_symbol failed #{failure}: name='{symbolName}' out=0x{outputAddress:X16}");
+			}
+
 			if (outputAddress != 0)
 			{
 				_ = TryWriteUInt64Compat(outputAddress, 0);
 			}
 
-			cpuContext[CpuRegister.Rax] = ulong.MaxValue;
+			cpuContext[CpuRegister.Rax] = unchecked((ulong)(int)OrbisGen2Result.ORBIS_GEN2_ERROR_NOT_FOUND);
 			return OrbisGen2Result.ORBIS_GEN2_OK;
 		}
 

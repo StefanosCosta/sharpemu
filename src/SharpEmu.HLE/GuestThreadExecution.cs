@@ -30,6 +30,25 @@ public readonly record struct GuestThreadSnapshot(
 /// false leaves it parked. Resume runs later on the woken thread outside that gate, and
 /// its return value becomes the guest's RAX for the resumed call.
 /// </summary>
+/// <remarks>
+/// <para><b>TryWake must be a pure, idempotent condition test.</b> It is NOT called only in
+/// response to a matching wake: the scheduler also probes it speculatively and without any key
+/// match — once synchronously right after the block registers (RunGuestThread's exit handler)
+/// and again after delivering a guest exception (RestoreInterruptedGuestThread). Concretely:</para>
+/// <list type="bullet">
+/// <item>No observable side effect when it returns <c>false</c>.</item>
+/// <item>Side effects (consuming a token, decrementing a count, granting ownership) only on the
+/// <c>true</c> branch — the caller guarantees it then re-readies the thread, so they commit once.</item>
+/// <item>Not all implementations are idempotent across two <c>true</c> results (the rwlock waiter
+/// grants ownership), which is why every call site invokes it under the guest-thread gate with
+/// <c>State == Blocked</c> re-checked inside. Keep any new call site to that rule.</item>
+/// </list>
+/// <para>A predicate that assumes "I was only called because someone woke me" will release its
+/// thread spuriously. Conversely, a predicate that can only detect an explicitly posted wake will
+/// strand its thread forever if the producer satisfies the condition without posting one — see
+/// <c>docs/cooperative-guest-blocking.md</c>, and the sync-on-address predicate for a worked
+/// example of testing the underlying condition rather than trusting the notification.</para>
+/// </remarks>
 public interface IGuestThreadBlockWaiter
 {
     int Resume();

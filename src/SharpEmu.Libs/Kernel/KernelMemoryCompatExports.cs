@@ -1203,6 +1203,8 @@ public static partial class KernelMemoryCompatExports
             }
         }
 
+        LogMemWrite(ctx, "memcpy", destination, source, (ulong)count);
+
         ctx[CpuRegister.Rax] = destination;
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;
     }
@@ -1215,6 +1217,70 @@ public static partial class KernelMemoryCompatExports
     public static int Memmove(CpuContext ctx)
     {
         return Memcpy(ctx);
+    }
+
+    // Signal-free CPU-write catcher: SHARPEMU_LOG_MEMWRITE="lo-hi[,lo-hi...]" (hex). Logs every
+    // libc memcpy/memmove whose destination overlaps a watched range, with the guest CALLER
+    // (return address at [rsp]) — i.e. the exact guest code doing the copy — plus src head bytes.
+    // This finds a CPU producer (e.g. a per-frame constant-buffer upload) that the mprotect
+    // catchers cannot observe on hot direct-memory pages. Inert when unset.
+    private static readonly (ulong Lo, ulong Hi)[] _memWriteRanges = ParseMemWriteRanges(
+        Environment.GetEnvironmentVariable("SHARPEMU_LOG_MEMWRITE"));
+
+    private static (ulong Lo, ulong Hi)[] ParseMemWriteRanges(string? spec)
+    {
+        if (string.IsNullOrWhiteSpace(spec))
+        {
+            return [];
+        }
+
+        var list = new List<(ulong, ulong)>();
+        foreach (var token in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var parts = token.Split('-', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (parts.Length == 2 &&
+                ulong.TryParse(parts[0].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var lo) &&
+                ulong.TryParse(parts[1].Replace("0x", "", StringComparison.OrdinalIgnoreCase), System.Globalization.NumberStyles.HexNumber, System.Globalization.CultureInfo.InvariantCulture, out var hi) &&
+                hi > lo)
+            {
+                list.Add((lo, hi));
+            }
+        }
+
+        return list.ToArray();
+    }
+
+    private static void LogMemWrite(CpuContext ctx, string op, ulong dst, ulong src, ulong count)
+    {
+        var ranges = _memWriteRanges;
+        if (ranges.Length == 0 || count == 0)
+        {
+            return;
+        }
+
+        var end = dst + count;
+        var hit = false;
+        foreach (var (lo, hi) in ranges)
+        {
+            if (dst < hi && end > lo)
+            {
+                hit = true;
+                break;
+            }
+        }
+
+        if (!hit)
+        {
+            return;
+        }
+
+        ctx.TryReadUInt64(ctx[CpuRegister.Rsp], out var caller);
+        Span<byte> head = stackalloc byte[32];
+        var n = (int)Math.Min(count, 32);
+        head = head[..n];
+        ctx.Memory.TryRead(src, head);
+        Console.Error.WriteLine(
+            $"[MEMWRITE] {op} dst=0x{dst:X} src=0x{src:X} count={count} caller=0x{caller:X16} src={Convert.ToHexString(head)}");
     }
 
     [SysAbiExport(
@@ -2445,7 +2511,7 @@ public static partial class KernelMemoryCompatExports
         LogIoTrace(
             "read",
             stream is FileStream fileStream ? fileStream.Name : $"fd:{fd}",
-            $"fd={fd} req={requested} read={read} pos={positionBefore}->{positionAfter} preview='{PreviewIoBytes(buffer, read, 64)}' hex={PreviewIoHex(buffer, read, 32)} guest_tail={PreviewGuestHex(ctx, bufferAddress + (ulong)Math.Max(read, 0), 32)}");
+            $"fd={fd} req={requested} read={read} buf=0x{bufferAddress:X} pos={positionBefore}->{positionAfter} preview='{PreviewIoBytes(buffer, read, 64)}' hex={PreviewIoHex(buffer, read, 32)} guest_tail={PreviewGuestHex(ctx, bufferAddress + (ulong)Math.Max(read, 0), 32)}");
 
         ctx[CpuRegister.Rax] = unchecked((ulong)read);
         return (int)OrbisGen2Result.ORBIS_GEN2_OK;

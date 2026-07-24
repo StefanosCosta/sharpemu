@@ -84,6 +84,19 @@ internal sealed record GuestIndexBuffer(
     bool Is32Bit,
     bool Pooled);
 
+/// <summary>Raw AGC primitive-type codes: the value a title passes to
+/// sceAgcCreatePrimState, which is written verbatim to VGT_PRIMITIVE_TYPE.</summary>
+internal static class GuestPrimitiveType
+{
+    // A rectangle-list draw supplies three corners and the hardware derives the
+    // fourth, so three vertices cover a whole rectangle; titles use it for their
+    // full-screen composites. Drawn as a plain triangle list it covers only the
+    // half of the rectangle on one side of the diagonal. AGC numbers it 0x7 -
+    // every observed rect-list draw is exactly three vertices over a full-size
+    // render target - not the PS4/GNM DI_PT_RECTLIST value 0x11.
+    public const uint RectList = 0x7;
+}
+
 internal readonly record struct GuestRect(
     int X,
     int Y,

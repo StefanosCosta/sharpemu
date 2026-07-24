@@ -118,19 +118,27 @@ public sealed unsafe partial class DirectExecutionBackend
 
 		WarmUpPosixSignalPath();
 		SharpEmu.HLE.GuestImageWriteTracker.WarmUp();
+		SharpEmu.HLE.GuestWriteRipWatch.WarmUp();
 		SharpEmu.HLE.GuestSingleStepTracer.WarmUp();
 		SharpEmu.HLE.GuestAddrWriteCatcher.WarmUp();
 		SharpEmu.HLE.GuestRipBreakpoint.WarmUp();
+		SharpEmu.HLE.GuestExecLogger.WarmUp();
 
-		// A code-trap tool (INT3 breakpoint / single-step) plants a SIGTRAP that can
-		// fire while a guest thread runs on a freshly continuation-resumed runner
-		// thread. The Core continuation-resume chain is never in ModuleManager's
-		// HLE-only warm sweep, so its first resume JITs lazily; if a SIGTRAP intersects
-		// a still-cold method there the JIT runs in the signal frame and fail-fasts
-		// ("UnmanagedCallersOnly method from managed code"). Pre-JIT the chain when a
-		// trap tool is active so no such method is cold under the signal. Gated, so a
-		// normal run's warm set is unchanged.
-		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled || SharpEmu.HLE.GuestSingleStepTracer.Enabled)
+		// A code-trap (INT3 breakpoint / single-step, SIGTRAP) or a write-watch
+		// (mprotect'd page, SIGSEGV) tool can fault while a guest thread runs on a
+		// freshly continuation-resumed runner thread. The Core continuation-resume
+		// chain is never in ModuleManager's HLE-only warm sweep, so its first resume
+		// JITs lazily; if a signal intersects a still-cold method there the JIT runs
+		// in the signal frame and fail-fasts ("UnmanagedCallersOnly method from
+		// managed code"). Pre-JIT the chain when any such tool is active so no method
+		// is cold under the signal. Gated, so a normal run's warm set is unchanged.
+		// GuestWriteRipWatch.Enabled only flips once a watch is armed at runtime, so
+		// the dynamic-arming intent (SHARPEMU_HOOK_ARM_WRITE) must be checked too.
+		if (SharpEmu.HLE.GuestRipBreakpoint.Enabled ||
+			SharpEmu.HLE.GuestSingleStepTracer.Enabled ||
+			SharpEmu.HLE.GuestWriteRipWatch.Enabled ||
+			SharpEmu.HLE.GuestExecLogger.WriteWatchArmingEnabled ||
+			SharpEmu.HLE.GuestAddrWriteCatcher.Enabled)
 		{
 			WarmUpContinuationResumeChain();
 		}
